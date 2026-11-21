@@ -1,0 +1,417 @@
+"""Regression checks. Run with the dependencies in requirements.txt installed."""
+import csv
+import math
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import time
+import unittest
+from unittest.mock import patch
+
+os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
+
+import numpy as np
+from PySide6 import QtCore as C, QtGui, QtWidgets as W
+from engine import Lines, Simulator, match_ack, step_metrics
+from main import Window
+from storage import History
+from transport import SerialLink
+from scope import pixel_mean
+
+
+class CoreChecks(unittest.TestCase):
+    def test_pixel_averages_keep_raw_ripple_and_missing_data(self):
+        x = np.arange(200)/1000
+        y = np.tile([165.,165.8],100)
+        _,trend = pixel_mean(x,y,0.,1.,1)
+        np.testing.assert_allclose(trend,[165.4])
+        self.assertAlmostEqual(np.ptp(y),.8)
+        y[20:30] = np.nan
+        _,trend = pixel_mean(x,y,0.,1.,1)
+        np.testing.assert_allclose(trend,[165.4,np.nan,165.4],equal_nan=True)
+        np.testing.assert_allclose(pixel_mean(x,y,0.,.2,1000)[1],y,equal_nan=True)
+
+    def test_stream_recovery(self):
+        p = Lines()
+        self.assertEqual(list(p.feed(b"12,")),[])
+        events = list(p.feed(b"3\r\n#NAMES:t,y\nwave:4,5\nangle:1,gyro:2\n\xff\ninf\n1,2,3,4,5\n"))
+        self.assertEqual(events[:4],[("data",[12.,3.]),("names",["t","y"]),("data",[4.,5.]),("data",[1.,2.])])
+        self.assertEqual([x[0] for x in events[4:]],["bad"]*3)
+        self.assertEqual([x[0] for x in p.feed(b"9"*2049)],["bad"])
+        self.assertEqual(list(p.feed(b"12\n5\n")),[("data",[5.])])
+
+    def test_ack(self):
+        self.assertTrue(match_ack("@ANG.KP=1.2345","ANG.KP=1.235"))
+        self.assertFalse(match_ack("@ANG.KP=1","SPD.KP=1"))
+        self.assertFalse(match_ack("@ANG.KP=1","ANG.KP=2"))
+        self.assertFalse(match_ack("@STOP","RUN"))
+
+    def test_steps(self):
+        t = np.arange(0,10,.01)
+        for direction in [1,-1]:
+            y = np.where(t<1,0, direction*(1-np.exp(-np.maximum(0,t-1))))
+            sp = direction*(t>=1)
+            overshoot,rise,settle,err,_ = step_metrics(t,sp,y)
+            self.assertEqual(overshoot,0)
+            self.assertAlmostEqual(rise,math.log(9),places=3)
+            self.assertAlmostEqual(settle,3.92,places=2)
+            self.assertLess(abs(err),.001)
+        self.assertIsNone(step_metrics(t,np.ones_like(t),t))
+
+    def test_four_channels_rolling(self):
+        b = History()
+        for i in range(30000):
+            b.add(i*.01,[i,2,3,4],(i,))
+        self.assertEqual(b.view().shape,(20000,5))
+        self.assertEqual(b.view()[0,1],10000)
+        self.assertEqual(b.snapshots()[-1],(29999,))
+
+    def test_serial_loopback(self):
+        link = SerialLink({"url":"loop://","baudrate":115200})
+        link.start()
+        try:
+            link.send(b"10,20,30,40\n")
+            received = bytearray()
+            deadline = time.monotonic()+2
+            while time.monotonic()<deadline and not received.endswith(b"\n"):
+                events,_ = link.take()
+                for kind,_,data in events:
+                    if kind == "rx":
+                        received.extend(data)
+                time.sleep(.005)
+            self.assertEqual(received,b"10,20,30,40\n")
+        finally:
+            link.closed.set()
+            link.join(1)
+
+    def test_all_models(self):
+        for model in range(3):
+            sim = Simulator(model)
+            sim.command("@SPD.KP=3")
+            self.assertEqual(sim.params["ANG"]["KP"],2)
+            sim.command("@RUN")
+            for _ in range(600):
+                samples = sim.step("SPD")
+            self.assertTrue(all(np.isfinite(samples)))
+            sim.command("@STOP")
+            self.assertEqual(sim.step("SPD")[2],0)
+
+
+class GuiChecks(unittest.TestCase):
+    def tearDown(self):
+        C.QCoreApplication.sendPostedEvents(None,C.QEvent.Type.DeferredDelete)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = W.QApplication.instance() or W.QApplication([])
+
+    def test_engineering_units_dual_axis_and_target_ack(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp)/"cfg.ini")
+            w.timer.stop()
+            w.set_reference(0,"目标转速",25)
+            w.sample(0.,[12345,700])
+            w.configure_channels([.01,1,1,1],["RPM","PWM","",""],1,["SPD","","",""])
+            self.assertEqual(w.actual_ch.currentData(),0)
+            self.assertEqual(w.target_ch.currentData(),4)
+            self.assertFalse(w.scope.references[0].isVisible())
+            self.assertAlmostEqual(w.buffer.view()[0,1],123.45)
+            w.commands.pending = ("@SPD.TGT=150","SPD",None)
+            w.receive(b"@ACK:ANG.TGT=150\n",time.monotonic())
+            self.assertTrue(np.isnan(w.reference_value(0)))
+            w.receive(b"@ACK:SPD.TGT=150\n",time.monotonic())
+            self.assertEqual(w.reference_value(0),150)
+            w.sample(.1,[15000,850])
+            w.paint_scope()
+            self.assertEqual(w.scope.curves[1].getViewBox(),w.scope.secondary)
+            self.assertLess(w.scope.viewRange()[1][1],200)
+            self.assertGreater(w.scope.secondary.viewRange()[1][1],850)
+            self.assertIn("RPM",w.names()[0])
+            self.assertEqual(w.buffer.view()[-1,5],150)
+            w.select_channel(1)
+            w.actual_ch.setCurrentIndex(w.actual_ch.findData(1))
+            w.refresh_channels()
+            self.assertEqual(w.actual_ch.currentData(),1)
+            w.close()
+
+    def test_parameter_confirmation_batch_and_undo(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp)/"cfg.ini")
+            w.timer.stop()
+            w.source.setCurrentIndex(1)
+            w.toggle_connection()
+            old = w.sim.params["ANG"].copy()
+            w.rules["ANG"]["KP"] = (0,5,.5)
+            w.fields["KP"].setValue(8)
+            w.send_group()
+            self.assertEqual(old,w.sim.params["ANG"])
+            w.fields["KP"].setValue(4)
+            w.fields["KI"].setValue(2.5)
+            with patch.object(W.QMessageBox,"question",return_value=W.QMessageBox.StandardButton.No):
+                w.send_group()
+            self.assertEqual(old,w.sim.params["ANG"])
+            with patch.object(W.QMessageBox,"question",return_value=W.QMessageBox.StandardButton.Yes):
+                w.send_group()
+                for _ in range(5): w.commands.dispatch()
+                self.assertEqual(w.sim.params["ANG"]["KP"],4)
+                self.assertEqual(len(w.undo_history),1)
+                w.commands.undo_parameter()
+                for _ in range(5): w.commands.dispatch()
+            self.assertEqual(w.sim.params["ANG"],old)
+            self.assertFalse(w.undo_history)
+            self.assertEqual(w.fields["KP"].value(),old["KP"])
+            w.close()
+
+    def test_interaction_presets_chips_and_heartbeat(self):
+        class Link:
+            def __init__(self):
+                self.pings = 0
+            def take(self):
+                return [],0
+            def ping(self):
+                self.pings += 1
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp)/"cfg.ini")
+            w.timer.stop()
+            w.show()
+            self.app.processEvents()
+            self.assertTrue(w.pid_panel.isVisible())
+            self.assertFalse(w.terminal_panel.isVisible())
+            link = w.link = Link()
+            w.connected = True
+            w.receive(b"#CAP:PING\n",time.monotonic())
+            w.commands.pending = ("@RUN","ANG",None)
+            w.receive(b"@ACK:RUN\n100,600\n",time.monotonic())
+            w.tick()
+            w.tick()
+            self.assertEqual(link.pings,1)
+            w.next_ping = time.monotonic()-.001
+            w.tick()
+            self.assertEqual(link.pings,2)
+            w.workbench.layout(1)
+            self.assertTrue(w.scope.frozen)
+            w.enabled_ch[1].click()
+            self.assertFalse(w.scope.curves[1].isVisible())
+            w.workbench.layout(2)
+            self.assertTrue(w.terminal_panel.isVisible())
+            w.receive(b"#STOP:heartbeat\n",time.monotonic())
+            self.assertFalse(w.send_heartbeat)
+            self.assertIn("超时",w.stop_banner.text())
+            w.link = None
+            w.close()
+
+    def test_scope_controls_and_saved_settings(self):
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp)/"settings.ini"
+            old = C.QSettings(str(config),C.QSettings.Format.IniFormat)
+            old.setValue("options",'{"window": 2}')
+            old.sync()
+            w = Window(config)
+            w.timer.stop()
+            self.assertEqual(w.window.value(),30)
+            w.set_reference(0,"目标",2)
+            for i in range(10):
+                w.sample(float(i),[float(i)])
+            w.window.setValue(2.75)
+            w.x_div.setValue(.25)
+            w.y_div.setValue(20)
+            self.assertEqual(w.scope.getAxis("bottom").tickSpacing(0,2.75,900)[0],(.25,0))
+            self.assertEqual(w.scope.getAxis("bottom").tickStrings([.25,.75],1,.25),["0.25","0.75"])
+            self.assertEqual(w.scope.getAxis("left").tickSpacing(0,200,600)[0],(20,0))
+            self.assertLess(len(w.scope.getAxis("bottom").tickValues(0,86400,1000)[0][1]),40)
+            w.measure()
+            np.testing.assert_allclose(w.scope.viewRange()[0],[6.25,9])
+            self.assertIn("峰峰值 2",w.measure_text.text())
+            self.assertIn("9",w.scope.legend.getLabel(w.scope.curves[0]).text)
+            w.toggle_freeze()
+            w.window.setValue(1.5)
+            np.testing.assert_allclose(w.scope.viewRange()[0],[7.5,9])
+            def select(hex_color,accept):
+                dialog = W.QApplication.activeModalWidget()
+                dialog.setCurrentColor(QtGui.QColor(hex_color))
+                dialog.accept() if accept else dialog.reject()
+            C.QTimer.singleShot(0,lambda: select("#e6194b",True))
+            w.color_buttons[0].click()
+            C.QTimer.singleShot(0,lambda: select("#00ff00",False))
+            w.color_buttons[0].click()
+            C.QTimer.singleShot(0,lambda: select("#aa3377",True))
+            w.color_buttons[4].click()
+            w.line.setValue(1.75)
+            self.assertEqual(w.scope.curves[0].opts["pen"].color().name(),"#e6194b")
+            self.assertEqual(w.scope.references[0].pen.color().name(),"#aa3377")
+            self.assertEqual(w.scope.references[0].pen.widthF(),1.75)
+            w.close()
+            reopened = Window(config)
+            self.assertEqual(reopened.window.value(),1.5)
+            self.assertEqual(reopened.x_div.value(),.25)
+            self.assertEqual(reopened.y_div.value(),20)
+            self.assertEqual(reopened.colors[0],"#e6194b")
+            self.assertEqual(reopened.colors[4],"#aa3377")
+            reopened.close()
+
+    def test_edge_capture_and_cancel(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp)/"settings.ini")
+            w.timer.stop()
+            w.connected = True
+            w.trigger_level.setValue(5)
+            w.pre_percent.setValue(50)
+            for edge,before,after in ((0,4,6),(1,6,4),(2,6,4)):
+                w.clear_plot()
+                w.trigger_edge.setCurrentIndex(edge)
+                w.sample(0.,[before])
+                w.capture.arm_capture()
+                w.sample(1.,[after])
+                self.assertFalse(w.scope.frozen)
+                w.sample(2.,[after])
+                self.assertTrue(w.scope.frozen)
+                np.testing.assert_allclose(w.scope.viewRange()[0],[0.,2.])
+                w.sample(3.,[0.])
+                self.assertEqual(w.scope.data[-1,0],2.)
+                self.assertEqual(w.buffer.view()[-1,0],3.)
+                w.toggle_freeze()
+            w.capture.arm_capture()
+            w.capture.arm_capture()
+            self.assertIsNone(w.capture.capture_channel)
+            self.assertEqual(w.tx,0)
+            w.close()
+
+    def test_terminal_groups_split_and_batched_readings(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp)/"settings.ini")
+            w.timer.stop()
+            w.clear_log()
+            stamp = time.monotonic()
+            def displayed():
+                w.render_log()
+                return [line.split("  ",1)[1] for line in w.terminal.toPlainText().splitlines()]
+
+            for chunk in (b"1", b"5", b"6"):
+                w.receive(chunk,stamp)
+            self.assertEqual(displayed(),["接收  156"])
+            w.receive(b"\r",stamp)
+            w.receive(b"\n122.8\r\n\r\n-3.1\n",stamp)
+            self.assertEqual(displayed(),["接收  156","接收  122.8","接收  -3.1"])
+            self.assertEqual(w.frames,3)
+            w.hex_mode.setChecked(True)
+            self.assertEqual(displayed()[0],"接收  31 35 36 0D 0A")
+            w.hex_mode.setChecked(False)
+            w.receive(b"old",stamp)
+            w.clear_log()
+            w.receive(b"7\r8\n",stamp)
+            entries = displayed()
+            self.assertEqual(entries[:2],["接收  7","接收  8"])
+            self.assertIn("错误帧 1",entries[2])
+            w.close()
+
+    def test_session(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp)/"settings.ini")
+            w.timer.stop()
+            w.source.setCurrentIndex(1)
+            w.toggle_connection()
+            self.assertIn("ANG.KP",w.confirmed)
+            for _ in range(5):
+                w.sample(w.frames*.01,w.sim.step("ANG"))
+            w.run_device()
+            for _ in range(500):
+                w.sample(w.frames*.01,w.sim.step("ANG"))
+            w.fields["KP"].setValue(2.75)
+            w.send_field("KP")
+            self.assertEqual(w.confirmed["ANG.KP"],2.75)
+            w.toggle_freeze()
+            w.analyze()
+            self.assertIn("超调",w.metrics.text())
+            old = w.scope.data.copy()
+            w.sample(5.05,w.sim.step("ANG"))
+            np.testing.assert_array_equal(old,w.scope.data)
+            w.choose_file = lambda title,suffix: str(Path(tmp)/("data."+suffix))
+            w.export_view()
+            with open(Path(tmp)/"data.csv",encoding="utf-8-sig") as f:
+                csvdata = list(csv.reader(f))
+                self.assertEqual(len(csvdata[0]),21)
+                self.assertEqual(len(csvdata)-1,len(old))
+            w.record()
+            w.sample(5.06,w.sim.step("ANG"))
+            w.end_record()
+            with open(Path(tmp)/"data.csv",encoding="utf-8-sig") as f:
+                row = list(csv.reader(f))[1]
+                self.assertEqual(float(row[5]),2.75)
+            w.png()
+            self.assertTrue((Path(tmp)/"data.png").read_bytes().startswith(b"\x89PNG"))
+            w.stop_device()
+            self.assertFalse(w.sim.running)
+            w.disconnect()
+            w.close()
+            other = Window(Path(tmp)/"settings.ini")
+            self.assertEqual(other.fields["KP"].value(),2.75)
+            other.close()
+
+    def test_detected_channels_and_local_reference(self):
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp)/"settings.ini"
+            w = Window(config)
+            w.timer.stop()
+            self.assertEqual(w.target_ch.count(),0)
+            w.set_reference(0,"目标转速",150)
+            w.sample(0.,[145])
+            w.name_edits[0].setText("实际转速")
+            w.channel_names()
+            self.assertEqual(w.actual_ch.currentData(),0)
+            self.assertEqual(w.target_ch.currentData(),4)
+            self.assertTrue(w.channel_form.isRowVisible(w.name_edits[0]))
+            self.assertFalse(w.channel_form.isRowVisible(w.name_edits[1]))
+            w.receive(b"#NAMES:rpm,extra\n",time.monotonic())
+            self.assertEqual(w.names()[0],"实际转速")
+            w.sample(.1,[146,8])
+            self.assertTrue(w.channel_form.isRowVisible(w.name_edits[1]))
+            w.toggle_freeze()
+            w.sample(.2,[147])
+            self.assertEqual(w.actual_ch.count(),3)
+            w.toggle_freeze()
+            self.assertEqual(w.actual_ch.count(),2)
+            self.assertFalse(w.channel_form.isRowVisible(w.name_edits[1]))
+            w.ref_rows[0][2].setValue(160)
+            w.sample(.3,[148])
+            w.sample(.4,[155])
+            w.paint_scope()
+            w.analyze()
+            self.assertIn("超调",w.metrics.text())
+            self.assertEqual(w.tx,0)
+            self.assertEqual(w.bad,0)
+            self.assertEqual(w.scope.references[0].value(),160)
+            self.assertEqual(w.scope.legend_channels,((0,"实际转速"),))
+            w.choose_file = lambda *_: str(Path(tmp)/"test.csv")
+            w.export_view()
+            with open(Path(tmp)/"test.csv",encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual([float(r["REF_目标转速"]) for r in rows],[150,150,150,160,160])
+            self.assertEqual(rows[2]["CH2_extra"],"")
+            w.close()
+            w = Window(config)
+            self.assertEqual(w.names()[0],"实际转速")
+            self.assertTrue(w.ref_active[0])
+            self.assertEqual(w.scope.references[0].value(),160)
+            w.remove_reference(0)
+            self.assertFalse(w.scope.references[0].isVisible())
+            w.close()
+
+    def test_wrong_ack_and_timeout(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp)/"settings.ini")
+            w.timer.stop()
+            w.commands.pending = ("@ANG.KP=1","ANG",time.monotonic()-1)
+            w.commands.waiting.append(("@RUN","ANG",False))
+            w.receive(b"@ACK:SPD.KP=1\n",time.monotonic())
+            self.assertIsNotNone(w.commands.pending)
+            w.tick()
+            self.assertIsNone(w.commands.pending)
+            self.assertFalse(w.commands.waiting)
+            self.assertFalse(w.confirmed)
+            self.assertIn("超时",w.ack.text())
+            w.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
