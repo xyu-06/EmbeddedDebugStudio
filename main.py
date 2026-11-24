@@ -17,6 +17,7 @@ from PySide6 import QtCore as C, QtGui, QtWidgets as W
 from serial.tools import list_ports
 
 from engine import DEFAULTS, KEYS, LIMIT, LOOPS, Lines, Simulator, step_metrics
+from generator import SHAPES, TargetGenerator
 from layout_ui import STYLE, build, number
 from scope import COLORS, REF_COLORS
 from storage import History, PARAM_COLS, csv_header, csv_row
@@ -36,6 +37,10 @@ class Window(W.QMainWindow):
         self.commands = DeviceSession(self)
         self.ping_capable = self.send_heartbeat = False
         self.next_ping = 0.
+        self.generator = None
+        self.reconnect_at = self.reconnect_opts = None
+        self.reconnecting = False
+        self.reconnect_attempts = 0
         self.field_errors = set()
         self.undo_history = deque(maxlen=25)
         self.rollback = None
@@ -169,9 +174,9 @@ class Window(W.QMainWindow):
         self.save_draft()
         s = self.settings
         opts = {name:getattr(self,name).currentIndex() for name in
-                ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode")}
-        opts.update({name:getattr(self,name).value() for name in ("rate","ymin","ymax","line","trigger_level","capture_seconds","pre_percent","x_div","y_div")})
-        opts.update({name:getattr(self,name).isChecked() for name in ("grid","legend","show_stats","auto","autoscroll","hex_mode","reduce_motion","dark","overlays","terminal_toggle")})
+                ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode","gen_shape")}
+        opts.update({name:getattr(self,name).value() for name in ("rate","ymin","ymax","line","trigger_level","capture_seconds","pre_percent","x_div","y_div","gen_amp","gen_period","gen_rate")})
+        opts.update({name:getattr(self,name).isChecked() for name in ("grid","legend","show_stats","auto","autoscroll","hex_mode","reduce_motion","dark","overlays","terminal_toggle","auto_reconnect")})
         s.setValue("layoutPreset",self.preset.currentIndex())
         opts.update(window_seconds=self.window.value(),colors=self.colors)
         opts.update(scales=self.scales, units=self.units, right_channel=self.right_channel,
@@ -201,7 +206,7 @@ class Window(W.QMainWindow):
             for g,rules in opts.get("rules",{}).items():
                 if g in LOOPS and isinstance(rules,dict):
                     self.rules[g].update({k:tuple(v) for k,v in rules.items() if k in KEYS and valid_rule(v)})
-            for key in ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode"):
+            for key in ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode","gen_shape"):
                 w = getattr(self,key)
                 value = opts.get(key,w.currentIndex())
                 if isinstance(value,int) and 0 <= value < w.count():
@@ -213,10 +218,10 @@ class Window(W.QMainWindow):
             for i,color in enumerate(opts.get("colors",[])[:8]):
                 if isinstance(color,str) and QtGui.QColor.isValidColorName(color):
                     self.colors[i] = QtGui.QColor(color).name()
-            for key in ("rate","ymin","ymax","line","trigger_level","capture_seconds","pre_percent","x_div","y_div"):
+            for key in ("rate","ymin","ymax","line","trigger_level","capture_seconds","pre_percent","x_div","y_div","gen_amp","gen_period","gen_rate"):
                 if key in opts:
                     getattr(self,key).setValue(float(opts[key]))
-            for key in ("grid","legend","show_stats","auto","autoscroll","hex_mode","reduce_motion","dark","overlays","terminal_toggle"):
+            for key in ("grid","legend","show_stats","auto","autoscroll","hex_mode","reduce_motion","dark","overlays","terminal_toggle","auto_reconnect"):
                 if key in opts:
                     getattr(self,key).setChecked(bool(opts[key]))
             for key in ("port","baud"):
@@ -271,7 +276,7 @@ class Window(W.QMainWindow):
         single = self.address.currentIndex() == 1
         if single:
             self.group.setCurrentIndex(0)
-        self.group.setEnabled(not single and not (self.sim and self.writer))
+        self.group.setEnabled(not single and not (self.sim and self.writer) and self.generator is None)
 
     def edited(self,key,value):
         self.drafts[self.selected()][key] = value
@@ -298,18 +303,23 @@ class Window(W.QMainWindow):
 
     def source_ui(self):
         sim = self.source.currentIndex() == 1
-        busy = self.connected or self.link is not None
+        waiting = self.reconnect_at is not None
+        busy = self.connected or self.link is not None or waiting
         self.source.setEnabled(not busy)
         self.model.setEnabled(not busy)
         self.serial_form.setRowVisible(self.model,sim)
         self.serial_form.setRowVisible(self.baud,not sim)
         self.serial_form.setRowVisible(1,not sim)
+        self.serial_form.setRowVisible(self.auto_reconnect,not sim)
         for w in (self.port,self.refresh_btn,self.baud,self.bits,self.parity,self.stops,self.flow,self.time_mode,self.rate):
             w.setEnabled(not busy and not sim)
         self.connect_btn.setEnabled(not self.closing)
-        self.connect_btn.setText("关闭仿真" if self.sim else "断开" if busy else "打开仿真" if sim else "连接串口")
+        self.connect_btn.setText("关闭仿真" if self.sim else "取消重连" if waiting or (self.reconnecting and not self.connected)
+                                 else "断开" if busy else "打开仿真" if sim else "连接串口")
         self.stop_btn.setEnabled(self.connected)
-        self.badge.setText("仿真练习" if self.sim else "串口已连接" if self.connected else "正在关闭…" if self.closing else "正在连接…" if busy else "未连接")
+        self.gen_btn.setEnabled(self.connected or self.generator is not None)
+        self.badge.setText("仿真练习" if self.sim else "串口已连接" if self.connected else "正在关闭…" if self.closing
+                           else "等待重连…" if waiting or self.reconnecting else "正在连接…" if busy else "未连接")
         if hasattr(self,"workbench"):
             self.workbench.connection()
             self.workbench.fields()
@@ -341,6 +351,11 @@ class Window(W.QMainWindow):
         self.ack.setText("等待操作")
 
     def toggle_connection(self):
+        if self.reconnect_at is not None or (self.reconnecting and not self.connected):
+            self.cancel_reconnect()
+            if self.link:
+                self.disconnect()
+            return
         if self.connected or self.link:
             self.disconnect()
             return
@@ -366,11 +381,35 @@ class Window(W.QMainWindow):
                 self.feedback(str(exc),True)
                 return
             self.fresh_session()
+            self.reconnect_opts = opts
             self.link = SerialLink(opts)
             self.link.start()
         self.source_ui()
 
+    def cancel_reconnect(self):
+        self.reconnect_at = None
+        self.reconnecting = False
+        self.reconnect_attempts = 0
+        self.connection_error = False
+        self.source_ui()
+
+    def reconnect(self):
+        """Reopen the same port after an unexpected loss. The plot and parameters stay;
+        the device is only read back (@GET), never started automatically."""
+        self.reconnect_at = None
+        self.reconnecting = True
+        self.reconnect_attempts += 1
+        self.parser = Lines()
+        self.parser.skipping = True
+        self.rx_log_tail = None
+        self.link = SerialLink(self.reconnect_opts)
+        self.link.start()
+        self.source_ui()
+
     def disconnect(self):
+        self.stop_generator("连接已关闭",restore=False)
+        self.reconnect_at = None
+        self.reconnecting = False
         self.send_heartbeat = False
         self.capture.cancel_capture("连接已关闭")
         self.end_record()
@@ -475,10 +514,76 @@ class Window(W.QMainWindow):
     def stop_device(self):
         if not self.connected:
             return
+        self.stop_generator("急停",restore=False)
         self.workbench.stop_feedback()
         self.send_heartbeat = False
         self.commands.clear()
         self.enqueue("@STOP",urgent=True)
+
+    def toggle_generator(self):
+        if self.generator:
+            self.stop_generator("发生器已停止，TGT 已恢复")
+            return
+        if not self.connected:
+            self.feedback("请先连接串口或打开仿真",True)
+            return
+        group = self.selected()
+        with C.QSignalBlocker(self.fields["TGT"]):
+            self.fields["TGT"].interpretText()
+        try:
+            gen = TargetGenerator(self.gen_shape.currentIndex(),self.fields["TGT"].value(),
+                                  self.gen_amp.value(),self.gen_period.value(),self.gen_rate.value())
+        except ValueError as exc:
+            self.feedback(str(exc),True)
+            return
+        if gen.amplitude == 0:
+            self.feedback("发生器幅值不能为零",True)
+            return
+        low,high,_ = self.rules[group]["TGT"]
+        lo,hi = gen.bounds()
+        if lo < low or hi > high:
+            self.feedback(f"发生器范围 {lo:g} 至 {hi:g} 超出 {group}.TGT 允许范围 {low:g} 至 {high:g}",True)
+            return
+        self.generator = gen
+        self.generator_group = group
+        self.generator_ui()
+        self.log("系统",f"目标值发生器启动  {SHAPES[gen.shape]}  基准 {gen.base:g}  幅值 {gen.amplitude:g}  周期 {gen.period:g} s")
+        self.generator_tick(monotonic())
+
+    def generator_ui(self):
+        running = self.generator is not None
+        self.gen_btn.setText("停止发生器" if running else "启动发生器")
+        self.gen_btn.setObjectName("danger" if running else "")
+        self.gen_btn.style().unpolish(self.gen_btn)
+        self.gen_btn.style().polish(self.gen_btn)
+        for widget in (self.gen_shape,self.gen_amp,self.gen_period,self.gen_rate,self.fields["TGT"]):
+            widget.setEnabled(not running)
+        self.group.setEnabled(not running and self.address.currentIndex()!=1 and not (self.sim and self.writer))
+        if running:
+            self.gen_status.setText(f"运行中 · {SHAPES[self.generator.shape]} · {self.generator_group}.TGT")
+        self.gen_btn.setEnabled(self.connected or running)
+
+    def stop_generator(self,message="",restore=True):
+        gen = self.generator
+        if gen is None:
+            return
+        self.generator = None
+        self.generator_ui()
+        self.gen_status.setText(message or "已停止")
+        if restore and self.connected and gen.last_sent is not None and gen.last_sent != gen.base:
+            self.commands.submit([self.key("TGT")+"="+format(gen.base,".4f")],quiet=True)
+        if message:
+            self.log("系统","目标值发生器  "+message)
+
+    def generator_tick(self,now):
+        gen = self.generator
+        if gen is None or not self.connected or self.commands.busy():
+            return
+        value = gen.due(now)
+        if value is StopIteration:
+            self.stop_generator("单次阶跃完成",restore=False)
+        elif value is not None:
+            self.commands.submit([self.key("TGT")+"="+format(value,".4f")],quiet=True)
 
     def enqueue(self,command,urgent=False):
         self.commands.submit([command],urgent)
@@ -522,10 +627,15 @@ class Window(W.QMainWindow):
                 self.ping_capable = True
             elif kind == "log" and payload.startswith("#ERROR:float printf"):
                 self.feedback("设备浮点格式化自检失败，请启用 -u _printf_float 后重新链接",True)
-            elif kind == "log" and payload == "#STOP:heartbeat":
+            elif kind == "log" and payload.startswith("#STOP:"):
+                reason = payload[6:].strip()
+                text = {"heartbeat":("设备因心跳超时已停机","设备已报告心跳超时停机"),
+                        "fall":("检测到倒地，设备已自动停机","检测到倒地 · 输出已清零，扶正后再点启动")}.get(
+                        reason,("设备已停机  "+reason,"设备已停机 · "+reason))
                 self.send_heartbeat = False
-                self.commands.failed("设备因心跳超时已停机")
-                self.stop_banner.setText("设备已报告心跳超时停机")
+                self.stop_generator(text[0],restore=False)
+                self.commands.failed(text[0])
+                self.stop_banner.setText(text[1])
                 self.stop_banner.show()
             elif kind == "names":
                 if not self.writer:
@@ -575,8 +685,17 @@ class Window(W.QMainWindow):
             for kind,stamp,data in batch:
                 if kind == "open" and not self.closing:
                     self.connected = True
-                    self.source_ui()
-                    self.log("系统","已连接 " + str(data))
+                    self.connection_error = False
+                    if self.reconnecting:
+                        self.reconnecting = False
+                        self.reconnect_attempts = 0
+                        self.notice.hide()
+                        self.log("系统","已重新连接 " + str(data) + "，正在读回参数（不会自动启动）")
+                        self.source_ui()
+                        self.read_params()
+                    else:
+                        self.source_ui()
+                        self.log("系统","已连接 " + str(data))
                 elif kind == "rx":
                     self.receive(data,stamp)
                 elif kind == "gap":
@@ -590,9 +709,15 @@ class Window(W.QMainWindow):
                     self.commands.written(data,stamp)
                 elif kind == "error":
                     self.connection_error = True
-                    self.commands.failed("串口异常  " + data)
                     self.badge.setToolTip(data)
+                    if self.reconnecting:
+                        if self.reconnect_attempts <= 1 or self.reconnect_attempts % 10 == 0:
+                            self.log("系统",f"重连第 {self.reconnect_attempts} 次失败  {data}")
+                    else:
+                        self.stop_generator("串口异常",restore=False)
+                        self.commands.failed("串口异常  " + data)
                 elif kind == "closed":
+                    unexpected = not self.closing and self.connection_error
                     self.send_heartbeat = False
                     self.capture.cancel_capture("连接已关闭")
                     self.rx_log_tail = None
@@ -600,13 +725,29 @@ class Window(W.QMainWindow):
                     self.closing = self.connected = False
                     self.commands.clear()
                     self.end_record()
+                    if unexpected and self.auto_reconnect.isChecked() and self.reconnect_opts and not self.sim:
+                        self.reconnect_at = now + min(3., 1. + .2*self.reconnect_attempts)
+                        if not self.reconnecting:
+                            self.feedback("串口断开，将自动重连（设备会因心跳超时自行停机）",True)
+                    else:
+                        self.reconnecting = False
                     self.source_ui()
-        if self.link and self.connected and self.send_heartbeat and now >= self.next_ping:
-            self.link.ping()
-            self.next_ping = now+.2
+                    break
+        if self.link:
+            self.link.keepalive(self.connected and self.send_heartbeat)
+        elif self.reconnect_at is not None and now >= self.reconnect_at:
+            self.reconnect()
         if self.sim:
+            if self.send_heartbeat:
+                self.sim.ping()
             due = int((now-self.epoch)/self.sim.dt)
-            for _ in range(min(100,max(0,due-self.sim_steps))):
+            lag = due-self.sim_steps
+            if lag > 30:
+                # The UI stalled (window drag, modal dialog). Pause the simulated world
+                # instead of fast-forwarding it unseen.
+                self.epoch += (lag-30)*self.sim.dt
+                lag = 30
+            for _ in range(max(0,lag)):
                 self.sim_steps += 1
                 v = self.sim.step(self.selected())
                 self.sample(self.sim_steps*self.sim.dt,v)
@@ -614,8 +755,13 @@ class Window(W.QMainWindow):
                 self.rx += len(wire)
                 if self.sim_steps % 5 == 0:
                     self.log("仿真 RX",wire)
+                for line in self.sim.drain():
+                    self.receive((line+"\n").encode(),now)
+                if not self.sim:
+                    break
         if self.commands.timed_out(now):
             self.commands.failed("应答超时，已取消后续命令  " + self.commands.pending[0])
+        self.generator_tick(now)
         self.commands.dispatch()
         if self.buffer.size and (self.scope.drawn_view != self.scope.viewport_key() or
                                  (not self.scope.frozen and self.last_paint != self.frames)):

@@ -2,7 +2,8 @@ from functools import partial
 
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 
-from engine import DEFAULTS, KEYS, LIMIT, LOOPS
+from engine import DEFAULTS, KEYS, LIMIT, LOOPS, MODELS
+from generator import SHAPES
 from scope import COLORS, REF_COLORS, Scope
 
 
@@ -175,8 +176,11 @@ def build(w):
     w.baud = combo(["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"], 4)
     w.baud.setEditable(True)
     f.addRow("波特率", w.baud)
-    w.model = combo(["一阶惯性", "二阶振荡", "一阶含延迟"])
+    w.model = combo(list(MODELS))
+    w.model.setToolTip("倒立摆：不加控制会倒下，D 项作用于角速度（相当于陀螺仪），倾角超过 45° 自动停机")
     f.addRow("仿真对象", w.model)
+    w.auto_reconnect = check("断线后自动重连（只读回参数，不自动启动）", True)
+    f.addRow(w.auto_reconnect)
     w.serial_form = f
 
     f = section("串口与数据格式", False)
@@ -298,6 +302,26 @@ def build(w):
     w.ack = W.QLabel("等待操作")
     w.ack.setWordWrap(True)
     f.addRow(w.ack)
+    line = W.QFrame()
+    line.setFrameShape(W.QFrame.Shape.HLine)
+    line.setStyleSheet("color:#d3dae1")
+    panel.addWidget(line)
+    panel.addWidget(W.QLabel("<b>目标值发生器</b>"))
+    g = W.QFormLayout()
+    panel.addLayout(g)
+    w.gen_shape = combo(list(SHAPES), 1)
+    w.gen_amp = number(5, -LIMIT, LIMIT, 1, 3)
+    w.gen_amp.setToolTip("相对启动时 TGT 输入框数值的偏移量，可为负")
+    w.gen_period = number(2, .05, 3600, .5, 2)
+    w.gen_rate = number(10, 1, 50, 1, 0)
+    w.gen_rate.setToolTip("正弦、三角波每秒下发 TGT 的次数；阶跃、方波只在跳变时下发")
+    for label, widget in [("波形", w.gen_shape), ("幅值", w.gen_amp), ("周期 s", w.gen_period), ("节拍 Hz", w.gen_rate)]:
+        g.addRow(label, widget)
+    w.gen_btn = button("启动发生器", w.toggle_generator)
+    g.addRow(w.gen_btn)
+    w.gen_status = W.QLabel("以 TGT 输入框为基准，停止后恢复")
+    w.gen_status.setWordWrap(True)
+    g.addRow(w.gen_status)
     panel.addStretch()
 
     f = section("阶跃与游标", True)

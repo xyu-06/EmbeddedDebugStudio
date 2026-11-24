@@ -5,10 +5,18 @@ from command_queue import CommandQueue
 from engine import LOOPS, KEYS, LIMIT, match_ack, parameter_pairs
 
 
+def ask_confirmation(parent, changes):
+    """Default confirmation for large parameter changes. Tests and tools may inject another."""
+    return W.QMessageBox.question(parent,"确认参数变化","确认下发以下变化？\n"+"\n".join(changes),
+            W.QMessageBox.StandardButton.Yes | W.QMessageBox.StandardButton.No,
+            W.QMessageBox.StandardButton.No) == W.QMessageBox.StandardButton.Yes
+
+
 class DeviceSession(CommandQueue):
-    def __init__(self, window):
+    def __init__(self, window, confirm=None):
         super().__init__()
         self.ui = window
+        self.confirm = confirm or (lambda changes: ask_confirmation(self.ui, changes))
 
     def retry_last(self):
         cmd = self.ui.retry_command
@@ -27,7 +35,9 @@ class DeviceSession(CommandQueue):
         self.submit(commands,undo=(batch,previous))
 
 
-    def submit(self,commands,urgent=False,undo=None):
+    def submit(self,commands,urgent=False,undo=None,quiet=False):
+        """quiet: generator traffic. Range limits still apply, but no confirmation,
+        undo history, change markers or log entries per acknowledgement."""
         if not self.ui.connected:
             self.ui.feedback("请先连接串口或打开仿真",True)
             return
@@ -49,14 +59,12 @@ class DeviceSession(CommandQueue):
                 self.ui.feedback(f"{g}.{k} 允许范围为 {low:g} 至 {high:g}",True)
                 return
             previous = self.ui.confirmed.get(g+"."+k)
-            if abs(value-(previous if previous is not None else 0.)) >= threshold:
+            if not quiet and abs(value-(previous if previous is not None else 0.)) >= threshold:
                 before = "未读回" if previous is None else f"{previous:g}"
                 changes.append(f"{g}.{k}　{before} → {value:g}")
-        if changes and W.QMessageBox.question(self.ui,"确认参数变化","确认下发以下变化？\n"+"\n".join(changes),
-                W.QMessageBox.StandardButton.Yes | W.QMessageBox.StandardButton.No,
-                W.QMessageBox.StandardButton.No) != W.QMessageBox.StandardButton.Yes:
+        if changes and not self.confirm(changes):
             return
-        if not self.ui.connected or not self.append(commands,group,urgent):
+        if not self.ui.connected or not self.append(commands,group,urgent,quiet):
             self.ui.feedback("待发送命令已满",True)
             return
         self.ui.rollback = (self.batch,undo) if undo else self.ui.rollback
@@ -72,17 +80,23 @@ class DeviceSession(CommandQueue):
             return
         cmd,urgent = next_cmd
         wire = (cmd+"\n").encode()
-        self.ui.ack.setText("等待应答  " + cmd)
+        if not self.active_is_quiet():
+            self.ui.ack.setText("等待应答  " + cmd)
         if self.ui.sim:
             self.ui.tx += len(wire)
             self.ui.log("TX",wire)
-            reply = (self.ui.sim.command(cmd)+"\n").encode()
-            self.ui.receive(reply,monotonic())
+            reply = self.ui.sim.command(cmd)
+            if reply:
+                self.ui.receive((reply+"\n").encode(),monotonic())
+            else:
+                self.pending = None   # e.g. @PING: the device sends no reply
         elif not self.ui.link.send(wire,urgent):
             self.failed("发送队列已满")
 
 
     def failed(self,msg):
+        if getattr(self.ui,"generator",None):
+            self.ui.stop_generator("命令失败，发生器已停止",restore=False)
         self.ui.rollback = None
         self.ui.retry_command = self.pending[0] if self.pending else None
         if self.ui.retry_command and "=" in self.ui.retry_command:
@@ -140,6 +154,7 @@ class DeviceSession(CommandQueue):
                 self.ui.stop_banner.hide()
         self.ui.retry_command = None
         self.ui.notice.hide()
+        quiet = self.active_is_quiet()
         if "=" in cmd:
             try:
                 updates = parameter_pairs(payload,group)
@@ -158,7 +173,7 @@ class DeviceSession(CommandQueue):
                     if g==self.ui.selected():
                         with C.QSignalBlocker(self.ui.fields[k]):
                             self.ui.fields[k].setValue(value)
-                elif old is not None and old!=value:
+                elif old is not None and old!=value and not quiet:
                     batch = self.active_batch
                     if not self.ui.undo_history or self.ui.undo_history[-1][0]!=batch:
                         self.ui.undo_history.append((batch,{}))
@@ -167,6 +182,11 @@ class DeviceSession(CommandQueue):
                 self.ui.field_errors.discard(addr)
             self.ui.confirmed.update(updates)
             self.ui.update_params()
+            if quiet:
+                self.pending = None
+                self.ui.ack.setText("发生器  " + payload)
+                self.ui.workbench.fields()
+                return
             for addr in updates:
                 self.ui.workbench.field_event(addr)
             self.ui.mark(payload)

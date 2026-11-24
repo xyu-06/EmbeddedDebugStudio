@@ -1,0 +1,11 @@
+# Line endings: LF in the repository and working tree for sources,
+# CRLF only for Windows scripts. Binary assets are never converted.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.ico binary
+*.png binary
+*.docx binary
+*.pdf binary
+*.exe binary
+*.zip binary

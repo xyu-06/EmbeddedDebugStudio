@@ -213,7 +213,7 @@ class Scope(pg.PlotWidget):
         t,y = data[k:,0],data[k:,actual]
         goal,y0 = targets[k],data[k-1,actual]
         z = (y-y0)/(goal-y0)
-        peak = int(np.argmax(z))
+        peak = int(np.nanargmax(z))
         view = self.secondary if actual-1==self.right_channel else self.getViewBox()
         signature = (t[0],goal,y0,band,t[peak],y[peak],metrics[1],metrics[2],view,actual)
         if self.step_signature!=signature:

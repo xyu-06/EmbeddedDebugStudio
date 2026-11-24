@@ -123,7 +123,8 @@ class Workbench(C.QObject):
         elif self.previous_connection and not w.connected:
             w.cards[0].setChecked(True)
         self.previous_connection = w.connected
-        mode = ("connected" if w.connected else "opening" if w.link else "error" if w.connection_error else "idle")
+        reconnecting = getattr(w,"reconnect_at",None) is not None or getattr(w,"reconnecting",False)
+        mode = ("connected" if w.connected else "opening" if w.link or reconnecting else "error" if w.connection_error else "idle")
         if mode!=self.last_badge_mode:
             self.last_badge_mode = mode
             if self.breath:
@@ -147,7 +148,7 @@ class Workbench(C.QObject):
         text = w.badge.text().removeprefix("● ")
         w.badge.setText("● "+("连接异常" if mode=="error" else text))
         w.badge.setStyleSheet("color:"+color)
-        w.guide.setVisible(not w.connected and not w.link and not w.buffer.size)
+        w.guide.setVisible(not w.connected and not w.link and not reconnecting and not w.buffer.size)
 
     def fields(self):
         w = self.w

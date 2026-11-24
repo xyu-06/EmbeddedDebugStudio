@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 import numpy as np
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 from engine import Lines, Simulator, match_ack, step_metrics
+from generator import TargetGenerator
 from main import Window
 from storage import History
 from transport import SerialLink
@@ -85,7 +86,7 @@ class CoreChecks(unittest.TestCase):
             link.join(1)
 
     def test_all_models(self):
-        for model in range(3):
+        for model in range(4):
             sim = Simulator(model)
             sim.command("@SPD.KP=3")
             self.assertEqual(sim.params["ANG"]["KP"],2)
@@ -95,6 +96,95 @@ class CoreChecks(unittest.TestCase):
             self.assertTrue(all(np.isfinite(samples)))
             sim.command("@STOP")
             self.assertEqual(sim.step("SPD")[2],0)
+
+    def test_pendulum_balances_and_falls(self):
+        sim = Simulator(3)
+        self.assertEqual(sim.command("@RUN"),"#CAP:PING\n@ACK:RUN")
+        for _ in range(500):
+            target,angle,_,_ = sim.step("ANG")
+        self.assertTrue(sim.running)
+        self.assertAlmostEqual(angle,target,delta=.2)
+        sim.command("@STOP")
+        for key in ("KP","KI","KD"):
+            sim.command(f"@ANG.{key}=0")
+        sim.command("@RUN")
+        for _ in range(300):
+            sim.step("ANG")
+            if not sim.running:
+                break
+        self.assertFalse(sim.running)
+        self.assertEqual(sim.drain(),["#STOP:fall"])
+        self.assertEqual(sim.step("ANG")[2],0)
+
+    def test_simulated_heartbeat(self):
+        sim = Simulator(0)
+        sim.command("@RUN")
+        for _ in range(100):
+            sim.step("ANG")
+        self.assertTrue(sim.running)        # not armed until the host pings
+        self.assertEqual(sim.command("@PING"),"")
+        for _ in range(49):
+            sim.step("ANG")
+        self.assertTrue(sim.running)
+        sim.ping()
+        for _ in range(60):
+            sim.step("ANG")
+        self.assertFalse(sim.running)
+        self.assertEqual(sim.drain(),["#STOP:heartbeat"])
+
+    def test_metrics_ignore_missing_samples(self):
+        t = np.arange(0,5,.01)
+        y = np.where(t<1,0,1-np.exp(-np.maximum(0,t-1)))
+        y[150:155] = np.nan
+        metrics = step_metrics(t,(t>=1).astype(float),y)
+        self.assertTrue(all(m is None or np.isfinite(m) for m in metrics))
+        self.assertGreater(metrics[4],0)
+
+    def test_generator_shapes(self):
+        square = TargetGenerator(1,10,5,1.)
+        self.assertEqual([square.value(x) for x in (0,.4,.6,1.1)],[15,15,10,15])
+        sine = TargetGenerator(2,0,2,4.)
+        self.assertAlmostEqual(sine.value(1.),2)
+        self.assertEqual(sine.bounds(),(-2,2))
+        tri = TargetGenerator(3,0,4,4.)
+        self.assertEqual([tri.value(x) for x in (0,1,2,3)],[0,4,0,-4])
+        step = TargetGenerator(0,1,2,.5)
+        self.assertEqual(step.due(100.),3)
+        self.assertIsNone(step.due(100.2))
+        self.assertEqual(step.due(100.6),1)
+        self.assertIs(step.due(100.7),StopIteration)
+        sine = TargetGenerator(2,0,1,1.,rate=10)
+        self.assertIsNotNone(sine.due(0.))
+        self.assertIsNone(sine.due(.05))
+        self.assertIsNotNone(sine.due(.11))
+        with self.assertRaises(ValueError):
+            TargetGenerator(1,0,1,0)
+
+    def test_thread_heartbeat_needs_a_live_ui(self):
+        link = SerialLink({"url":"loop://","baudrate":115200})
+        link.start()
+        try:
+            link.keepalive(True)
+            received = bytearray()
+            deadline = time.monotonic()+1
+            while time.monotonic()<deadline and received.count(b"@PING\n")<2:
+                link.keepalive(True)
+                for kind,_,data in link.take()[0]:
+                    self.assertNotEqual(kind,"tx")
+                    if kind == "rx":
+                        received.extend(data)
+                time.sleep(.01)
+            self.assertGreaterEqual(received.count(b"@PING\n"),2)
+            with link.lock:
+                link.alive_at = time.monotonic()-2   # UI frozen for 2 s
+            time.sleep(.1)
+            link.take()
+            sent = link.pings
+            time.sleep(.5)
+            self.assertEqual(link.pings,sent)
+        finally:
+            link.closed.set()
+            link.join(1)
 
 
 class GuiChecks(unittest.TestCase):
@@ -165,11 +255,13 @@ class GuiChecks(unittest.TestCase):
     def test_interaction_presets_chips_and_heartbeat(self):
         class Link:
             def __init__(self):
-                self.pings = 0
+                self.heartbeat = None
+                self.calls = 0
             def take(self):
                 return [],0
-            def ping(self):
-                self.pings += 1
+            def keepalive(self,enabled):
+                self.heartbeat = enabled
+                self.calls += 1
         with TemporaryDirectory() as tmp:
             w = Window(Path(tmp)/"cfg.ini")
             w.timer.stop()
@@ -179,15 +271,15 @@ class GuiChecks(unittest.TestCase):
             self.assertFalse(w.terminal_panel.isVisible())
             link = w.link = Link()
             w.connected = True
+            w.tick()
+            self.assertFalse(link.heartbeat)
             w.receive(b"#CAP:PING\n",time.monotonic())
             w.commands.pending = ("@RUN","ANG",None)
             w.receive(b"@ACK:RUN\n100,600\n",time.monotonic())
             w.tick()
+            self.assertTrue(link.heartbeat)
             w.tick()
-            self.assertEqual(link.pings,1)
-            w.next_ping = time.monotonic()-.001
-            w.tick()
-            self.assertEqual(link.pings,2)
+            self.assertEqual(link.calls,3)
             w.workbench.layout(1)
             self.assertTrue(w.scope.frozen)
             w.enabled_ch[1].click()
@@ -197,7 +289,99 @@ class GuiChecks(unittest.TestCase):
             w.receive(b"#STOP:heartbeat\n",time.monotonic())
             self.assertFalse(w.send_heartbeat)
             self.assertIn("超时",w.stop_banner.text())
+            w.tick()
+            self.assertFalse(link.heartbeat)
             w.link = None
+            w.close()
+
+    def test_generator_in_simulation(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp)/"cfg.ini")
+            w.timer.stop()
+            w.commands.confirm = lambda changes: self.fail("generator must not ask: "+str(changes))
+            w.source.setCurrentIndex(1)
+            w.toggle_connection()
+            w.fields["TGT"].setValue(10)
+            w.gen_shape.setCurrentIndex(1)
+            w.rules["ANG"]["TGT"] = (-100.,100.,1.)
+            w.gen_amp.setValue(150)
+            w.toggle_generator()
+            self.assertIsNone(w.generator)
+            self.assertIn("超出",w.ack.text())
+            w.gen_amp.setValue(5)
+            w.gen_period.setValue(1)
+            w.toggle_generator()
+            self.assertIsNotNone(w.generator)
+            self.assertFalse(w.group.isEnabled())
+            start = w.generator.start
+            seen = []
+            for t in (0,.2,.55,.7,1.05):
+                w.generator_tick(start+t)
+                w.commands.dispatch()
+                seen.append(w.sim.params["ANG"]["TGT"])
+            self.assertEqual(seen,[15,15,10,10,15])
+            self.assertFalse(w.undo_history)
+            self.assertEqual(len(w.scope.markers),0)
+            w.toggle_generator()
+            for _ in range(3): w.commands.dispatch()
+            self.assertIsNone(w.generator)
+            self.assertEqual(w.sim.params["ANG"]["TGT"],10)
+            self.assertTrue(w.group.isEnabled())
+            w.toggle_generator()
+            w.stop_device()
+            self.assertIsNone(w.generator)
+            w.close()
+
+    def test_simulated_fall_stops_and_reports(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp)/"cfg.ini")
+            w.timer.stop()
+            w.source.setCurrentIndex(1)
+            w.model.setCurrentIndex(3)
+            w.toggle_connection()
+            for key in ("KP","KI","KD"):
+                w.sim.params["ANG"][key] = 0
+            w.run_device()
+            self.assertTrue(w.send_heartbeat)
+            for _ in range(20):
+                w.epoch -= .3
+                w.tick()
+            self.assertFalse(w.sim.running)
+            self.assertIn("倒地",w.stop_banner.text())
+            self.assertFalse(w.send_heartbeat)
+            w.close()
+
+    def test_auto_reconnect_reads_back_only(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp)/"cfg.ini")
+            w.timer.stop()
+            w.port.setCurrentText("loop://")
+            w.toggle_connection()
+            def pump(cond,seconds=2):
+                deadline = time.monotonic()+seconds
+                while time.monotonic()<deadline and not cond():
+                    w.tick()
+                    time.sleep(.01)
+                return cond()
+            self.assertTrue(pump(lambda: w.connected))
+            first = w.link
+            first.event("error","device unplugged")
+            first.closed.set()
+            first.join(1)
+            self.assertTrue(pump(lambda: w.reconnect_at is not None))
+            self.assertFalse(w.connected)
+            self.assertEqual(w.connect_btn.text(),"取消重连")
+            self.assertIn("等待重连",w.badge.text())
+            w.reconnect_at = time.monotonic()
+            self.assertTrue(pump(lambda: w.connected))
+            self.assertIsNot(w.link,first)
+            def sent(text):
+                return any(k=="TX" and isinstance(d,(bytes,bytearray)) and text in bytes(d) for _,k,d in w.logs)
+            self.assertTrue(pump(lambda: sent(b"GET")))
+            self.assertFalse(sent(b"RUN"))
+            w.disconnect()
+            self.assertTrue(pump(lambda: w.link is None))
+            self.assertIsNone(w.reconnect_at)
             w.close()
 
     def test_scope_controls_and_saved_settings(self):
