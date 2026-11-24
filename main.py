@@ -1,5 +1,6 @@
 import csv
 from collections import deque
+from autotune_ui import AutoTuneController
 from device_session import DeviceSession
 from capture import CaptureController
 from configuration import DEFAULT_RULES, valid_rule, calibration_dialog, limits_dialog
@@ -35,6 +36,7 @@ class Window(W.QMainWindow):
         self.link = self.sim = None
         self.connected = self.closing = False
         self.commands = DeviceSession(self)
+        self.autotuner = AutoTuneController(self)
         self.ping_capable = self.send_heartbeat = False
         self.next_ping = 0.
         self.generator = None
@@ -185,7 +187,7 @@ class Window(W.QMainWindow):
                     references=[(self.ref_name(i),r[2].value()) if self.ref_active[i] else None for i,r in enumerate(self.ref_rows)],
                     channel_preferences=self.channel_preferences,
                     channels=[c.isChecked() for c in self.enabled_ch],cards=[t.isChecked() for t in self.cards],
-                    drafts=self.drafts)
+                    drafts=self.drafts,autotune=self.autotuner.cfg)
         s.setValue("options",json.dumps(opts,ensure_ascii=False))
         for key, value in (("geometry",self.saveGeometry()),("horizontal",self.horizontal.saveState()),("vertical",self.vertical.saveState())):
             s.setValue(key,value)
@@ -248,6 +250,10 @@ class Window(W.QMainWindow):
             for widgets,key in [(self.enabled_ch,"channels"),(self.cards,"cards")]:
                 for w,v in zip(widgets,opts.get(key,[])):
                     w.setChecked(bool(v))
+            if isinstance(opts.get("autotune"),dict):
+                for k,v in opts["autotune"].items():
+                    if k in self.autotuner.cfg and isinstance(v,(int,float,bool)):
+                        self.autotuner.cfg[k] = v
             for key,fn in (("geometry",self.restoreGeometry),("horizontal",self.horizontal.restoreState),("vertical",self.vertical.restoreState)):
                 if self.settings.contains(key):
                     fn(self.settings.value(key))
@@ -276,7 +282,7 @@ class Window(W.QMainWindow):
         single = self.address.currentIndex() == 1
         if single:
             self.group.setCurrentIndex(0)
-        self.group.setEnabled(not single and not (self.sim and self.writer) and self.generator is None)
+        self.group.setEnabled(not single and not (self.sim and self.writer) and self.generator is None and not self.autotuner.active)
 
     def edited(self,key,value):
         self.drafts[self.selected()][key] = value
@@ -317,7 +323,8 @@ class Window(W.QMainWindow):
         self.connect_btn.setText("关闭仿真" if self.sim else "取消重连" if waiting or (self.reconnecting and not self.connected)
                                  else "断开" if busy else "打开仿真" if sim else "连接串口")
         self.stop_btn.setEnabled(self.connected)
-        self.gen_btn.setEnabled(self.connected or self.generator is not None)
+        self.gen_btn.setEnabled((self.connected or self.generator is not None) and not self.autotuner.active)
+        self.autotune_btn.setEnabled(self.connected or self.autotuner.active)
         self.badge.setText("仿真练习" if self.sim else "串口已连接" if self.connected else "正在关闭…" if self.closing
                            else "等待重连…" if waiting or self.reconnecting else "正在连接…" if busy else "未连接")
         if hasattr(self,"workbench"):
@@ -332,6 +339,8 @@ class Window(W.QMainWindow):
         self.connection_error = False
         self.stop_banner.hide()
         self.notice.hide()
+        self.autotune_status.clear()
+        self.autotune_status.hide()
         self.send_heartbeat = self.ping_capable = False
         self.end_record()
         self.rx_log_tail = None
@@ -407,6 +416,7 @@ class Window(W.QMainWindow):
         self.source_ui()
 
     def disconnect(self):
+        self.autotuner.stop("连接已关闭",apply_best=False)
         self.stop_generator("连接已关闭",restore=False)
         self.reconnect_at = None
         self.reconnecting = False
@@ -511,9 +521,13 @@ class Window(W.QMainWindow):
     def run_device(self):
         self.enqueue("@RUN")
 
+    def open_autotune(self):
+        self.autotuner.open_dialog()
+
     def stop_device(self):
         if not self.connected:
             return
+        self.autotuner.on_device_stopped("急停")
         self.stop_generator("急停",restore=False)
         self.workbench.stop_feedback()
         self.send_heartbeat = False
@@ -633,6 +647,7 @@ class Window(W.QMainWindow):
                         "fall":("检测到倒地，设备已自动停机","检测到倒地 · 输出已清零，扶正后再点启动")}.get(
                         reason,("设备已停机  "+reason,"设备已停机 · "+reason))
                 self.send_heartbeat = False
+                self.autotuner.on_device_stopped(text[0])
                 self.stop_generator(text[0],restore=False)
                 self.commands.failed(text[0])
                 self.stop_banner.setText(text[1])
@@ -761,6 +776,7 @@ class Window(W.QMainWindow):
                     break
         if self.commands.timed_out(now):
             self.commands.failed("应答超时，已取消后续命令  " + self.commands.pending[0])
+        self.autotuner.tick(now)
         self.generator_tick(now)
         self.commands.dispatch()
         if self.buffer.size and (self.scope.drawn_view != self.scope.viewport_key() or

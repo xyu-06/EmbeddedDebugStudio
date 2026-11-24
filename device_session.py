@@ -97,6 +97,8 @@ class DeviceSession(CommandQueue):
     def failed(self,msg):
         if getattr(self.ui,"generator",None):
             self.ui.stop_generator("命令失败，发生器已停止",restore=False)
+        if getattr(self.ui,"autotuner",None) and self.ui.autotuner.active:
+            self.ui.autotuner.on_device_stopped(msg)
         self.ui.rollback = None
         self.ui.retry_command = self.pending[0] if self.pending else None
         if self.ui.retry_command and "=" in self.ui.retry_command:
@@ -192,8 +194,9 @@ class DeviceSession(CommandQueue):
             self.ui.mark(payload)
         elif cmd.endswith("GET"):
             return
-        else:
+        elif not quiet:
             self.ui.mark(payload)
         self.pending = None
-        self.ui.feedback("已确认  " + payload)
+        if not quiet:
+            self.ui.feedback("已确认  " + payload)
 

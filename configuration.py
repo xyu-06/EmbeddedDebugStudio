@@ -38,6 +38,7 @@ def finish_dialog(dialog, layout, validate):
 def calibration_dialog(w):
     dialog = W.QDialog(w)
     dialog.setWindowTitle("通道换算与坐标轴")
+    dialog.setMinimumWidth(370)
     outer = W.QVBoxLayout(dialog)
     outer.addWidget(W.QLabel("显示值 = 收到的数值 × 系数"))
     grid = W.QGridLayout()
@@ -75,6 +76,7 @@ def limits_dialog(w):
     group = w.selected()
     dialog = W.QDialog(w)
     dialog.setWindowTitle(group+" 参数保护")
+    dialog.setMinimumWidth(460)
     outer = W.QVBoxLayout(dialog)
     grid = W.QGridLayout()
     outer.addLayout(grid)

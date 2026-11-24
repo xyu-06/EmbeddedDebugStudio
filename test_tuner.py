@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 
 import numpy as np
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
+from autotune import AutoTuner, evaluate_step
 from engine import Lines, Simulator, match_ack, step_metrics
 from generator import TargetGenerator
 from main import Window
@@ -159,6 +160,56 @@ class CoreChecks(unittest.TestCase):
         self.assertIsNotNone(sine.due(.11))
         with self.assertRaises(ValueError):
             TargetGenerator(1,0,1,0)
+
+    def test_autotuner_identifies_and_optimizes_plants(self):
+        rules = {"KP":(-1000.,1000.,20.),"KI":(-1000.,1000.,50.),"KD":(-100.,100.,1.)}
+        def closed_loop_run(model,mode,strategy,init,target,obs_s=2.0,rounds=8):
+            sim = Simulator(model)
+            sim.params["ANG"].update(init,TGT=0.)
+            sim.command("@RUN")
+            tuner = AutoTuner(mode,1,strategy,init,rules,0.,target,obs_s,rounds)
+            while True:
+                nxt = tuner.next_candidate()
+                if nxt is None:
+                    break
+                _,cand,_ = nxt
+                sim.params["ANG"].update(cand,TGT=0.)
+                sim.command("@ANG.RST")
+                for _ in range(int(1.0/sim.dt)):
+                    sim.step("ANG")
+                base_y = sim.states["ANG"][0]
+                sim.command("@ANG.RST")
+                sim.params["ANG"]["TGT"] = target
+                ts,ys,us = [],[],[]
+                for k in range(int(obs_s/sim.dt)):
+                    _,y,u,_ = sim.step("ANG")
+                    ts.append(k*sim.dt); ys.append(y); us.append(u)
+                tuner.record_result(ts,ys,base_y=base_y,outputs=us)
+            return tuner
+
+        t0 = closed_loop_run(0,0,0,{"KP":.25,"KI":.05,"KD":0.},60.)
+        self.assertLess(t0.best_eval.score, 0.35)
+        self.assertLess(t0.best_eval.overshoot_pct, 5.0)
+        self.assertLess(t0.best_eval.score, t0.baseline_eval.score * 0.15)
+
+        # Actuator-ceiling target (100 == u_max): flags saturation and stays bounded
+        t_sat = closed_loop_run(0,0,0,{"KP":.25,"KI":.05,"KD":0.},100.,rounds=6)
+        self.assertLess(t_sat.best_eval.score, 0.75)
+        self.assertLess(t_sat.best_params["KP"], 50.0)
+
+        t1 = closed_loop_run(1,1,0,{"KP":4.,"KI":5.,"KD":0.},50.,obs_s=2.4)
+        self.assertLess(t1.best_eval.score, 0.32)
+        self.assertGreater(t1.best_params["KD"], 0.5)
+
+        t2 = closed_loop_run(2,0,0,{"KP":0.,"KI":0.,"KD":0.},60.,obs_s=2.8)
+        self.assertLess(t2.best_eval.score, 0.40)
+
+        # Reverse feedback polarity stops immediately on probe
+        bad = AutoTuner(0,1,0,{"KP":1.,"KI":0.,"KD":0.},rules,0.,50.,1.0,6)
+        bad.next_candidate()
+        ev = bad.record_result(np.linspace(0,1,50), -np.linspace(0,20,50), base_y=0.)
+        self.assertTrue(ev.reversed_sign)
+        self.assertTrue(bad.finished)
 
     def test_thread_heartbeat_needs_a_live_ui(self):
         link = SerialLink({"url":"loop://","baudrate":115200})
@@ -382,6 +433,55 @@ class GuiChecks(unittest.TestCase):
             w.disconnect()
             self.assertTrue(pump(lambda: w.link is None))
             self.assertIsNone(w.reconnect_at)
+            w.close()
+
+    def test_autotune_gui_workflow_and_one_click_undo(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp)/"cfg.ini")
+            w.timer.stop()
+            w.commands.confirm = lambda changes: True
+            w.source.setCurrentIndex(1)
+            w.model.setCurrentIndex(0)
+            w.toggle_connection()
+            w.fields["KP"].setValue(0.3)
+            w.fields["KI"].setValue(0.05)
+            w.fields["KD"].setValue(0.0)
+            w.fields["TGT"].setValue(10.0)
+            w.send_group()
+            for _ in range(6):
+                w.commands.dispatch()
+            self.assertAlmostEqual(w.confirmed["ANG.KP"], 0.3)
+
+            ok = w.autotuner.start(mode=0,style=1,strategy=0,base=0.,target=100.,step_seconds=1.5,max_rounds=6,hold_target=True)
+            self.assertTrue(ok)
+            self.assertTrue(w.autotuner.active)
+            for _ in range(260):
+                if not w.autotuner.active and not w.commands.busy():
+                    break
+                w.epoch -= .25
+                w.tick()
+            self.assertFalse(w.autotuner.active)
+            for _ in range(8):
+                w.commands.dispatch()
+            self.assertGreater(w.confirmed["ANG.KP"], 1.5)
+            self.assertGreater(w.confirmed["ANG.KI"], 3.0)
+            self.assertAlmostEqual(w.confirmed["ANG.TGT"], 100.0)
+            self.assertIn("评分 J=", w.autotune_status.text())
+            self.assertTrue(w.undo_btn.isEnabled())
+
+            # One-click undo restores the exact pre-autotune parameters
+            w.commands.undo_parameter()
+            for _ in range(8):
+                w.commands.dispatch()
+            self.assertAlmostEqual(w.confirmed["ANG.KP"], 0.3)
+            self.assertAlmostEqual(w.confirmed["ANG.KI"], 0.05)
+            self.assertAlmostEqual(w.confirmed["ANG.TGT"], 10.0)
+
+            # Emergency stop aborts an active auto-tune cleanly
+            w.autotuner.start(mode=0,style=1,strategy=0,base=0.,target=80.,step_seconds=1.5,max_rounds=6)
+            self.assertTrue(w.autotuner.active)
+            w.stop_device()
+            self.assertFalse(w.autotuner.active)
             w.close()
 
     def test_scope_controls_and_saved_settings(self):

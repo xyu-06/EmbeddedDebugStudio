@@ -296,9 +296,16 @@ def build(w):
     f.addRow(w.auto)
     f.addRow(row(button("读取", w.read_params),button("发送本组",w.send_group),button("启动",w.run_device)))
     f.addRow(row(button("清积分", w.reset_integral),button("保存预设",w.save_preset),button("载入预设",w.load_preset)))
-    f.addRow(button("本组参数保护",w.edit_limits))
     w.undo_btn = button("撤销上次下发",w.commands.undo_parameter)
-    f.addRow(w.undo_btn)
+    f.addRow(row(button("参数保护",w.edit_limits),w.undo_btn))
+    w.autotune_btn = button("⚡ 自动整定 PID…",w.open_autotune,"accent")
+    w.autotune_btn.setToolTip("设定目标值后自动激励、评估波形并寻优 KP / KI / KD")
+    f.addRow(w.autotune_btn)
+    w.autotune_status = W.QLabel()
+    w.autotune_status.setWordWrap(True)
+    w.autotune_status.setStyleSheet("color:#1c5f4e;font-size:9pt;padding:2px 0;")
+    w.autotune_status.hide()
+    f.addRow(w.autotune_status)
     w.ack = W.QLabel("等待操作")
     w.ack.setWordWrap(True)
     f.addRow(w.ack)
@@ -438,6 +445,8 @@ QPushButton,QComboBox,QLineEdit,QDoubleSpinBox {border:1px solid #c6d0da;border-
 QPushButton:hover {background:#eaf1fa;border-color:#8daaca;}
 QPushButton:pressed {background:#d5e5f7;}
 QPushButton#primary {background:#225fc1;color:white;border:1px solid #225fc1;font-weight:600;padding:4px 12px;}
+QPushButton#accent {background:#197a63;color:white;border:1px solid #197a63;font-weight:600;padding:4px 10px;}
+QPushButton#accent:hover {background:#146652;border-color:#146652;}
 QPushButton#danger {background:#ba333b;color:white;border:1px solid #ba333b;font-weight:600;padding:4px 18px;}
 QPushButton:disabled,QWidget:disabled {color:#929ba5;}
 QPlainTextEdit {background:white;border:1px solid #d5dce3;font:10pt 'Consolas','Microsoft YaHei UI';}

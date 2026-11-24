@@ -11,7 +11,7 @@ QFrame#card,QFrame#top,QFrame#pidPanel,QFrame#card QWidget,QFrame#top QLabel {ba
 QPushButton,QComboBox,QLineEdit,QDoubleSpinBox,QPlainTextEdit,QToolButton {background:#25303a;color:#ecf2f6;border-color:#526071;}
 QLabel#measure,QLabel#status {background:#202730;color:#c7d6de;}
 QPushButton:hover {background:#384759;}
-QPushButton#primary {background:#285fa3;} QPushButton#danger {background:#a33440;}
+QPushButton#primary {background:#285fa3;} QPushButton#accent {background:#1e7a64;} QPushButton#danger {background:#a33440;}
 """
 
 
@@ -107,6 +107,8 @@ class Workbench(C.QObject):
         for line in s.markers:
             line.label.fill = pg.mkBrush("#25303a" if dark else "#ffffff")
             line.label.setColor("#aec1d1" if dark else "#52677d")
+        if hasattr(self.w,"autotune_status"):
+            self.w.autotune_status.setStyleSheet(f"color:{'#6ed4b4' if dark else '#1c5f4e'};font-size:9pt;padding:2px 0;")
         self.fields()
 
     def motion(self):
@@ -167,7 +169,8 @@ class Workbench(C.QObject):
             color = {"错误":"#bd3947","已确认":"#218366","草稿":"#ad7921"}[status]
             field.setStyleSheet(f"QDoubleSpinBox {{border-left:4px solid {color};}}")
             field.setToolTip(status+(" · 设备值 "+format(confirmed,"g") if confirmed is not None else " · 尚未读回"))
-        w.undo_btn.setEnabled(bool(w.undo_history) and w.connected)
+        tuning = getattr(w,"autotuner",None) is not None and w.autotuner.active
+        w.undo_btn.setEnabled(bool(w.undo_history) and w.connected and not tuning)
 
     def animate(self,widget,start,end,paint,duration):
         prior = getattr(widget,"state_animation",None)
