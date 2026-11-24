@@ -13,10 +13,11 @@ os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 import numpy as np
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 from autotune import AutoTuner, evaluate_step
+from diagnostics import RuntimeMonitor, analyze_frame_timing, dominant_fft, format_c_code
 from engine import Lines, Simulator, match_ack, step_metrics
 from generator import TargetGenerator
 from main import Window
-from storage import History
+from storage import History, load_csv
 from transport import SerialLink
 from scope import pixel_mean
 
@@ -210,6 +211,40 @@ class CoreChecks(unittest.TestCase):
         ev = bad.record_result(np.linspace(0,1,50), -np.linspace(0,20,50), base_y=0.)
         self.assertTrue(ev.reversed_sign)
         self.assertTrue(bad.finished)
+
+    def test_fft_timing_watchdog_and_c_codegen(self):
+        t = np.arange(0, 4.0, 0.005)
+        y = 12.0 + 3.5 * np.sin(2 * math.pi * 7.5 * t)
+        freq, amp = dominant_fft(t, y)
+        self.assertAlmostEqual(freq, 7.5, delta=0.35)
+        self.assertGreater(amp, 2.5)
+
+        # Coalesced USB-TTL timestamps (pairs arriving 0.1ms apart every 20ms)
+        batched = np.ravel(np.column_stack((np.arange(0, 1.0, 0.02), np.arange(0, 1.0, 0.02) + 0.0001)))
+        fps, _, _, ratio = analyze_frame_timing(batched)
+        self.assertGreater(fps, 90)
+        self.assertGreater(ratio, 0.4)
+
+        # Stuck sensor & saturation monitor
+        mon = RuntimeMonitor()
+        mat = np.zeros((300, 5))
+        mat[:, 0] = np.arange(300) * 0.01
+        mat[:, 2] = 0.0       # frozen actual
+        mat[:, 3] = 450.0     # active PWM output!
+        alert = mon.check(10.0, mat, 1, 2, True)
+        self.assertIn("毫无变化", alert)
+
+        mon.reset()
+        mat[:, 2] = np.linspace(0, 60, 300)
+        mat[-30:, 2] = 60.0
+        mat[:, 3] = 1000.0
+        sat_alert = mon.check(20.0, mat, 1, 2, True)
+        self.assertIn("满幅饱和", sat_alert)
+
+        params = {g: {"KP": 3.5, "KI": 12.0, "KD": 0.08, "TGT": 100.0} for g in ("ANG", "SPD", "YAW", "AUX")}
+        self.assertIn("PID_DEBUG_DEFAULT_KP", format_c_code("SPD", params, 0))
+        self.assertIn("BALANCE_KP", format_c_code("ANG", params, 1))
+        self.assertIn("pid_loops[PID_YAW]", format_c_code("YAW", params, 2))
 
     def test_thread_heartbeat_needs_a_live_ui(self):
         link = SerialLink({"url":"loop://","baudrate":115200})
@@ -480,8 +515,85 @@ class GuiChecks(unittest.TestCase):
             # Emergency stop aborts an active auto-tune cleanly
             w.autotuner.start(mode=0,style=1,strategy=0,base=0.,target=80.,step_seconds=1.5,max_rounds=6)
             self.assertTrue(w.autotuner.active)
+            self.stop_device_check = True
             w.stop_device()
             self.assertFalse(w.autotuner.active)
+            w.close()
+
+    def test_ghost_csv_replay_sliders_macros_and_balance_protocol(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "cfg.ini")
+            w.timer.stop()
+            w.commands.confirm = lambda changes: True
+            w.source.setCurrentIndex(1)
+            w.model.setCurrentIndex(1)
+            w.toggle_connection()
+            w.run_device()
+            for _ in range(30):
+                w.sample(w.frames * .01, w.sim.step("ANG"))
+            w.fields["TGT"].setValue(25.0)
+            w.send_field("TGT")
+            w.commands.dispatch()
+            for _ in range(250):
+                w.sample(w.frames * .01, w.sim.step("ANG"))
+            w.paint_scope()
+            w.analyze()
+            w.pin_step_ghost()
+            self.assertIsNotNone(w.scope.ghost)
+            self.assertTrue(w.scope.ghost_curve.isVisible())
+            self.assertIn("对比底图", w.metrics.text())
+
+            # Second step aligns Ghost to the new step timestamp
+            w.fields["KP"].setValue(8.0)
+            w.fields["KD"].setValue(1.2)
+            w.fields["TGT"].setValue(40.0)
+            w.send_group()
+            for _ in range(6):
+                w.commands.dispatch()
+            step2_t = w.latest + .01
+            for _ in range(200):
+                w.sample(w.frames * .01, w.sim.step("ANG"))
+            w.paint_scope()
+            w.analyze()
+            self.assertAlmostEqual(float(w.scope.ghost_curve.xData[0]), step2_t, delta=0.02)
+
+            # Export view CSV, clear everything, and reload CSV offline!
+            csv_path = Path(tmp) / "replay.csv"
+            w.choose_file = lambda *_: str(csv_path)
+            w.export_view()
+            self.assertTrue(w.load_csv_file(csv_path))
+            self.assertTrue(w.scope.frozen)
+            self.assertEqual(w.count, 4)
+            self.assertAlmostEqual(w.confirmed["ANG.KP"], 8.0)
+
+            # Sliders, step gear, macro send, SPD auto-switch & #BALANCE protocol
+            w.source.setCurrentIndex(1)
+            w.toggle_connection()
+            w.slider_toggle.setChecked(True)
+            w.step_gear.setCurrentIndex(1)  # 0.01
+            self.assertAlmostEqual(w.fields["KP"].singleStep(), 0.01)
+            w.slider_moved("KP", 750)
+            self.assertGreater(w.fields["KP"].value(), 8.0)
+
+            w.send_macro(1)  # @RST
+            w.commands.dispatch()
+
+            # Simulate User/pid_debug.c replying "@ERR:only SPD supported" on ANG.GET
+            w.group.setCurrentIndex(0)
+            w.commands.pending = ("@ANG.GET", "ANG", None)
+            w.receive(b"@ERR:only SPD supported\n", time.monotonic())
+            self.assertEqual(w.selected(), "SPD")
+
+            # Simulate Doc/main_balance_test.c status frames
+            w.receive(b"#BALANCE:CALIBRATING,KEEP_STILL\n", time.monotonic())
+            self.assertFalse(w.stop_banner.isHidden())
+            self.assertIn("静止校准", w.stop_banner.text())
+            w.receive(b"#BALANCE:READY\n", time.monotonic())
+            self.assertTrue(w.stop_banner.isHidden())
+            w.receive(b"#BALANCE:INIT_ERROR=5\n", time.monotonic())
+            self.assertIn("晃动", w.stop_banner.text())
+            w.receive(b"#BALANCE:TILT_STOP\n", time.monotonic())
+            self.assertIn("30°", w.stop_banner.text())
             w.close()
 
     def test_scope_controls_and_saved_settings(self):

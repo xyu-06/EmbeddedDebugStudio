@@ -1,6 +1,7 @@
 import csv
 from collections import deque
 from autotune_ui import AutoTuneController
+from diagnostics import RuntimeMonitor, c_export_dialog, diagnostics_dialog, dominant_fft
 from device_session import DeviceSession
 from capture import CaptureController
 from configuration import DEFAULT_RULES, valid_rule, calibration_dialog, limits_dialog
@@ -21,7 +22,7 @@ from engine import DEFAULTS, KEYS, LIMIT, LOOPS, Lines, Simulator, step_metrics
 from generator import SHAPES, TargetGenerator
 from layout_ui import STYLE, build, number
 from scope import COLORS, REF_COLORS
-from storage import History, PARAM_COLS, csv_header, csv_row
+from storage import History, PARAM_COLS, csv_header, csv_row, load_csv
 from transport import SerialLink
 
 
@@ -37,6 +38,9 @@ class Window(W.QMainWindow):
         self.connected = self.closing = False
         self.commands = DeviceSession(self)
         self.autotuner = AutoTuneController(self)
+        self.monitor = RuntimeMonitor()
+        self.macros = [("读参数","@GET"),("清积分","@RST"),("启动","@RUN"),("急停","@STOP"),("校准IMU","@CAL")]
+        self.slider_spans = {k: (-10., 10.) for k in KEYS}
         self.ping_capable = self.send_heartbeat = False
         self.next_ping = 0.
         self.generator = None
@@ -109,6 +113,13 @@ class Window(W.QMainWindow):
         for key, field in self.fields.items():
             field.valueChanged.connect(lambda value, k=key: self.edited(k, value))
             field.lineEdit().returnPressed.connect(lambda k=key: self.enter_field(k))
+            self.sliders[key].valueChanged.connect(lambda pos, k=key: self.slider_moved(k, pos))
+            self.sliders[key].sliderReleased.connect(lambda k=key: self.recenter_slider(k, send=self.auto.isChecked()))
+        self.slider_toggle.toggled.connect(self.toggle_sliders)
+        self.step_gear.currentIndexChanged.connect(self.apply_step_gear)
+        self.refresh_macros()
+        self.toggle_sliders(self.slider_toggle.isChecked())
+        self.apply_step_gear()
         self.set_auto_names()
         self.refresh_channels()
         self.scope.reset()
@@ -176,9 +187,9 @@ class Window(W.QMainWindow):
         self.save_draft()
         s = self.settings
         opts = {name:getattr(self,name).currentIndex() for name in
-                ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode","gen_shape")}
+                ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode","gen_shape","step_gear")}
         opts.update({name:getattr(self,name).value() for name in ("rate","ymin","ymax","line","trigger_level","capture_seconds","pre_percent","x_div","y_div","gen_amp","gen_period","gen_rate")})
-        opts.update({name:getattr(self,name).isChecked() for name in ("grid","legend","show_stats","auto","autoscroll","hex_mode","reduce_motion","dark","overlays","terminal_toggle","auto_reconnect")})
+        opts.update({name:getattr(self,name).isChecked() for name in ("grid","legend","show_stats","auto","autoscroll","hex_mode","reduce_motion","dark","overlays","terminal_toggle","auto_reconnect","slider_toggle")})
         s.setValue("layoutPreset",self.preset.currentIndex())
         opts.update(window_seconds=self.window.value(),colors=self.colors)
         opts.update(scales=self.scales, units=self.units, right_channel=self.right_channel,
@@ -187,7 +198,7 @@ class Window(W.QMainWindow):
                     references=[(self.ref_name(i),r[2].value()) if self.ref_active[i] else None for i,r in enumerate(self.ref_rows)],
                     channel_preferences=self.channel_preferences,
                     channels=[c.isChecked() for c in self.enabled_ch],cards=[t.isChecked() for t in self.cards],
-                    drafts=self.drafts,autotune=self.autotuner.cfg)
+                    drafts=self.drafts,autotune=self.autotuner.cfg,macros=self.macros)
         s.setValue("options",json.dumps(opts,ensure_ascii=False))
         for key, value in (("geometry",self.saveGeometry()),("horizontal",self.horizontal.saveState()),("vertical",self.vertical.saveState())):
             s.setValue(key,value)
@@ -208,7 +219,7 @@ class Window(W.QMainWindow):
             for g,rules in opts.get("rules",{}).items():
                 if g in LOOPS and isinstance(rules,dict):
                     self.rules[g].update({k:tuple(v) for k,v in rules.items() if k in KEYS and valid_rule(v)})
-            for key in ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode","gen_shape"):
+            for key in ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode","gen_shape","step_gear"):
                 w = getattr(self,key)
                 value = opts.get(key,w.currentIndex())
                 if isinstance(value,int) and 0 <= value < w.count():
@@ -223,7 +234,7 @@ class Window(W.QMainWindow):
             for key in ("rate","ymin","ymax","line","trigger_level","capture_seconds","pre_percent","x_div","y_div","gen_amp","gen_period","gen_rate"):
                 if key in opts:
                     getattr(self,key).setValue(float(opts[key]))
-            for key in ("grid","legend","show_stats","auto","autoscroll","hex_mode","reduce_motion","dark","overlays","terminal_toggle","auto_reconnect"):
+            for key in ("grid","legend","show_stats","auto","autoscroll","hex_mode","reduce_motion","dark","overlays","terminal_toggle","auto_reconnect","slider_toggle"):
                 if key in opts:
                     getattr(self,key).setChecked(bool(opts[key]))
             for key in ("port","baud"):
@@ -254,6 +265,10 @@ class Window(W.QMainWindow):
                 for k,v in opts["autotune"].items():
                     if k in self.autotuner.cfg and isinstance(v,(int,float,bool)):
                         self.autotuner.cfg[k] = v
+            if isinstance(opts.get("macros"),list):
+                for i,item in enumerate(opts["macros"][:5]):
+                    if isinstance(item,(list,tuple)) and len(item)==2:
+                        self.macros[i] = (str(item[0])[:16],str(item[1])[:80])
             for key,fn in (("geometry",self.restoreGeometry),("horizontal",self.horizontal.restoreState),("vertical",self.vertical.restoreState)):
                 if self.settings.contains(key):
                     fn(self.settings.value(key))
@@ -267,8 +282,50 @@ class Window(W.QMainWindow):
         for k, w in self.fields.items():
             with C.QSignalBlocker(w):
                 w.setValue(self.drafts[self.selected()][k])
+            if hasattr(self, "sliders"):
+                self.recenter_slider(k)
         if hasattr(self,"workbench"):
             self.workbench.fields()
+
+    def toggle_sliders(self, visible):
+        for k, slider in self.sliders.items():
+            self.pid_form.setRowVisible(slider, visible)
+            if visible:
+                self.recenter_slider(k)
+
+    def apply_step_gear(self):
+        steps = (0.001, 0.01, 0.1, 1.0, 10.0)
+        step = steps[self.step_gear.currentIndex()]
+        for k, field in self.fields.items():
+            field.setSingleStep(step)
+            self.recenter_slider(k)
+
+    def recenter_slider(self, key, send=False):
+        if key not in self.sliders:
+            return
+        val = self.fields[key].value()
+        step = self.fields[key].singleStep()
+        lo_rule, hi_rule, _ = self.rules[self.selected()][key]
+        half = max(abs(val) * 0.65, step * 50.0, 0.5)
+        lo = max(lo_rule, val - half)
+        hi = min(hi_rule, val + half)
+        if hi <= lo:
+            lo, hi = lo_rule, hi_rule
+        self.slider_spans[key] = (lo, hi)
+        pos = round((val - lo) / max(1e-9, hi - lo) * 1000)
+        with C.QSignalBlocker(self.sliders[key]):
+            self.sliders[key].setValue(max(0, min(1000, pos)))
+        if send and self.connected:
+            self.send_field(key)
+
+    def slider_moved(self, key, pos):
+        lo, hi = self.slider_spans[key]
+        val = round(lo + (pos / 1000.0) * (hi - lo), 4)
+        with C.QSignalBlocker(self.fields[key]):
+            self.fields[key].setValue(val)
+        self.drafts[self.selected()][key] = val
+        self.field_errors.discard(self.selected() + "." + key)
+        self.workbench.fields()
 
     def change_group(self):
         self.save_draft()
@@ -287,6 +344,8 @@ class Window(W.QMainWindow):
     def edited(self,key,value):
         self.drafts[self.selected()][key] = value
         self.field_errors.discard(self.selected()+"."+key)
+        if not self.sliders[key].isSliderDown():
+            self.recenter_slider(key)
         self.workbench.fields()
         if self.auto.isChecked() and self.connected:
             self.send_field(key)
@@ -341,6 +400,7 @@ class Window(W.QMainWindow):
         self.notice.hide()
         self.autotune_status.clear()
         self.autotune_status.hide()
+        self.monitor.reset()
         self.send_heartbeat = self.ping_capable = False
         self.end_record()
         self.rx_log_tail = None
@@ -641,6 +701,8 @@ class Window(W.QMainWindow):
                 self.ping_capable = True
             elif kind == "log" and payload.startswith("#ERROR:float printf"):
                 self.feedback("设备浮点格式化自检失败，请启用 -u _printf_float 后重新链接",True)
+            elif kind == "log" and payload.startswith("#BALANCE:"):
+                self.handle_balance_log(payload[9:].strip())
             elif kind == "log" and payload.startswith("#STOP:"):
                 reason = payload[6:].strip()
                 text = {"heartbeat":("设备因心跳超时已停机","设备已报告心跳超时停机"),
@@ -659,6 +721,50 @@ class Window(W.QMainWindow):
                     self.channel_names()
             elif kind in ("ACK","PARAM","ERR"):
                 self.commands.reply(kind,payload)
+
+    def handle_balance_log(self, tag):
+        """Decode #BALANCE:... telemetry from User/balance.c & main_balance_test.c."""
+        imu_errors = {
+            "1": "I2C 通信无应答（检查 PB6/PB7 与供电）",
+            "2": "参数错误",
+            "3": "器件 WHO_AM_I 不符（非 0x68/0x70）",
+            "4": "配置寄存器回读校验失败",
+            "5": "校准期间车身晃动或未水平静置",
+            "6": "陀螺仪尚未完成静止校准",
+            "7": "等待 IMU 新数据超时",
+            "8": "传感器读数接近满量程饱和",
+        }
+        if tag.startswith("CALIBRATING"):
+            self.stop_banner.setStyleSheet("background:#8d691e;color:white;padding:5px")
+            self.stop_banner.setText("IMU 正在预热与静止校准（约 10 秒），请保持车身静止勿动…")
+            self.stop_banner.show()
+        elif tag == "READY":
+            self.stop_banner.setStyleSheet("background:#a83139;color:white;padding:5px")
+            self.stop_banner.hide()
+            self.feedback("平衡车 IMU 校准完成，扶正车身至 ±8° 内即可启动")
+        elif tag.startswith("INIT_ERROR="):
+            code = tag.split("=", 1)[1].strip()
+            detail = imu_errors.get(code, "错误码 " + code)
+            self.stop_banner.setStyleSheet("background:#a83139;color:white;padding:5px")
+            self.stop_banner.setText(f"平衡车 IMU 初始化失败 · {detail}")
+            self.stop_banner.show()
+            self.feedback(f"IMU 初始化失败：{detail}", True)
+        elif tag == "START_REJECTED":
+            self.feedback("启动被拒绝：请将车身扶正至 ±8° 内并保持平稳（角速度 <25°/s）", True)
+        elif tag == "RUN":
+            self.stop_banner.hide()
+            self.feedback("平衡车直立环已启动运行")
+        elif tag == "TILT_STOP":
+            self.stop_banner.setStyleSheet("background:#a83139;color:white;padding:5px")
+            self.stop_banner.setText("倾角超过 30° 保护上限 · 电机驱动已自动切断")
+            self.stop_banner.show()
+        elif tag in ("IMU_ERROR", "IMU_TIMEOUT"):
+            msg = "IMU 通信错误或超量程" if tag == "IMU_ERROR" else "IMU 连续 35 ms 无新帧超时"
+            self.stop_banner.setStyleSheet("background:#a83139;color:white;padding:5px")
+            self.stop_banner.setText(f"{msg} · 驱动已紧急切断")
+            self.stop_banner.show()
+        elif tag == "STOP":
+            self.feedback("平衡车驱动已关闭（待启动）")
 
     def update_params(self):
         self.param_tuple = tuple(self.confirmed.get(k,"") for k in PARAM_COLS)
@@ -786,6 +892,13 @@ class Window(W.QMainWindow):
         if now-self.last_metrics >= .25:
             self.last_metrics = now
             self.analyze()
+            if self.connected and not self.autotuner.active:
+                act_col, out_col = self.autotuner.detect_channels()
+                running_now = bool(self.sim.running) if self.sim else self.send_heartbeat
+                alert = self.monitor.check(now, self.buffer.view(), act_col, out_col, running_now)
+                if alert and hasattr(self, "workbench"):
+                    self.workbench.notice(alert, False)
+                    self.log("诊断", alert)
             self.render_log(preview_only=not self.terminal_toggle.isChecked())
             self.update_status()
         if now-self.rate_start >= 1:
@@ -1039,6 +1152,7 @@ class Window(W.QMainWindow):
         a = self.scope.data
         target,actual = self.target_ch.currentData(),self.actual_ch.currentData()
         metrics = None
+        segment = ()
         if target is not None and actual is not None and target != actual and len(a):
             # A new or temporarily missing channel begins a new measurement interval.
             missing = np.flatnonzero(~np.isfinite(a[:,target+1]) | ~np.isfinite(a[:,actual+1]))
@@ -1046,15 +1160,193 @@ class Window(W.QMainWindow):
             metrics = step_metrics(segment[:,0],segment[:,target+1],segment[:,actual+1],.05 if self.band.currentIndex() else .02)
         if metrics is None:
             self.scope.clear_step()
-            self.metrics.setText("等待所选目标通道发生阶跃")
+            text = "等待所选目标通道发生阶跃"
+            if actual is not None and actual < 4 and len(a) >= 24:
+                left, right = self.scope.viewRange()[0]
+                vis = a[(a[:, 0] >= left) & (a[:, 0] <= right)]
+                freq, amp = dominant_fft(vis[:, 0], vis[:, actual + 1]) if len(vis) >= 24 else (None, 0.0)
+                if freq is not None and amp > 0.05:
+                    text += f"\n主频 FFT ≈ {freq:.2f} Hz（幅值 {amp:.3g}）"
+            self.metrics.setText(text)
         else:
             if self.overlays.isChecked():
                 self.scope.step_overlay(segment,target+1,actual+1,.05 if self.band.currentIndex() else .02,metrics)
             else:
                 self.scope.clear_step()
+            if self.scope.ghost:
+                targets = segment[:, target + 1]
+                changes = np.flatnonzero(~np.isclose(targets[1:], targets[:-1], rtol=1e-7, atol=1e-9) & np.isfinite(targets[1:])) + 1
+                if len(changes):
+                    k = int(changes[-1])
+                    prev = segment[:k, actual + 1]
+                    prev = prev[np.isfinite(prev)]
+                    if len(prev):
+                        self.scope.align_ghost(float(segment[k, 0]), float(prev[-1]), float(targets[k]), actual + 1)
             vals = ["—" if x is None else f"{x:.3g}" for x in metrics]
-            self.metrics.setText(f"超调  {vals[0]} %　 上升  {vals[1]} s\n调节  {vals[2]} s　 尾段误差  {vals[3]}\nIAE  {vals[4]}")
+            msg = f"超调  {vals[0]} %　 上升  {vals[1]} s\n调节  {vals[2]} s　 尾段误差  {vals[3]}\nIAE  {vals[4]}"
+            if self.scope.ghost:
+                gm = self.scope.ghost["metrics"]
+                g_os = f"{gm[0]:.3g}%" if gm[0] is not None else "—"
+                g_st = f"{gm[2]:.3g}s" if gm[2] is not None else "—"
+                msg += f"\n对比底图 ({self.scope.ghost['tag']})：超调 {g_os} · 调节 {g_st}"
+            if actual < 4 and len(segment) >= 24:
+                freq, amp = dominant_fft(segment[:, 0], segment[:, actual + 1])
+                if freq is not None and amp > 0.08 * max(float(np.nanmax(segment[:, actual + 1]) - np.nanmin(segment[:, actual + 1])), 1e-3):
+                    msg += f"\n主频 FFT ≈ {freq:.2f} Hz"
+            self.metrics.setText(msg)
         self.measure()
+
+    def pin_step_ghost(self):
+        a = self.scope.data
+        target, actual = self.target_ch.currentData(), self.actual_ch.currentData()
+        if target is None or actual is None or target == actual or not len(a):
+            self.feedback("当前没有可锁定的阶跃曲线", True)
+            return
+        missing = np.flatnonzero(~np.isfinite(a[:, target + 1]) | ~np.isfinite(a[:, actual + 1]))
+        segment = a[missing[-1] + 1:] if len(missing) else a
+        metrics = step_metrics(segment[:, 0], segment[:, target + 1], segment[:, actual + 1], .05 if self.band.currentIndex() else .02)
+        if metrics is None:
+            self.feedback("未检测到阶跃跳变，请先触发一次目标值阶跃后再锁定底图", True)
+            return
+        g = self.selected()
+        kp = self.confirmed.get(f"{g}.KP", self.fields["KP"].value())
+        ki = self.confirmed.get(f"{g}.KI", self.fields["KI"].value())
+        kd = self.confirmed.get(f"{g}.KD", self.fields["KD"].value())
+        tag = f"KP={kp:.3g},KI={ki:.3g},KD={kd:.3g}"
+        if self.scope.pin_ghost(segment, target + 1, actual + 1, metrics, tag):
+            self.clear_ghost_btn.setEnabled(True)
+            self.analyze()
+            self.feedback("已锁定当前阶跃为对比底图（后续阶跃将自动同起点叠加对比）")
+
+    def clear_step_ghost(self):
+        self.scope.clear_ghost()
+        self.clear_ghost_btn.setEnabled(False)
+        self.analyze()
+        self.feedback("已清除对比底图")
+
+    def import_csv(self):
+        if self.writer:
+            self.feedback("请先停止当前 CSV 录制后再导入回放", True)
+            return
+        path, _ = W.QFileDialog.getOpenFileName(
+            self, "打开历史 CSV 波形回放", "", "CSV (*.csv);;所有文件 (*)",
+            options=W.QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not path:
+            return
+        self.load_csv_file(path)
+
+    def load_csv_file(self, path):
+        try:
+            loaded = load_csv(path)
+        except (OSError, ValueError) as exc:
+            self.feedback(f"CSV 导入失败：{exc}", True)
+            return False
+        if self.connected or self.link:
+            self.disconnect()
+        self.clear_plot()
+        for i in range(4):
+            self.scales[i] = 1.0
+            self.units[i] = loaded["units"][i]
+            self.name_edits[i].setText(loaded["aliases"][i])
+            self.ref_active[i] = False
+            self.follow[i] = ""
+        for slot, (r_name, r_val) in enumerate(loaded["references"]):
+            self.ref_rows[slot][1].setText(r_name)
+            self.ref_rows[slot][2].setValue(r_val)
+            self.ref_active[slot] = True
+
+        mat = loaded["data"]
+        snaps = loaded["params"]
+        self.count = loaded["count"]
+        self.buffer.reset()
+        for row, snap in zip(mat, snaps):
+            self.buffer.add(float(row[0]), row[1:9], snap)
+        self.frames = len(mat)
+        self.latest = float(mat[-1, 0])
+        # Populate confirmed dictionary from the last non-empty parameter snapshot if present
+        for snap in reversed(snaps):
+            if any(x != "" for x in snap):
+                for col_key, val in zip(PARAM_COLS, snap):
+                    if isinstance(val, (int, float)):
+                        self.confirmed[col_key] = float(val)
+                        g, k = col_key.split(".")
+                        self.drafts[g][k] = float(val)
+                self.load_fields()
+                break
+
+        self.refresh_channels()
+        span = max(0.5, float(mat[-1, 0] - mat[0, 0]))
+        self.window.setValue(round(span, 3))
+        self.toggle_freeze()
+        self.scope.setXRange(float(mat[0, 0]), float(mat[-1, 0]), padding=0)
+        self.analyze()
+        self.feedback(f"已载入 CSV 回放：{Path(path).name}（{len(mat)} 帧，{self.count} 通道）")
+        return True
+
+    def export_c_code(self):
+        c_export_dialog(self)
+
+    def open_diagnostics(self):
+        diagnostics_dialog(self)
+
+    def refresh_macros(self):
+        for i, btn in enumerate(self.macro_btns):
+            label, cmd = self.macros[i]
+            btn.setText(label or f"M{i+1}")
+            btn.setToolTip(f"点击发送：{cmd}（右键点击可编辑）")
+
+    def send_macro(self, index):
+        if not self.connected:
+            self.feedback("请先连接串口或打开仿真", True)
+            return
+        _, cmd = self.macros[index]
+        cmd = cmd.strip()
+        if not cmd:
+            self.edit_macro(index)
+            return
+        if cmd == "@STOP":
+            self.stop_device()
+        elif cmd in ("@GET", "@RST"):
+            self.enqueue(self.key(cmd[1:]))
+        elif cmd.startswith("@"):
+            self.enqueue(cmd)
+        elif self.sim:
+            self.feedback("仿真仅支持 @ 开头指令", True)
+        elif not self.link.send((cmd + "\n").encode()):
+            self.feedback("发送队列已满", True)
+
+    def edit_macro(self, index):
+        dlg = W.QDialog(self)
+        dlg.setWindowTitle("编辑快捷指令按钮")
+        dlg.setMinimumWidth(360)
+        outer = W.QVBoxLayout(dlg)
+        outer.addWidget(W.QLabel("配置终端上方的 5 个一键快捷指令（右键任意按钮可直接打开）："))
+        grid = W.QGridLayout()
+        outer.addLayout(grid)
+        grid.addWidget(W.QLabel("按钮名称"), 0, 1)
+        grid.addWidget(W.QLabel("发送指令（自动加换行）"), 0, 2)
+        edits = []
+        for i, (lbl, cmd) in enumerate(self.macros):
+            n_ed = W.QLineEdit(lbl)
+            n_ed.setMaxLength(16)
+            c_ed = W.QLineEdit(cmd)
+            c_ed.setMaxLength(80)
+            grid.addWidget(W.QLabel(f"#{i+1}"), i + 1, 0)
+            grid.addWidget(n_ed, i + 1, 1)
+            grid.addWidget(c_ed, i + 1, 2)
+            edits.append((n_ed, c_ed))
+        edits[index][0].setFocus()
+        bb = W.QDialogButtonBox(W.QDialogButtonBox.StandardButton.Ok | W.QDialogButtonBox.StandardButton.Cancel)
+        bb.button(W.QDialogButtonBox.StandardButton.Ok).setText("保存")
+        bb.button(W.QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        outer.addWidget(bb)
+        if dlg.exec() == W.QDialog.DialogCode.Accepted:
+            self.macros = [(n.text().strip() or f"M{i+1}", c.text().strip()) for i, (n, c) in enumerate(edits)]
+            self.refresh_macros()
+            self.feedback("快捷指令已更新")
 
     def choose_file(self,title,suffix):
         filename = "PID_"+datetime.now().strftime("%Y%m%d_%H%M%S")+"."+suffix

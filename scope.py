@@ -119,6 +119,16 @@ class Scope(pg.PlotWidget):
         self.step_items = []
         self.step_view = None
         self.step_signature = None
+        self.ghost = None
+        self.ghost_view = self.getViewBox()
+        self.ghost_curve = pg.PlotDataItem(pen=pg.mkPen("#8b5cf6", width=2.0, style=QtCore.Qt.PenStyle.DashLine))
+        self.ghost_curve.setZValue(8)
+        self.ghost_curve.hide()
+        self.ghost_label = pg.TextItem(color="#8b5cf6", anchor=(1, 0))
+        self.ghost_label.setZValue(9)
+        self.ghost_label.hide()
+        self.getViewBox().addItem(self.ghost_curve, ignoreBounds=True)
+        self.getViewBox().addItem(self.ghost_label, ignoreBounds=True)
 
     def hover(self,args):
         pos = args[0]
@@ -206,6 +216,62 @@ class Scope(pg.PlotWidget):
             self.step_view.removeItem(item)
         self.step_items.clear()
         self.step_signature = None
+        if self.ghost is None:
+            self.ghost_curve.hide()
+            self.ghost_label.hide()
+
+    def pin_ghost(self, data, target, actual, metrics, tag=""):
+        targets = data[:, target]
+        changes = np.flatnonzero(~np.isclose(targets[1:], targets[:-1], rtol=1e-7, atol=1e-9) & np.isfinite(targets[1:])) + 1
+        if not len(changes):
+            return False
+        k = int(changes[-1])
+        prev = data[:k, actual]
+        prev = prev[np.isfinite(prev)]
+        if not len(prev):
+            return False
+        y0 = float(prev[-1])
+        goal = float(targets[k])
+        if abs(goal - y0) < 1e-9:
+            return False
+        rel_t = data[k:, 0] - data[k, 0]
+        norm_z = (data[k:, actual] - y0) / (goal - y0)
+        self.ghost = {
+            "rel_t": rel_t.copy(),
+            "norm_z": norm_z.copy(),
+            "y0": y0,
+            "goal": goal,
+            "metrics": metrics,
+            "tag": tag or "对比底图",
+        }
+        self.align_ghost(float(data[k, 0]), y0, goal, actual)
+        return True
+
+    def align_ghost(self, step_t0, y0, goal, actual):
+        if not self.ghost:
+            return
+        view = self.secondary if actual - 1 == self.right_channel else self.getViewBox()
+        if view is not self.ghost_view:
+            self.ghost_view.removeItem(self.ghost_curve)
+            self.ghost_view.removeItem(self.ghost_label)
+            view.addItem(self.ghost_curve, ignoreBounds=True)
+            view.addItem(self.ghost_label, ignoreBounds=True)
+            self.ghost_view = view
+        gx = step_t0 + self.ghost["rel_t"]
+        gy = y0 + self.ghost["norm_z"] * (goal - y0)
+        self.ghost_curve.setData(gx, gy, autoDownsample=False, connect="finite")
+        self.ghost_curve.show()
+        valid_idx = np.flatnonzero(np.isfinite(gy))
+        if len(valid_idx):
+            last_i = int(valid_idx[-1])
+            self.ghost_label.setText("底图 · " + self.ghost["tag"])
+            self.ghost_label.setPos(float(gx[last_i]), float(gy[last_i]))
+            self.ghost_label.show()
+
+    def clear_ghost(self):
+        self.ghost = None
+        self.ghost_curve.hide()
+        self.ghost_label.hide()
 
     def step_overlay(self,data,target,actual,band,metrics):
         targets = data[:,target]
@@ -285,6 +351,8 @@ class Scope(pg.PlotWidget):
 
     def reset(self):
         self.clear_step()
+        self.ghost_curve.hide()
+        self.ghost_label.hide()
         self.selection.hide()
         self.press = None
         self.data = np.empty((0, 9))

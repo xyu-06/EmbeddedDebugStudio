@@ -138,7 +138,8 @@ def build(w):
     w.stop_btn = button("急停", w.stop_device, "danger")
     w.badge = W.QLabel("未连接")
     for b in [w.connect_btn, w.pause_btn, button("清空波形", w.clear_plot), w.record_btn,
-              button("快照 PNG", w.png), button("导出视图 CSV", w.export_view)]:
+              button("快照 PNG", w.png), button("导出视图 CSV", w.export_view),
+              button("打开 CSV", w.import_csv), button("🩺 信号体检", w.open_diagnostics)]:
         bar.addWidget(b)
     bar.addWidget(w.badge)
     bar.addStretch()
@@ -275,7 +276,12 @@ def build(w):
     f.addRow("参数组",w.group)
     w.address = combo(["分组命令  @ANG.KP", "单环命令  @KP"])
     f.addRow("寻址方式",w.address)
+    w.slider_toggle = check("滑块微调", False)
+    w.step_gear = combo(["步长 0.001", "步长 0.01", "步长 0.1", "步长 1", "步长 10"], 2)
+    f.addRow(row(w.slider_toggle, w.step_gear))
     w.fields = {}
+    w.sliders = {}
+    w.pid_form = f
     for key in KEYS:
         field = number(DEFAULTS[key], -LIMIT, LIMIT, .1, parameter=True)
         w.fields[key] = field
@@ -292,12 +298,21 @@ def build(w):
         action.setToolTip("下发此参数（回车）")
         action.triggered.connect(lambda _,k=key: w.send_field(k))
         f.addRow(key,field)
+        slider = W.QSlider(C.Qt.Orientation.Horizontal)
+        slider.setRange(0, 1000)
+        slider.setValue(500)
+        slider.setFixedHeight(15)
+        slider.setToolTip(f"拖动连续调节 {key}（以当前值为中心微调）")
+        w.sliders[key] = slider
+        f.addRow("", slider)
+        f.setRowVisible(slider, False)
     w.auto = check("编辑完成后自动发送", False)
     f.addRow(w.auto)
     f.addRow(row(button("读取", w.read_params),button("发送本组",w.send_group),button("启动",w.run_device)))
     f.addRow(row(button("清积分", w.reset_integral),button("保存预设",w.save_preset),button("载入预设",w.load_preset)))
-    w.undo_btn = button("撤销上次下发",w.commands.undo_parameter)
-    f.addRow(row(button("参数保护",w.edit_limits),w.undo_btn))
+    w.undo_btn = button("撤销",w.commands.undo_parameter)
+    w.undo_btn.setToolTip("撤销上次下发的参数")
+    f.addRow(row(button("参数保护",w.edit_limits),w.undo_btn,button("C 代码",w.export_c_code)))
     w.autotune_btn = button("⚡ 自动整定 PID…",w.open_autotune,"accent")
     w.autotune_btn.setToolTip("设定目标值后自动激励、评估波形并寻优 KP / KI / KD")
     f.addRow(w.autotune_btn)
@@ -341,6 +356,10 @@ def build(w):
     f.addRow(w.metrics)
     w.overlays = check("在波形显示阶跃指标",True)
     f.addRow(w.overlays)
+    w.pin_step_btn = button("📌 锁定对比底图", w.pin_step_ghost)
+    w.clear_ghost_btn = button("清除底图", w.clear_step_ghost)
+    w.clear_ghost_btn.setEnabled(False)
+    f.addRow(row(w.pin_step_btn, w.clear_ghost_btn))
     f = section("单次触发捕获",False)
     w.trigger_ch = combo([])
     w.trigger_level = number(0,-LIMIT,LIMIT,.5,3)
@@ -409,6 +428,16 @@ def build(w):
     lo.setSpacing(4)
     w.hex_mode, w.autoscroll = check("HEX 显示",False),check("自动滚动",True)
     tools = row(W.QLabel("串口终端"),w.hex_mode,w.autoscroll,button("清屏",w.clear_log))
+    tools.addSpacing(8)
+    tools.addWidget(W.QLabel("快捷指令:"))
+    w.macro_btns = []
+    for idx in range(5):
+        mb = button("", partial(w.send_macro, idx))
+        mb.setContextMenuPolicy(C.Qt.ContextMenuPolicy.CustomContextMenu)
+        mb.customContextMenuRequested.connect(lambda _, i=idx: w.edit_macro(i))
+        w.macro_btns.append(mb)
+        tools.addWidget(mb)
+    tools.addWidget(button("编辑快捷", lambda: w.edit_macro(0)))
     tools.addStretch()
     lo.addLayout(tools)
     w.terminal = W.QPlainTextEdit()

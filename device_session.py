@@ -119,6 +119,14 @@ class DeviceSession(CommandQueue):
         if cmd and "." not in cmd.partition("=")[0]:
             group = "ANG"
         if kind == "ERR":
+            if "only spd" in payload.lower() and self.ui.selected() != "SPD":
+                was_get = cmd.endswith("GET")
+                self.clear()
+                self.ui.group.setCurrentIndex(LOOPS.index("SPD"))
+                self.ui.feedback("下位机仅启用 SPD 速度环，已自动切换至 SPD")
+                if was_get:
+                    self.ui.read_params()
+                return
             self.failed("设备报错  " + payload)
             return
         if kind == "PARAM":
