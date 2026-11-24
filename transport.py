@@ -30,6 +30,11 @@ class SerialLink(Thread):
         self.events = deque()
         self.queued_bytes = 0
         self.dropped = 0
+        self._modem_lines = None
+
+    def set_modem_lines(self, dtr=None, rts=None):
+        with self.lock:
+            self._modem_lines = (dtr, rts)
 
     def send(self, data, urgent=False):
         with self.lock:
@@ -88,6 +93,16 @@ class SerialLink(Thread):
             with serial.serial_for_url(**self.options, timeout=.012, write_timeout=.25) as port:
                 self.event("open", port.port)
                 while not self.closed.is_set():
+                    with self.lock:
+                        lines, self._modem_lines = self._modem_lines, None
+                    if lines is not None:
+                        try:
+                            if lines[0] is not None:
+                                port.dtr = bool(lines[0])
+                            if lines[1] is not None:
+                                port.rts = bool(lines[1])
+                        except (AttributeError, OSError, serial.SerialException):
+                            pass
                     data = self.next_write(monotonic())
                     if data is not None:
                         heartbeat = data is HEARTBEAT

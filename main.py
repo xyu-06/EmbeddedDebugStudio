@@ -20,8 +20,10 @@ from serial.tools import list_ports
 
 from engine import DEFAULTS, KEYS, LIMIT, LOOPS, Lines, Simulator, step_metrics
 from generator import SHAPES, TargetGenerator
+from imu_studio import ImuStudioPage
 from layout_ui import STYLE, build, number
 from scope import COLORS, REF_COLORS
+from serial_studio import SerialAssistantPage
 from storage import History, PARAM_COLS, csv_header, csv_row, load_csv
 from transport import SerialLink
 
@@ -82,6 +84,20 @@ class Window(W.QMainWindow):
         self.last_metrics = 0.
         self.loading = True
         build(self)
+        self.module_id = "pid"
+        self.module_title = "📈 PID 调参"
+        self.module_tabs = []
+        self.module_actions = []
+        self.extra_modules = []
+        self.confirm_handoff = None
+        self.module_group = W.QButtonGroup(self)
+        self.module_group.setExclusive(True)
+        self.serial_page = SerialAssistantPage(self)
+        self.imu_page = ImuStudioPage(self)
+        self.register_module(self.module_title, self.pid_page, host_owned=True)
+        self.register_module(self.serial_page.module_title, self.serial_page)
+        self.register_module(self.imu_page.module_title, self.imu_page)
+        self.dark_action.toggled.connect(self.dark.setChecked)
         self.refresh_ports()
         self.restore()
         self.last_group = self.selected()
@@ -135,6 +151,151 @@ class Window(W.QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start()
         self.update_status()
+        self.update_module_badges()
+
+    def register_module(self, title, widget, host_owned=False):
+        if self.module_stack.indexOf(widget) < 0:
+            self.module_stack.addWidget(widget)
+        idx = self.module_stack.indexOf(widget)
+        tab = W.QPushButton(title)
+        tab.setObjectName("navTab")
+        tab.setCheckable(True)
+        tab.setCursor(C.Qt.CursorShape.PointingHandCursor)
+        tab.setChecked(idx == 0)
+        tab.clicked.connect(lambda _=False, i=idx: self.switch_module(i))
+        self.nav_buttons_layout.addWidget(tab)
+        self.module_group.addButton(tab, idx)
+        owner = self if host_owned else widget
+        self.module_tabs.append((title, tab, owner))
+        act = self.module_menu.addAction(title)
+        act.setCheckable(True)
+        act.setChecked(idx == 0)
+        if idx < 9:
+            act.setShortcut(QtGui.QKeySequence(f"Ctrl+{idx+1}"))
+        act.triggered.connect(lambda _=False, i=idx: self.switch_module(i))
+        self.module_actions.append(act)
+        if not host_owned:
+            self.extra_modules.append(widget)
+
+    def switch_module(self, index: int):
+        if not (0 <= index < self.module_stack.count()):
+            return
+        self.module_stack.setCurrentIndex(index)
+        for i, (_, tab, _) in enumerate(self.module_tabs):
+            with C.QSignalBlocker(tab):
+                tab.setChecked(i == index)
+        for i, act in enumerate(self.module_actions):
+            with C.QSignalBlocker(act):
+                act.setChecked(i == index)
+        _, _, target = self.module_tabs[index]
+        default_port = self.port.currentText().strip()
+        if target is not self and default_port and hasattr(target, "port_box") and not target.port_box.currentText().strip():
+            target.port_box.setCurrentText(default_port)
+        self.update_module_badges()
+
+    def active_port(self):
+        if (self.connected or self.link is not None or self.reconnect_at is not None) and not self.sim and self.reconnect_opts:
+            return self.reconnect_opts.get("url")
+        return None
+
+    def release_port(self):
+        if self.connected or self.link or self.reconnect_at is not None:
+            self.disconnect()
+            if self.link:
+                self.link.join(0.5)
+                if not self.link.is_alive():
+                    self.link = None
+                    self.closing = False
+                    self.source_ui()
+
+    def request_port_access(self, requester, port_name: str) -> bool:
+        wanted = port_name.strip().upper()
+        if not wanted:
+            return True
+        req_title = getattr(requester, "module_title", "当前模块")
+        for title, _, mod in self.module_tabs:
+            if mod is requester:
+                continue
+            held = mod.active_port()
+            if held and held.strip().upper() == wanted:
+                if self.confirm_handoff is not None:
+                    ok = bool(self.confirm_handoff(title, req_title, port_name))
+                else:
+                    ans = W.QMessageBox.question(
+                        self,
+                        "串口占用切换确认",
+                        f"串口 {port_name} 当前正被【{title}】占用。\n\n"
+                        f"是否自动断开【{title}】的连接，并将该串口切换给【{req_title}】使用？",
+                        W.QMessageBox.StandardButton.Yes | W.QMessageBox.StandardButton.No,
+                        W.QMessageBox.StandardButton.Yes,
+                    )
+                    ok = ans == W.QMessageBox.StandardButton.Yes
+                if not ok:
+                    return False
+                mod.release_port()
+                self.update_module_badges()
+                return True
+        return True
+
+    def update_module_badges(self):
+        if not hasattr(self, "module_tabs"):
+            return
+        active_notes = []
+        for title, tab, mod in self.module_tabs:
+            port = mod.active_port()
+            sim_on = bool(getattr(mod, "sim", None) or getattr(mod, "sim_active", False))
+            busy = bool(port or sim_on or getattr(mod, "connected", False) or getattr(mod, "link", None) is not None)
+            tab.setText(f"{title} ●" if busy else title)
+            clean_name = title.split(" ", 1)[-1]
+            if port:
+                active_notes.append(f"{clean_name}: {port}")
+            elif sim_on:
+                active_notes.append(f"{clean_name}: 仿真")
+        if active_notes:
+            self.global_ports_label.setText("活动连接：" + "  |  ".join(active_notes) + "  ·  Ctrl+1/2/3 切换模块")
+        else:
+            self.global_ports_label.setText("就绪 · 点击上方页签或按 Ctrl+1/2/3 快速切换调试模块")
+
+    def show_extension_guide(self):
+        dlg = W.QDialog(self)
+        dlg.setWindowTitle("综合调试台 · 模块化扩展接口说明")
+        dlg.resize(620, 440)
+        lay = W.QVBoxLayout(dlg)
+        info = W.QLabel(
+            "<b>插件化多模块架构说明</b><br>"
+            "本上位机采用统一的 <code>WorkbenchModule</code> 页面接口，当前已内置 "
+            "<b>📈 PID 调参</b>、<b>🔌 串口调试</b>、<b>🧭 IMU 姿态</b> 三大工作台。<br>"
+            "后续接入 <b>📷 摄像头图传 (OV7670/OpenMV)</b>、<b>🎮 蓝牙遥控</b>、<b>🔋 电源监测</b> 等模块时，"
+            "只需新建一个独立的 <code>QWidget</code> 子类并在 <code>Window.__init__</code> 注册一行即可自动获得："
+            "顶部导航栏页签、<code>调试模块(M)</code> 菜单与快捷键、跨页面串口冲突自动让渡、暗色主题同步与配置持久化。"
+        )
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        code = W.QPlainTextEdit()
+        code.setReadOnly(True)
+        code.setPlainText(
+            "class CameraDebugPage(QtWidgets.QWidget):\n"
+            "    module_id = 'camera'\n"
+            "    module_title = '📷 摄像头调试'\n\n"
+            "    def __init__(self, host=None):\n"
+            "        super().__init__(host)\n"
+            "        self.host = host\n"
+            "        # 打开串口前调用 self.host.request_port_access(self, port_name) 即可自动接管端口\n\n"
+            "    def active_port(self) -> str | None: return None\n"
+            "    def release_port(self) -> None: ...\n"
+            "    def apply_theme(self, dark: bool) -> None: ...\n"
+            "    def save_state(self, settings: QtCore.QSettings) -> None: ...\n"
+            "    def restore_state(self, settings: QtCore.QSettings) -> None: ...\n"
+            "    def shutdown(self) -> None: ...\n\n"
+            "# 在 main.py 的 Window.__init__ 中仅需新增一行：\n"
+            "self.register_module('📷 摄像头调试', CameraDebugPage(self))\n"
+        )
+        lay.addWidget(code, 1)
+        bb = W.QDialogButtonBox(W.QDialogButtonBox.StandardButton.Close)
+        bb.button(W.QDialogButtonBox.StandardButton.Close).setText("关闭")
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        dlg.exec()
 
     def try_simulation(self):
         if self.connected or self.link:
@@ -202,6 +363,9 @@ class Window(W.QMainWindow):
         s.setValue("options",json.dumps(opts,ensure_ascii=False))
         for key, value in (("geometry",self.saveGeometry()),("horizontal",self.horizontal.saveState()),("vertical",self.vertical.saveState())):
             s.setValue(key,value)
+        s.setValue("activeModule", self.module_stack.currentIndex())
+        for mod in getattr(self, "extra_modules", ()):
+            mod.save_state(s)
         s.sync()
 
     def restore(self):
@@ -272,6 +436,11 @@ class Window(W.QMainWindow):
             for key,fn in (("geometry",self.restoreGeometry),("horizontal",self.horizontal.restoreState),("vertical",self.vertical.restoreState)):
                 if self.settings.contains(key):
                     fn(self.settings.value(key))
+            for mod in getattr(self, "extra_modules", ()):
+                mod.restore_state(self.settings)
+            active_idx = self.settings.value("activeModule", 0, type=int)
+            if 0 <= active_idx < self.module_stack.count():
+                self.switch_module(active_idx)
         except (ValueError,TypeError,AttributeError):
             self.log("系统","设置中存在无效项目，已采用可用设置")
 
@@ -448,6 +617,8 @@ class Window(W.QMainWindow):
                             rtscts=self.flow.currentIndex()==1,xonxoff=self.flow.currentIndex()==2)
             except ValueError as exc:
                 self.feedback(str(exc),True)
+                return
+            if not self.request_port_access(self, name):
                 return
             self.fresh_session()
             self.reconnect_opts = opts
@@ -1461,6 +1632,8 @@ class Window(W.QMainWindow):
             self.link.closed.set()
             self.link.join(.6)
         self.persist()
+        for mod in getattr(self, "extra_modules", ()):
+            mod.shutdown()
         # The legend follows ViewBox geometry; stop their callbacks before Qt destroys the scene.
         self.scope.legend.blockSignals(True)
         self.scope.getViewBox().blockSignals(True)
@@ -1513,7 +1686,19 @@ def main():
             ok = terminal_ok and calibrated_ok and channels_ok and viewport_ok and win.count == 4 and win.buffer.size >= 19 and win.commands.pending is None
             win.stop_device()
             ok = ok and not win.sim.running and not win.scope.grab().isNull()
-            ok = ok and not win.windowIcon().pixmap(32,32).isNull()
+            win.switch_module(1)
+            app.processEvents()
+            serial_ok = win.module_stack.currentWidget() is win.serial_page and not win.serial_page.grab().isNull()
+            win.switch_module(2)
+            win.imu_page.source_box.setCurrentIndex(1)
+            win.imu_page.toggle_source()
+            win.imu_page.epoch = monotonic() - 0.1
+            win.imu_page.tick()
+            app.processEvents()
+            imu_ok = win.imu_page.frames >= 3 and not win.imu_page.canvas.grab().isNull()
+            win.imu_page.disconnect_source()
+            win.switch_module(0)
+            ok = ok and serial_ok and imu_ok and not win.windowIcon().pixmap(32,32).isNull()
             win.close()
             win.deleteLater()
             C.QCoreApplication.sendPostedEvents(None,C.QEvent.Type.DeferredDelete)

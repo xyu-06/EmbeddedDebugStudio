@@ -7,6 +7,9 @@ from layout_ui import STYLE
 
 DARK = """
 QMainWindow,QWidget {background:#202730;color:#e4eaf1;}
+QMenu {background:#29323e;color:#e4eaf1;border-color:#526071;}
+QMenu::item:selected {background:#384759;}
+QFrame#navBar {background:#171e26;border-bottom:1px solid #2f3b48;}
 QFrame#card,QFrame#top,QFrame#pidPanel,QFrame#card QWidget,QFrame#top QLabel {background:#29323e;color:#e4eaf1;}
 QPushButton,QComboBox,QLineEdit,QDoubleSpinBox,QPlainTextEdit,QToolButton {background:#25303a;color:#ecf2f6;border-color:#526071;}
 QLabel#measure,QLabel#status {background:#202730;color:#c7d6de;}
@@ -50,6 +53,9 @@ class Workbench(C.QObject):
                 return True
             if W.QApplication.activeModalWidget() or not w.isActiveWindow():
                 return False
+            on_pid_page = getattr(w, "module_stack", None) is None or w.module_stack.currentIndex() == 0
+            if not on_pid_page:
+                return super().eventFilter(obj, event)
             if key==C.Qt.Key.Key_F5:
                 w.refresh_ports()
                 return True
@@ -109,6 +115,11 @@ class Workbench(C.QObject):
             line.label.setColor("#aec1d1" if dark else "#52677d")
         if hasattr(self.w,"autotune_status"):
             self.w.autotune_status.setStyleSheet(f"color:{'#6ed4b4' if dark else '#1c5f4e'};font-size:9pt;padding:2px 0;")
+        if hasattr(self.w,"dark_action") and self.w.dark_action.isChecked() != dark:
+            with C.QSignalBlocker(self.w.dark_action):
+                self.w.dark_action.setChecked(dark)
+        for mod in getattr(self.w, "extra_modules", ()):
+            mod.apply_theme(dark)
         self.fields()
 
     def motion(self):
@@ -151,6 +162,8 @@ class Workbench(C.QObject):
         w.badge.setText("● "+("连接异常" if mode=="error" else text))
         w.badge.setStyleSheet("color:"+color)
         w.guide.setVisible(not w.connected and not w.link and not reconnecting and not w.buffer.size)
+        if hasattr(w, "update_module_badges"):
+            w.update_module_badges()
 
     def fields(self):
         w = self.w

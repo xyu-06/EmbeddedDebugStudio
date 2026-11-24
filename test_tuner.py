@@ -17,6 +17,7 @@ from diagnostics import RuntimeMonitor, analyze_frame_timing, dominant_fft, form
 from engine import Lines, Simulator, match_ack, step_metrics
 from generator import TargetGenerator
 from main import Window
+from serial_studio import append_checksum, crc16_modbus
 from storage import History, load_csv
 from transport import SerialLink
 from scope import pixel_mean
@@ -805,6 +806,174 @@ class GuiChecks(unittest.TestCase):
             self.assertFalse(w.commands.waiting)
             self.assertFalse(w.confirmed)
             self.assertIn("超时",w.ack.text())
+            w.close()
+
+    def test_serial_checksums_and_loopback(self):
+        self.assertEqual(crc16_modbus(b"\x01\x03\x00\x00\x00\x0A"), b"\xC5\xCD")
+        self.assertEqual(append_checksum(b"\x10\x20\x30", 1), b"\x10\x20\x30\x60")
+        self.assertEqual(append_checksum(b"\xAA\x55\x0F", 2), b"\xAA\x55\x0F\xF0")
+        self.assertEqual(append_checksum(b"\x01\x03\x00\x00\x00\x0A", 3), b"\x01\x03\x00\x00\x00\x0A\xC5\xCD")
+
+        with TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "settings.ini"
+            w = Window(cfg)
+            w.timer.stop()
+            sp = w.serial_page
+            sp.poll_timer.stop()
+            sp.port_box.setCurrentText("loop://")
+            sp.toggle_port()
+            deadline = time.monotonic() + 1.5
+            while not sp.connected and time.monotonic() < deadline:
+                sp.tick()
+                time.sleep(0.01)
+            self.assertTrue(sp.connected)
+            self.assertEqual(sp.active_port(), "loop://")
+
+            # GBK Chinese loopback test
+            sp.encoding_box.setCurrentIndex(1)  # GBK
+            sp.tx_edit.setPlainText("平衡车OK")
+            sp.send_from_editor()
+            deadline = time.monotonic() + 1.0
+            while sp.rx_bytes < len("平衡车OK\n".encode("gbk")) and time.monotonic() < deadline:
+                sp.tick()
+                time.sleep(0.01)
+            sp.render_logs(force=True)
+            self.assertIn("平衡车OK", sp.log_view.toPlainText())
+
+            # Keyword filter test
+            sp.filter_edit.setText("不存在关键字")
+            self.assertEqual(sp.log_view.toPlainText(), "")
+            sp.filter_edit.clear()
+            self.assertIn("平衡车OK", sp.log_view.toPlainText())
+
+            # HEX + CRC16 quick slot test
+            sp.checksum_box.setCurrentIndex(3)
+            sp.slot_widgets[10][1].setText("01 03 00 00 00 0A")
+            sp.send_quick_slot(10)
+            prev_rx = sp.rx_bytes
+            deadline = time.monotonic() + 1.0
+            while sp.rx_bytes < prev_rx + 8 and time.monotonic() < deadline:
+                sp.tick()
+                time.sleep(0.01)
+            sp.rx_hex.setChecked(True)
+            sp.render_logs(force=True)
+            self.assertIn("C5 CD", sp.log_view.toPlainText())
+
+            w.switch_module(1)
+            sp.release_port()
+            w.close()
+
+            w2 = Window(cfg)
+            w2.timer.stop()
+            self.assertEqual(w2.module_stack.currentIndex(), 1)
+            self.assertEqual(w2.serial_page.encoding_box.currentIndex(), 1)
+            self.assertEqual(w2.serial_page.quick_slots[10][1], "01 03 00 00 00 0A")
+            w2.close()
+
+    def test_imu_studio_fusion_and_calibration(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "settings.ini")
+            w.timer.stop()
+            imu = w.imu_page
+            imu.timer.stop()
+            imu.connected = True
+
+            # 1) Balance-car 4-col & #BALANCE status lines
+            t0 = time.monotonic()
+            imu._feed_bytes(b"#BALANCE:CALIBRATING,KEEP_STILL\n", t0)
+            self.assertFalse(imu.banner.isHidden())
+            imu._feed_bytes(b"#BALANCE:READY\n", t0 + 0.01)
+            self.assertTrue(imu.banner.isHidden())
+
+            imu.start_zero_capture()
+            for i in range(50):
+                imu._feed_bytes(b"0.00,1.85,-0.4,12\n", t0 + 0.02 + i * 0.01)
+            self.assertAlmostEqual(imu.target_pitch, 1.85, places=3)
+            self.assertTrue(imu.sync_pid_btn.isEnabled())
+            imu.sync_zero_to_pid()
+            self.assertAlmostEqual(w.drafts["ANG"]["TGT"], 1.85, places=3)
+            self.assertAlmostEqual(w.fields["TGT"].value(), 1.85, places=3)
+
+            # 2) Raw MPU6050 6-axis LSB fusion (ay = 0.5g, az = 0.866025g -> +30 deg pitch)
+            imu.proto_box.setCurrentIndex(3)
+            imu.fused_init = False
+            imu.ingest_values([0.0, 8192.0, 14189.0, 0.0, 0.0, 1310.0], 1.0, 0.01)
+            imu.ingest_values([0.0, 8192.0, 14189.0, 0.0, 0.0, 1310.0], 1.1, 0.1)
+            self.assertAlmostEqual(imu.pitch, 30.0, delta=0.2)
+            self.assertAlmostEqual(imu.yaw, 1.0, delta=0.05)
+
+            # 3) Render 3D Balance Car & Horizon in both light and dark modes
+            imu.canvas.resize(720, 420)
+            imu.canvas.set_attitude(imu.pitch, 8.5, imu.yaw, 0.0, 220.0)
+            self.assertFalse(imu.canvas.grab().isNull())
+            w.dark.setChecked(True)
+            self.assertTrue(imu.canvas.dark)
+            self.assertFalse(imu.canvas.grab().isNull())
+            w.close()
+
+    def test_multi_module_navigation_and_port_handoff(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "settings.ini")
+            w.timer.stop()
+            w.serial_page.poll_timer.stop()
+            w.imu_page.timer.stop()
+
+            # Dynamic 4th module plug-in test (e.g. future Camera module)
+            class DummyCameraPage(W.QWidget):
+                module_id = "camera"
+                module_title = "📷 摄像头调试"
+                def active_port(self): return None
+                def release_port(self): pass
+                def apply_theme(self, dark): pass
+                def save_state(self, s): pass
+                def restore_state(self, s): pass
+                def shutdown(self): pass
+
+            cam = DummyCameraPage(w)
+            w.register_module(cam.module_title, cam)
+            self.assertEqual(w.module_stack.count(), 4)
+            w.switch_module(3)
+            self.assertIs(w.module_stack.currentWidget(), cam)
+
+            # Open loop:// on SerialAssistantPage
+            sp = w.serial_page
+            sp.port_box.setCurrentText("loop://")
+            sp.toggle_port()
+            deadline = time.monotonic() + 1.5
+            while not sp.connected and time.monotonic() < deadline:
+                sp.tick()
+                time.sleep(0.01)
+            self.assertEqual(sp.active_port(), "loop://")
+            self.assertIn("●", w.module_tabs[1][1].text())
+
+            # Decline handoff -> SerialAssistantPage retains port
+            imu = w.imu_page
+            imu.port_box.setCurrentText("loop://")
+            w.confirm_handoff = lambda *_: False
+            imu.toggle_source()
+            self.assertEqual(sp.active_port(), "loop://")
+            self.assertIsNone(imu.active_port())
+
+            # Accept handoff -> SerialAssistantPage releases port to ImuStudioPage
+            w.confirm_handoff = lambda *_: True
+            imu.toggle_source()
+            deadline = time.monotonic() + 1.5
+            while not imu.connected and time.monotonic() < deadline:
+                imu.tick()
+                time.sleep(0.01)
+            self.assertIsNone(sp.active_port())
+            self.assertEqual(imu.active_port(), "loop://")
+
+            # Accept handoff -> ImuStudioPage releases port to PID Tuner Page
+            w.port.setCurrentText("loop://")
+            w.toggle_connection()
+            deadline = time.monotonic() + 1.5
+            while not w.connected and time.monotonic() < deadline:
+                w.tick()
+                time.sleep(0.01)
+            self.assertIsNone(imu.active_port())
+            self.assertEqual(w.active_port(), "loop://")
+            w.release_port()
             w.close()
 
 

@@ -120,14 +120,55 @@ def card(side, title, opened):
 
 
 def build(w):
-    w.setWindowTitle("PID 调参助手")
-    w.resize(1280, 800)
-    w.setMinimumSize(890, 570)
+    w.setWindowTitle("嵌入式综合调试助手 · PID / 串口 / IMU")
+    w.resize(1280, 820)
+    w.setMinimumSize(920, 590)
+
+    # Top Menu Bar for module selection & view options
+    menubar = w.menuBar()
+    w.module_menu = menubar.addMenu("调试模块(&M)")
+    view_menu = menubar.addMenu("视图与扩展(&V)")
+    w.dark_action = view_menu.addAction("暗色护眼主题")
+    w.dark_action.setCheckable(True)
+    view_menu.addSeparator()
+    view_menu.addAction("模块扩展接口说明…", w.show_extension_guide)
+
     root = W.QWidget()
     w.setCentralWidget(root)
-    main = W.QVBoxLayout(root)
+    shell = W.QVBoxLayout(root)
+    shell.setSpacing(0)
+    shell.setContentsMargins(0, 0, 0, 0)
+
+    # Unified top workbench module switcher bar
+    w.nav_bar = W.QFrame()
+    w.nav_bar.setObjectName("navBar")
+    nav = W.QHBoxLayout(w.nav_bar)
+    nav.setContentsMargins(12, 5, 12, 5)
+    nav.setSpacing(6)
+    brand = W.QLabel("⚡ 综合调试台")
+    brand.setObjectName("navBrand")
+    nav.addWidget(brand)
+    nav.addSpacing(8)
+    w.nav_buttons_layout = W.QHBoxLayout()
+    w.nav_buttons_layout.setContentsMargins(0, 0, 0, 0)
+    w.nav_buttons_layout.setSpacing(6)
+    nav.addLayout(w.nav_buttons_layout)
+    nav.addStretch()
+    w.global_ports_label = W.QLabel("就绪 · 可按上方页签或 Ctrl+1/2/3 切换工作台")
+    w.global_ports_label.setObjectName("navStatus")
+    nav.addWidget(w.global_ports_label)
+    shell.addWidget(w.nav_bar)
+
+    w.module_stack = W.QStackedWidget()
+    shell.addWidget(w.module_stack, 1)
+
+    # Page 0: Existing PID Tuner Workbench (100% preserved)
+    w.pid_page = W.QWidget()
+    main = W.QVBoxLayout(w.pid_page)
     main.setSpacing(0)
     main.setContentsMargins(0, 0, 0, 0)
+    w.module_stack.addWidget(w.pid_page)
+
     top = W.QFrame()
     top.setObjectName("top")
     bar = W.QHBoxLayout(top)
@@ -465,6 +506,17 @@ def build(w):
 STYLE = """
 QMainWindow,QWidget { font-family:'Microsoft YaHei UI','Segoe UI'; font-size:10pt; color:#223449; }
 QWidget { background:#f3f5f7; }
+QMenuBar { background:#1c2b3a; color:#dce6f0; padding:2px 6px; border-bottom:1px solid #13202c; }
+QMenuBar::item { background:transparent; padding:4px 10px; border-radius:3px; }
+QMenuBar::item:selected { background:#2c435a; color:white; }
+QMenu { background:white; color:#223449; border:1px solid #c6d0da; }
+QMenu::item:selected { background:#eaf1fa; }
+QFrame#navBar { background:#223449; border-bottom:1px solid #162433; }
+QLabel#navBrand { background:transparent; color:#ffffff; font-weight:700; font-size:10.5pt; }
+QLabel#navStatus { background:transparent; color:#b8cadb; font-size:9pt; }
+QPushButton#navTab { background:#2d435c; color:#d7e3ef; border:1px solid #3d5672; border-radius:5px; padding:4px 14px; font-weight:600; }
+QPushButton#navTab:hover { background:#395472; color:white; }
+QPushButton#navTab:checked { background:#225fc1; color:white; border-color:#4b86e8; }
 QFrame#top,QLabel#measure { background:white; border-bottom:1px solid #d3dae1; }
 QFrame#top QLabel {background:white;}
 QFrame#card {background:white;border:1px solid #cdd6df;border-radius:5px;}
