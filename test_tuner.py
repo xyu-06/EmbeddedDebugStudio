@@ -998,7 +998,19 @@ class GuiChecks(unittest.TestCase):
             self.assertAlmostEqual(w.drafts["ANG"]["TGT"], 1.85, places=3)
             self.assertAlmostEqual(w.fields["TGT"].value(), 1.85, places=3)
 
-            # 2) Raw MPU6050 6-axis LSB fusion (ay = 0.5g, az = 0.866025g -> +30 deg pitch)
+            # 2) Physical 6-axis split-chunk assembly, then raw MPU6050 LSB fusion (+30 deg pitch)
+            imu.proto_box.setCurrentIndex(2)
+            imu.fused_init = False
+            imu._feed_bytes(b"#BALANCE:CALIBRATING,KEEP_STILL\n", t0 + 0.8)
+            self.assertFalse(imu.banner.isHidden())
+            imu._feed_bytes(b"#NAMES:ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps\n#BALANCE:READY\n", t0 + 0.82)
+            self.assertTrue(imu.banner.isHidden())
+            frames_before = imu.frames
+            for chunk in (b"0.0100,-0.0", b"870,0.9960,0.2", b"0,-0.10,0.05\n"):
+                imu._feed_bytes(chunk, t0 + 0.85)
+            self.assertEqual(imu.frames, frames_before + 1)
+            self.assertAlmostEqual(imu.acc_norm, 1.0, delta=0.02)
+
             imu.proto_box.setCurrentIndex(3)
             imu.fused_init = False
             imu.ingest_values([0.0, 8192.0, 14189.0, 0.0, 0.0, 1310.0], 1.0, 0.01)

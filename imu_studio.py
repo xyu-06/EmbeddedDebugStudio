@@ -628,14 +628,14 @@ class ImuStudioPage(W.QWidget):
 
     def copy_imu_c_snippet(self):
         snippet = (
-            "// 在 MPU6050 读取循环中通过 USART2 发送六轴数据（100 Hz，适配【IMU 姿态】页“六轴物理量”模式）：\n"
+            "// 在 MPU6050 读取循环中通过 USART2 发送六轴数据（50 Hz，适配【IMU 姿态】页“六轴物理量”模式）：\n"
+            "// 需包含 User/MPU6050.h，并用 static 缓冲区保证 HAL_UART_Transmit_IT 发送完成前内存有效：\n"
             "MPU6050_Data_t imu;\n"
+            "static char uart_buf[96];\n"
             "if (MPU6050_GetCalibratedData(&imu) == MPU6050_OK) {\n"
-            "    char buf[80];\n"
-            "    int n = npf_snprintf(buf, sizeof(buf), \"%.3f,%.3f,%.3f,%.2f,%.2f,%.2f\\n\",\n"
-            "                         imu.AccX, imu.AccY, imu.AccZ, imu.GyroX, imu.GyroY, imu.GyroZ);\n"
-            "    if (n > 0 && huart2.gState == HAL_UART_STATE_READY)\n"
-            "        HAL_UART_Transmit_IT(&huart2, (uint8_t *)buf, (uint16_t)n);\n"
+            "    uint16_t n = MPU6050_FormatCalibratedCsv(uart_buf, sizeof(uart_buf), &imu);\n"
+            "    if (n > 0U && huart2.gState == HAL_UART_STATE_READY)\n"
+            "        HAL_UART_Transmit_IT(&huart2, (uint8_t *)uart_buf, n);\n"
             "}\n"
         )
         W.QApplication.clipboard().setText(snippet)
@@ -706,13 +706,9 @@ class ImuStudioPage(W.QWidget):
 
     def _feed_bytes(self, data: bytes, stamp_mono: float):
         self.rx_bytes += len(data)
-        # Support up to 6 comma-separated floats on IMU lines!
-        for raw_line in data.decode("utf-8", errors="ignore").splitlines():
-            s = raw_line.strip()
-            if not s:
-                continue
-            if s.startswith("#BALANCE:"):
-                tag = s[9:].strip()
+        for kind, payload in self.parser.feed(data):
+            if kind == "log" and payload.startswith("#BALANCE:"):
+                tag = payload[9:].strip()
                 if tag.startswith("CALIBRATING"):
                     self.banner.setStyleSheet("background:#8d691e;color:white;padding:5px 10px;font-weight:600;")
                     self.banner.setText("IMU 正在预热与 500 帧静止校准，请保持车身静止…")
@@ -727,19 +723,10 @@ class ImuStudioPage(W.QWidget):
                     self.banner.setStyleSheet("background:#a83139;color:white;padding:5px 10px;font-weight:600;")
                     self.banner.setText("IMU 初始化或静止校准失败：" + tag)
                     self.banner.show()
-                continue
-            if s.startswith(("#", "@")):
-                continue
-            parts = s.split(",")
-            if 1 <= len(parts) <= 6:
-                try:
-                    vals = [float(p.rsplit(":", 1)[-1]) for p in parts]
-                    if all(math.isfinite(v) for v in vals):
-                        dt = 0.01 if self.last_sample_mono is None else max(0.001, min(0.2, stamp_mono - self.last_sample_mono))
-                        self.last_sample_mono = stamp_mono
-                        self.ingest_values(vals, max(0.0, stamp_mono - self.epoch), dt)
-                except ValueError:
-                    pass
+            elif kind == "data" and 1 <= len(payload) <= 6:
+                dt = 0.01 if self.last_sample_mono is None else max(0.001, min(0.2, stamp_mono - self.last_sample_mono))
+                self.last_sample_mono = stamp_mono
+                self.ingest_values(payload, max(0.0, stamp_mono - self.epoch), dt)
 
     def tick(self):
         now = monotonic()
