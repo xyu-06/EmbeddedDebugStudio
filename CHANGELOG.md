@@ -8,6 +8,8 @@
   - **覆盖全软件 3 类串口接口**：① **PID 闭环调参接口**（1～8 通道、`#NAMES:`/`#ROLES:`、`@RUN/@STOP/@PING/@SET`、`500 ms` 看门狗）、② **IMU / MPU6050 姿态接口**（支持六轴物理量、原始计数 LSB、平衡车四列、欧拉角三列，含 `#BALANCE:` 校准与保护横幅）、③ **小车差速遥控接口 `J,x,y`**（精确对齐 `BlueSerial_MixWheels` 差速混控、`S` 急停、`LED_ON/OFF/BEEP/SERVO` 与超时失联保护）。
   - **覆盖 3 大主流目标库**：**STM32 HAL 库（CubeMX · `huart` 中断收发）**、**STM32 标准外设库 SPL（`stm32f10x.h` · `USARTx` 中断）** 与 **ESP32 / Arduino（`Serial` C++ · `.ino`）**；STM32 代码全部基于整数定点数串行化，**零 `-u _printf_float` 依赖**，已通过 `-std=c99 -Wall -Wextra -Werror` 严格编译验证。
   - **动态【📖 协议与使用配置说明】**：随左栏所选接口类型与目标库自动切换对应接线步骤、CubeMX/Keil SPL/Arduino 接入指引、协议报文表及故障排查清单，并附全软件三大接口速查总览；PyInstaller 打包同步内嵌 `firmware_example/` 模板目录，单文件版 EXE 可离线导出全部源码。
+- **鼠标滚轮防误触保护**（`workbench.py`、`layout_ui.py`、`firmware_studio.py`）：
+  - 数值框、下拉框与微调滑块采用“点击聚焦后再滚轮微调”机制——滚动页面或误划过控件且未点击聚焦时，滚轮仅正常上下滚动所在面板而不会误改数值；先左键点击聚焦后再滑动滚轮即可微调数值。
 - **任意通道顺序自动绑定协议 `#ROLES:`**（`engine.py`、`main.py`、`autotune_ui.py`）：
   - 下位机只需上报 `#ROLES:output,error,actual,target`（或使用规范通道名），无论将 PWM、误差、实际速度、目标值放在第几列，上位机均自动识别并锁定真实反馈列、目标列与输出参考列，彻底消除顺序不一致导致的调参错误。
 

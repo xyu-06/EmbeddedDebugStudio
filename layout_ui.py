@@ -19,6 +19,7 @@ def button(text, fn, role=""):
 
 def combo(values, idx=0):
     w = W.QComboBox()
+    w.setFocusPolicy(C.Qt.FocusPolicy.StrongFocus)
     w.addItems(values)
     w.setCurrentIndex(idx)
     return w
@@ -26,6 +27,10 @@ def combo(values, idx=0):
 
 class ParameterSpin(W.QDoubleSpinBox):
     def wheelEvent(self,event):
+        le = self.lineEdit()
+        if not (self.hasFocus() or (le is not None and le.hasFocus())):
+            event.ignore()
+            return
         steps = event.angleDelta().y()
         if steps:
             multiplier = 10 if event.modifiers() & C.Qt.KeyboardModifier.ShiftModifier else 1
@@ -37,6 +42,7 @@ class ParameterSpin(W.QDoubleSpinBox):
 
 def number(value, low, high, step=.1, decimals=4, parameter=False):
     w = ParameterSpin() if parameter else W.QDoubleSpinBox()
+    w.setFocusPolicy(C.Qt.FocusPolicy.StrongFocus)
     w.setDecimals(decimals)
     w.setRange(low, high)
     w.setSingleStep(step)

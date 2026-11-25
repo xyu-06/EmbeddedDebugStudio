@@ -1490,6 +1490,68 @@ class GuiChecks(unittest.TestCase):
             self.assertEqual(w.firmware_page.interface_type(), 0)
             w.close()
 
+    def test_v18_wheel_guard_requires_click_focus(self):
+        def wheel(widget, dy=120):
+            ev = QtGui.QWheelEvent(
+                C.QPointF(10, 10),
+                C.QPointF(widget.mapToGlobal(C.QPoint(10, 10))),
+                C.QPoint(0, 0),
+                C.QPoint(0, dy),
+                C.Qt.MouseButton.NoButton,
+                C.Qt.KeyboardModifier.NoModifier,
+                C.Qt.ScrollPhase.NoScrollPhase,
+                False,
+            )
+            W.QApplication.sendEvent(widget, ev)
+
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "wheel.ini")
+            w.timer.stop()
+            w.serial_page.poll_timer.stop()
+            w.imu_page.timer.stop()
+            w.remote_page.timer.stop()
+            w.show()
+            W.QApplication.setActiveWindow(w)
+            W.QApplication.processEvents()
+
+            # 1) PID ParameterSpin ignores wheel until clicked/focused
+            kp = w.fields["KP"]
+            kp.setValue(5.0)
+            kp.clearFocus()
+            if kp.lineEdit() is not None:
+                kp.lineEdit().clearFocus()
+            W.QApplication.processEvents()
+            wheel(kp, 120)
+            if kp.lineEdit() is not None:
+                wheel(kp.lineEdit(), 120)
+            self.assertAlmostEqual(kp.value(), 5.0)
+
+            kp.setFocus(C.Qt.FocusReason.MouseFocusReason)
+            W.QApplication.processEvents()
+            wheel(kp, 120)
+            self.assertGreater(kp.value(), 5.0)
+
+            # 2) FirmwareStudioPage spinbox ignores wheel until clicked/focused
+            w.switch_module(4)
+            W.QApplication.processEvents()
+            fw_kp = w.firmware_page.def_kp
+            v0 = fw_kp.value()
+            fw_kp.clearFocus()
+            if fw_kp.lineEdit() is not None:
+                fw_kp.lineEdit().clearFocus()
+            w.firmware_page.code_edit.setFocus()
+            W.QApplication.processEvents()
+            wheel(fw_kp, 120)
+            if fw_kp.lineEdit() is not None:
+                wheel(fw_kp.lineEdit(), 120)
+            self.assertAlmostEqual(fw_kp.value(), v0)
+
+            fw_kp.setFocus(C.Qt.FocusReason.MouseFocusReason)
+            W.QApplication.processEvents()
+            wheel(fw_kp, 120)
+            self.assertGreater(fw_kp.value(), v0)
+            w.close()
+
 
 if __name__ == "__main__":
     unittest.main()

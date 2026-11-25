@@ -43,6 +43,27 @@ class Workbench(C.QObject):
 
     def eventFilter(self,obj,event):
         w = self.w
+        if event.type() == C.QEvent.Type.Wheel:
+            ctrl = None
+            if isinstance(obj, (W.QAbstractSpinBox, W.QComboBox, W.QSlider)):
+                ctrl = obj
+            elif isinstance(obj, W.QLineEdit) and isinstance(obj.parent(), (W.QAbstractSpinBox, W.QComboBox)):
+                ctrl = obj.parent()
+            if ctrl is not None:
+                focused = ctrl.hasFocus()
+                if not focused and hasattr(ctrl, "lineEdit") and ctrl.lineEdit() is not None:
+                    focused = ctrl.lineEdit().hasFocus()
+                if not focused:
+                    parent = ctrl.parentWidget()
+                    while parent is not None:
+                        if isinstance(parent, W.QScrollArea):
+                            vbar = parent.verticalScrollBar()
+                            if vbar is not None and vbar.maximum() > vbar.minimum():
+                                W.QApplication.sendEvent(vbar, event)
+                            break
+                        parent = parent.parentWidget()
+                    event.ignore()
+                    return True
         if event.type() in (C.QEvent.Type.ApplicationDeactivate, C.QEvent.Type.WindowDeactivate):
             if obj is w or obj is W.QApplication.instance():
                 rp = getattr(w, "remote_page", None)
@@ -189,7 +210,7 @@ class Workbench(C.QObject):
                       abs(field.value()-confirmed)<.00051 else "草稿")
             color = {"错误":"#bd3947","已确认":"#218366","草稿":"#ad7921"}[status]
             field.setStyleSheet(f"QDoubleSpinBox {{border-left:4px solid {color};}}")
-            field.setToolTip(status+(" · 设备值 "+format(confirmed,"g") if confirmed is not None else " · 尚未读回"))
+            field.setToolTip(status+(" · 设备值 "+format(confirmed,"g") if confirmed is not None else " · 尚未读回")+" · 点击聚焦后可滚轮微调")
         tuning = getattr(w,"autotuner",None) is not None and w.autotuner.active
         w.undo_btn.setEnabled(bool(w.undo_history) and w.connected and not tuning)
 

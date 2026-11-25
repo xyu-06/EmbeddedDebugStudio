@@ -2502,6 +2502,7 @@ class FirmwareStudioPage(W.QWidget):
         left_scroll.setMinimumWidth(320)
         left_scroll.setHorizontalScrollBarPolicy(C.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         left_box = W.QWidget()
+        left_box.setFocusPolicy(C.Qt.FocusPolicy.ClickFocus)
         left_layout = W.QVBoxLayout(left_box)
         left_layout.setContentsMargins(2, 2, 6, 2)
         left_layout.setSpacing(8)
@@ -2830,6 +2831,9 @@ class FirmwareStudioPage(W.QWidget):
         self.up_ch_btn.clicked.connect(lambda: self.move_channel(-1))
         self.dn_ch_btn.clicked.connect(lambda: self.move_channel(1))
         self.row_selector.valueChanged.connect(lambda v: setattr(self, "_selected_row", v - 1))
+        for cls in (W.QAbstractSpinBox, W.QComboBox):
+            for ctrl in left_box.findChildren(cls):
+                ctrl.setFocusPolicy(C.Qt.FocusPolicy.StrongFocus)
 
     @staticmethod
     def _pair_row(w1: W.QWidget, w2: W.QWidget) -> W.QWidget:
@@ -2917,6 +2921,7 @@ class FirmwareStudioPage(W.QWidget):
                 ed.setMaxLength(24)
                 ed.setMinimumWidth(0)
                 cb = W.QComboBox()
+                cb.setFocusPolicy(C.Qt.FocusPolicy.StrongFocus)
                 cb.setMinimumWidth(0)
                 cb.setSizeAdjustPolicy(W.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
                 for rk, rlabel in CHANNEL_ROLES:
