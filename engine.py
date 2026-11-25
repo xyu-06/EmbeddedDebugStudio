@@ -30,6 +30,12 @@ def decode_line(line):
         if 1 <= len(names) <= MAX_CHANNELS and all(names):
             return "names", names
         raise ValueError(f"通道名数量应为 1 至 {MAX_CHANNELS}")
+    if line.startswith("#ROLES:"):
+        roles = [s.strip().lower() for s in line[7:].split(",")]
+        allowed = {"target", "actual", "output", "error", "none", "other", ""}
+        if 1 <= len(roles) <= MAX_CHANNELS and all(r in allowed for r in roles):
+            return "roles", [r if r in ("target", "actual", "output", "error") else "" for r in roles]
+        raise ValueError(f"通道角色数量应为 1 至 {MAX_CHANNELS}")
     if line.startswith("#"):
         return "log", line
     for prefix in ("ACK", "ERR", "PARAM"):

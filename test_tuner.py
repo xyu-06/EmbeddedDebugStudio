@@ -1023,7 +1023,7 @@ class GuiChecks(unittest.TestCase):
             w.imu_page.timer.stop()
             w.remote_page.timer.stop()
 
-            # Dynamic 5th module plug-in test (e.g. future Camera module)
+            # Dynamic 6th module plug-in test (e.g. future Camera module)
             class DummyCameraPage(W.QWidget):
                 module_id = "camera"
                 module_title = "📷 摄像头调试"
@@ -1036,8 +1036,8 @@ class GuiChecks(unittest.TestCase):
 
             cam = DummyCameraPage(w)
             w.register_module(cam.module_title, cam)
-            self.assertEqual(w.module_stack.count(), 5)
-            w.switch_module(4)
+            self.assertEqual(w.module_stack.count(), 6)
+            w.switch_module(5)
             self.assertIs(w.module_stack.currentWidget(), cam)
 
             # Open loop:// on SerialAssistantPage
@@ -1334,6 +1334,72 @@ class GuiChecks(unittest.TestCase):
             self.assertTrue(any("SPD.KP=5.0000" in c for c in sent))
             self.assertTrue(any("SPD.KI=30.0000" in c for c in sent))
             w.close()
+
+    def test_v18_roles_order_free_and_firmware_interface_builder(self):
+        from firmware_studio import FirmwareStudioPage, generate_interface_bundle
+
+        # 1) Lines parses valid #ROLES and rejects invalid tokens or >8 items
+        parser = Lines()
+        ev = list(parser.feed(b"#ROLES:output,error,actual,target\n"))
+        self.assertEqual(ev, [("roles", ["output", "error", "actual", "target"])])
+        self.assertEqual([x[0] for x in parser.feed(b"#ROLES:bad_role,actual\n")], ["bad"])
+        self.assertEqual([x[0] for x in parser.feed(b"#ROLES:" + b",".join([b"other"] * 9) + b"\n")], ["bad"])
+
+        # 2) Reordered stream (PWM at CH1, Error at CH2, Actual at CH3, Target at CH4) binds automatically
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "roles.ini")
+            w.timer.stop()
+            w.connected = True
+            w.sim = None
+            w.receive(b"#NAMES:pwm_out,err,my_rpm,my_set\n", time.monotonic())
+            w.receive(b"#ROLES:output,error,actual,target\n", time.monotonic())
+            w.receive(b"650.0,84.5,15.5,100.0\n", time.monotonic())
+            self.assertEqual(w.target_ch.currentData(), 3)
+            self.assertEqual(w.actual_ch.currentData(), 2)
+            self.assertEqual(w.autotuner.detect_channels(), (2, 0))
+            w.close()
+
+        # 3) Code generation & UI builder add/move/delete/export across platforms
+        custom_cfg = {
+            "platform": 0,
+            "uart_handle": "huart1",
+            "baudrate": 115200,
+            "primary_loop": "SPD",
+            "control_ms": 10,
+            "report_ms": 20,
+            "pwm_limit": 1000.0,
+            "defaults": {"KP": 5.0, "KI": 30.0, "KD": 0.05, "TGT": 100.0},
+            "emit_roles": True,
+            "channels": [("pwm", "output"), ("err", "error"), ("vel", "actual"), ("sp", "target")],
+        }
+        hal_bundle = generate_interface_bundle(custom_cfg)
+        self.assertEqual(set(hal_bundle), {"main_integration_example.c", "pid_port_hal.h", "pid_port_hal.c", "pid_link.h", "pid_link.c", "README_接入说明.md"})
+        self.assertIn("#NAMES:pwm,err,vel,sp", hal_bundle["pid_port_hal.c"])
+        self.assertIn("#ROLES:output,error,actual,target", hal_bundle["pid_port_hal.c"])
+        self.assertIn("PID_Port_Init(&huart1)", hal_bundle["main_integration_example.c"])
+
+        gen_bundle = generate_interface_bundle({**custom_cfg, "platform": 1})
+        self.assertIn("pid_port_generic.c", gen_bundle)
+        ino_bundle = generate_interface_bundle({**custom_cfg, "platform": 2})
+        self.assertIn("EmbeddedDebugStudio_PID.ino", ino_bundle)
+        self.assertIn("#ROLES:output,error,actual,target", ino_bundle["EmbeddedDebugStudio_PID.ino"])
+
+        page = FirmwareStudioPage()
+        page.apply_preset(2)  # custom order preset
+        self.assertEqual(page.channels_data()[0][1], "output")
+        page.move_channel(-1) if False else None
+        page.row_selector.setValue(3)
+        page.move_channel(-1)  # swap CH3 -> CH2
+        self.assertEqual(page.channels_data()[1][1], "actual")
+        page.add_channel()
+        self.assertEqual(len(page.channels_data()), 5)
+        page.remove_channel()
+        self.assertEqual(len(page.channels_data()), 4)
+        with TemporaryDirectory() as exp_dir:
+            written = page.export_bundle(exp_dir)
+            self.assertEqual(len(written), 6)
+            self.assertTrue((Path(exp_dir) / "pid_port_hal.c").is_file())
+        page.close()
 
 
 if __name__ == "__main__":

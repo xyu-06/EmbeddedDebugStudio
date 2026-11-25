@@ -75,6 +75,9 @@ def main():
         ("11. 【🎮 遥控与 HC-05】工作台：联动 BlueSerialStudio（Ctrl+4）",
          "兼容 J,x,y 三模式差速遥控（失焦自动停车、非零摇杆 100 ms 心跳重发）；HC-05 工具箱含 57600 与 5760 笔误安全警告，写入 AT+UART= 前自动发 AT+UART? 对比确认。",
          "fig13_remote_hc05.png"),
+        ("12. 【🧩 接口构建】工作台与任意通道顺序 #ROLES: 协议（Ctrl+5）",
+         "支持可视化配置 1~8 通道顺序并绑定 target/actual/output/error 角色，一键生成并导出 STM32 HAL / 通用裸机 C99 / Arduino 接入代码，内置完整协议说明且允许任意列顺序自动识别。",
+         "fig10_diagnostics_and_ccode.png"),
     ]
 
     html_parts = [

@@ -50,25 +50,36 @@ class AutoTuneController:
         target_tags = ("target", "目标", "setpoint", "sp", "tgt", "ref")
         actual_tags = ("actual", "实际", "feedback", "fb", "meas")
         output_tags = ("pwm", "输出", "output", "out", "duty", "占空")
-        actual = w.actual_ch.currentData()
+        roles = list(getattr(w, "channel_roles", []))[:w.count]
         names = [n.lower() for n in w.names()[:w.count]]
-        if actual is None or actual >= max(1, w.count) or actual >= MAX_CHANNELS:
-            matched = next((i for i, n in enumerate(names) if any(t in n for t in actual_tags)), None)
-            if matched is not None:
-                actual = matched
-            elif w.sim or w.count >= 3 or (w.count >= 2 and any(t in names[0] for t in target_tags)):
-                actual = 1
-            else:
-                actual = 0
-        elif actual == 0 and w.count >= 2 and w.channel_preferences[1] != 0:
-            if any(t in names[0] for t in target_tags) or any(t in names[1] for t in actual_tags):
-                actual = 1
-                idx = w.actual_ch.findData(1)
-                if idx >= 0:
-                    with C.QSignalBlocker(w.actual_ch):
-                        w.actual_ch.setCurrentIndex(idx)
+        pref_actual = w.channel_preferences[1] if hasattr(w, "channel_preferences") else None
 
-        output = next((i for i, n in enumerate(names) if i != actual and any(t in n for t in output_tags)), None)
+        actual = w.actual_ch.currentData()
+        if pref_actual is not None and 0 <= pref_actual < w.count:
+            actual = pref_actual
+        else:
+            role_actual = next((i for i, r in enumerate(roles) if r == "actual"), None)
+            if role_actual is not None:
+                actual = role_actual
+            else:
+                name_actual = next((i for i, n in enumerate(names) if any(t in n for t in actual_tags)), None)
+                if name_actual is not None:
+                    actual = name_actual
+                elif actual is None or actual >= max(1, w.count) or actual >= MAX_CHANNELS:
+                    if w.sim or w.count >= 3 or (w.count >= 2 and any(t in names[0] for t in target_tags)):
+                        actual = 1
+                    else:
+                        actual = 0
+
+        if actual is not None and actual != w.actual_ch.currentData():
+            idx = w.actual_ch.findData(actual)
+            if idx >= 0:
+                with C.QSignalBlocker(w.actual_ch):
+                    w.actual_ch.setCurrentIndex(idx)
+
+        output = next((i for i, r in enumerate(roles) if i != actual and r == "output"), None)
+        if output is None:
+            output = next((i for i, n in enumerate(names) if i != actual and any(t in n for t in output_tags)), None)
         if output is None:
             if (w.sim or w.count >= 3) and actual != 2:
                 output = 2
@@ -395,8 +406,10 @@ class AutoTuneController:
                 return
             target_tags = ("target", "目标", "setpoint", "sp", "tgt", "ref")
             if not w.sim and 1 <= w.count <= 2 and not any(w.ref_active):
+                roles_now = list(getattr(w, "channel_roles", []))[:w.count]
                 names_lower = [n.lower() for n in w.names()[:w.count]]
-                if not any(t in names_lower[0] for t in target_tags):
+                has_tgt = ("target" in roles_now) or any(any(t in nl for t in target_tags) for nl in names_lower)
+                if not has_tgt:
                     w.follow[0] = self.group
                     w.set_reference(0, "整定目标", self.engine.target)
             self.actual_col, self.output_col = self.detect_channels()

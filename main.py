@@ -23,6 +23,7 @@ from generator import SHAPES, TargetGenerator
 from imu_studio import ImuStudioPage
 from layout_ui import STYLE, build, number
 from remote_studio import RemoteBtPage
+from firmware_studio import FirmwareStudioPage
 from scope import COLORS, REF_COLORS
 from serial_studio import SerialAssistantPage
 from storage import History, PARAM_COLS, csv_header, csv_row, load_csv
@@ -60,6 +61,7 @@ class Window(W.QMainWindow):
         self.ref_active = [False] * MAX_REFS
         self.scales = [1.] * MAX_CHANNELS
         self.units = [""] * MAX_CHANNELS
+        self.channel_roles = [""] * MAX_CHANNELS
         self.right_channel = -1
         self.follow = [""] * MAX_REFS
         self.rules = {group:DEFAULT_RULES.copy() for group in LOOPS}
@@ -97,10 +99,12 @@ class Window(W.QMainWindow):
         self.serial_page = SerialAssistantPage(self)
         self.imu_page = ImuStudioPage(self)
         self.remote_page = RemoteBtPage(self)
+        self.firmware_page = FirmwareStudioPage(self)
         self.register_module(self.module_title, self.pid_page, host_owned=True)
         self.register_module(self.serial_page.module_title, self.serial_page)
         self.register_module(self.imu_page.module_title, self.imu_page)
         self.register_module(self.remote_page.module_title, self.remote_page)
+        self.register_module(self.firmware_page.module_title, self.firmware_page)
         self.dark_action.toggled.connect(self.dark.setChecked)
         self.refresh_ports()
         self.restore()
@@ -599,6 +603,7 @@ class Window(W.QMainWindow):
         self.clear_plot()
         self.rx = self.tx = self.bad = self.frames = self.dropped = self.rate_frames = self.fps = 0
         self.count = 0
+        self.channel_roles = [""] * MAX_CHANNELS
         self.set_auto_names()
         self.refresh_channels()
         self.epoch = self.rate_start = monotonic()
@@ -929,6 +934,10 @@ class Window(W.QMainWindow):
                     for w,n in zip(self.name_edits,payload):
                         w.setPlaceholderText(n[:32])
                     self.channel_names()
+            elif kind == "roles":
+                if not self.writer:
+                    self.channel_roles = payload + [""] * (MAX_CHANNELS - len(payload))
+                    self.refresh_channels()
             elif kind in ("ACK","PARAM","ERR"):
                 self.commands.reply(kind,payload)
 
@@ -1218,13 +1227,19 @@ class Window(W.QMainWindow):
         self.calibrate_btn.setEnabled(not self.writer)
         ids = [*range(count),*(REF_BASE+i for i in refs)]
         speed_pwm = count==2 and not self.sim and any(tag in names[1].lower() for tag in ("pwm","占空","duty"))
-        target_tags = ("target","目标","setpoint","sp","tgt","ref")
-        actual_tags = ("actual","实际","feedback","fb","meas","pitch","rpm","speed","vel","pos")
-        ch0_is_target = count>=2 and any(tag in names[0].lower() for tag in target_tags)
-        ch1_is_actual = count>=2 and any(tag in names[1].lower() for tag in actual_tags)
-        has_target_ch = count>=3 or ch0_is_target or (count>=2 and ch1_is_actual and not speed_pwm)
-        defaults = [REF_BASE+refs[0] if refs else None if speed_pwm else 0,
-                    1 if count>=2 and (self.sim or has_target_ch or not (refs or speed_pwm)) else 0]
+        roles_now = self.channel_roles[:count]
+        target_tags = ("target","目标","setpoint","sp","tgt")
+        actual_tags = ("actual","实际","feedback","fb","meas")
+        role_target = next((i for i,r in enumerate(roles_now) if r == "target"), None)
+        if role_target is None:
+            role_target = next((i for i in range(count) if any(tag in names[i].lower() for tag in target_tags)), None)
+        role_actual = next((i for i,r in enumerate(roles_now) if i != role_target and r == "actual"), None)
+        if role_actual is None:
+            role_actual = next((i for i in range(count) if i != role_target and any(tag in names[i].lower() for tag in actual_tags)), None)
+        has_target_ch = count>=3 or role_target is not None
+        default_target = role_target if role_target is not None else (REF_BASE+refs[0] if refs else None if speed_pwm else 0)
+        default_actual = role_actual if role_actual is not None else (1 if count>=2 and (self.sim or has_target_ch or not (refs or speed_pwm)) else 0)
+        defaults = [default_target, default_actual]
         for role,widget in enumerate((self.target_ch,self.actual_ch)):
             with C.QSignalBlocker(widget):
                 widget.clear()
@@ -1749,8 +1764,14 @@ def main():
             win.switch_module(3)
             app.processEvents()
             remote_ok = win.module_stack.currentWidget() is win.remote_page and not win.remote_page.grab().isNull()
+            win.switch_module(4)
+            app.processEvents()
+            bundle = win.firmware_page.current_bundle()
+            fw_ok = (win.module_stack.currentWidget() is win.firmware_page
+                     and {"pid_link.h","pid_link.c","pid_port_hal.c"}.issubset(bundle.keys())
+                     and not win.firmware_page.grab().isNull())
             win.switch_module(0)
-            ok = ok and serial_ok and imu_ok and remote_ok and not win.windowIcon().pixmap(32,32).isNull()
+            ok = ok and serial_ok and imu_ok and remote_ok and fw_ok and not win.windowIcon().pixmap(32,32).isNull()
             win.close()
             win.deleteLater()
             C.QCoreApplication.sendPostedEvents(None,C.QEvent.Type.DeferredDelete)

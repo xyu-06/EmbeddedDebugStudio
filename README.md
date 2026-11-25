@@ -11,13 +11,13 @@
 
 👉 **[前往 GitHub Releases 下载最新 Windows 免安装版 EXE 与 PDF/Word 图文使用手册](https://github.com/xyu-06/EmbeddedDebugStudio/releases/latest)**
 
-- **Windows 免安装单文件**：下载 `PIDTuner.exe`（或 `EmbeddedDebugStudio-v1.7-win64.exe`）双击即用，无需安装 Python 环境。
+- **Windows 免安装单文件**：下载 `PIDTuner.exe`（或 `EmbeddedDebugStudio-v1.8-win64.exe`）双击即用，无需安装 Python 环境。
 - **在线阅读完整图文操作手册**：[点击在线查看完整图文使用手册 (docs/MANUAL.md)](docs/MANUAL.md)（Releases 中亦提供打包好的 `.pdf` 与 `.docx` 离线文档）
-- **历史版本归档**：`v1.1` → `v1.7` 各历史版本的安装包、源码快照与配套操作手册均完整归档于 [Releases 页面](https://github.com/xyu-06/EmbeddedDebugStudio/releases)。
+- **历史版本归档**：`v1.1` → `v1.8` 各历史版本的安装包、源码快照与配套操作手册均完整归档于 [Releases 页面](https://github.com/xyu-06/EmbeddedDebugStudio/releases)。
 
 ---
 
-## 四大内置调试工作台（顶栏菜单 / `Ctrl+1~4` 一键切换）
+## 五大内置调试工作台（顶栏菜单 / `Ctrl+1~5` 一键切换）
 
 支持**跨模块同串口冲突智能让渡**（切换模块打开同一 `COM` 口时自动安全释放原页面连接并无缝接管）与**跨页面全局 `Esc` 最高优先级急停**（含断开连接前硬件缓冲冲洗发停机指令）。
 
@@ -51,6 +51,10 @@
 
 ![小车遥控与 HC-05 AT 配置工作台](docs/images/fig13_remote_hc05.png)
 
+### 5. 🧩 单片机串口接口快速构建与协议手册（`Ctrl+5`）
+- **任意列顺序自动绑定（`#ROLES:`）**：支持可视化增删、调序 1～8 通道并指定各列角色（`target / actual / output / error / other`）；下位机带上 `#ROLES:` 声明后，即使 PWM 在第一列、反馈在第三列，上位机也能精准识别。
+- **跨平台一键生成完整接入源码**：内置 STM32 HAL（零 `printf_float` 依赖）、通用裸机 C99、Arduino/ESP32 三套代码生成器与 4 套常用预设，支持一键复制或导出 `pid_link.h/.c` + 移植层 + 示例工程至目录，并内置交互式协议手册。
+
 ---
 
 ## 插件化模块扩展架构（`WorkbenchModule`）
@@ -73,10 +77,11 @@ self.register_module("📷 摄像头调试", CameraDebugPage(self))
 | `serial_studio.py` | 独立全功能串口调试助手模块（UTF-8/GBK、CRC16、12 路快捷指令） |
 | `imu_studio.py` | 3D 平衡车姿态、人工地平仪、六轴互补滤波与中值角标定模块 |
 | `remote_studio.py` | `J,x,y` 小车差速遥控台与 HC-05 USB-TTL AT 配置工具箱模块 |
+| `firmware_studio.py` | 一键串口接口代码生成器（STM32 HAL / 裸机 C99 / Arduino）与内置协议说明书 |
 | `autotune.py` / `autotune_ui.py` | 闭环阶跃辨识（SIMC / 极点配置）+ Hooke–Jeeves 自动整定引擎 |
 | `diagnostics.py` / `scope.py` / `engine.py` | FFT 信号体检、C 代码导出、高刷示波器（含 Ghost 底图）、协议解析与仿真器 |
 | `firmware_example/` | STM32 C99 零 `printf_float` 依赖协议栈 `pid_link.c/.h`、HAL 队列与平衡车三环串级模板 |
-| `tests/` & `test_tuner.py` | STM32 C99 协议/平衡车闭环测试与 34 项 Python 自动化回归测试 |
+| `tests/` & `test_tuner.py` | STM32 C99 协议/平衡车闭环测试与 36 项 Python 自动化回归测试 |
 | `.github/workflows/build-windows.yml` | GitHub Actions 自动运行 C + Python 全套测试并构建单文件 `PIDTuner.exe` |
 
 ---

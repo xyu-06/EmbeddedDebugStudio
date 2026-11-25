@@ -1,5 +1,17 @@
 # 嵌入式综合调试助手（EmbeddedDebugStudio）更新记录
 
+## v1.8（2026-11-25）
+
+### 新增第 5 工作台【🧩 接口构建】（`firmware_studio.py`，快捷键 `Ctrl+5`）与任意列顺序 `#ROLES:`
+- **🧩 一键单片机串口接口构建器与内置协议说明书**：
+  - 无需自己从头写浮点串口解析或背诵列顺序：支持 **STM32 HAL（零 `printf_float` 依赖）**、**通用裸机 C99** 与 **Arduino / ESP32** 三大平台；内置 **电机速度环 / 平衡车双环 / 自定义乱序 / 位置云台** 4 套预设模板。
+  - 左侧可视化增删、上下移动 1～8 个上报通道并指定各列角色（`target / actual / output / error / other`），右侧实时生成可直接放入工程的完整 C99/Arduino 接口代码（含 `pid_link.h/.c`、`pid_port_hal.h/.c`、`main_integration_example.c` 等），支持一键复制或导出全部文件到目标目录。
+  - 内置 **【📖 协议与接口说明】** 页面，系统汇总 3 步接入清单、全量上/下行报文格式表与常见排查说明；PyInstaller 打包亦同步内嵌 `firmware_example/` 模板目录，免安装单文件版 EXE 同样可离线一键导出全部源码。
+- **任意通道顺序自动绑定协议 `#ROLES:`**（`engine.py`、`main.py`、`autotune_ui.py`）：
+  - 下位机只需上报 `#ROLES:output,error,actual,target`（或使用规范通道名），无论将 PWM、误差、实际速度、目标值放在第几列，上位机均自动识别并锁定真实反馈列、目标列与输出参考列，彻底消除顺序不一致导致的调参错误。
+
+---
+
 ## v1.7.1（2026-11-25）
 
 ### Bug 修复：STM32 `pid_debug.c` 自动整定误选目标通道导致整定失灵
