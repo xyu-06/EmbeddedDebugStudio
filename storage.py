@@ -46,17 +46,19 @@ def csv_header(names, references=()):
             *[f"REF_{name}" for name in references], *PARAM_COLS]
 
 
-def csv_row(t, values, params, references=()):
+def csv_row(t, values, params, references=(), ch_cols=None):
     cols = [float(x) if np.isfinite(x) else "" for x in values]
-    return [round(t, 6), *cols, *([""] * (4 - len(cols))),
+    width = ch_cols if ch_cols is not None else max(4, len(cols))
+    padded = cols[:width] + [""] * max(0, width - len(cols))
+    return [round(t, 6), *padded,
             *[float(x) if np.isfinite(x) else "" for x in references], *params]
 
 
 def _parse_channel_header(raw_header, fallback):
     text = raw_header.strip()
-    m = re.match(r"^CH[1-4]_(.+)$", text, flags=re.IGNORECASE)
+    m = re.match(r"^CH([1-8])_(.+)$", text, flags=re.IGNORECASE)
     if m:
-        text = m.group(1).strip()
+        text = m.group(2).strip()
     unit = ""
     um = re.match(r"^(.+?)\s*\[([^\]]+)\]\s*$", text)
     if um:
@@ -65,9 +67,9 @@ def _parse_channel_header(raw_header, fallback):
 
 
 def load_csv(path, max_rows=20000):
-    """Load a PIDTuner CSV (or generic time + 1..4 channel CSV) for offline replay.
+    """Load a PIDTuner CSV (or generic time + 1..8 channel CSV) for offline replay.
 
-    Returns dict with keys: data (Nx9 ndarray), count, aliases, units, references, params.
+    Returns dict with keys: data (Nx13 ndarray), count, aliases, units, references, params.
     """
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
@@ -84,8 +86,8 @@ def load_csv(path, max_rows=20000):
 
     # Detect PIDTuner native columns vs generic columns
     ch_cols = []
-    aliases = ["", "", "", ""]
-    units = ["", "", "", ""]
+    aliases = [""] * 8
+    units = [""] * 8
     ref_cols = []
     param_indices = {}
 
@@ -93,8 +95,9 @@ def load_csv(path, max_rows=20000):
         stripped = col_name.strip()
         if idx == 0:
             continue
-        if re.match(r"^CH([1-4])_", stripped, flags=re.IGNORECASE):
-            slot = int(stripped[2]) - 1
+        m = re.match(r"^CH([1-8])_", stripped, flags=re.IGNORECASE)
+        if m:
+            slot = int(m.group(1)) - 1
             ch_cols.append((slot, idx))
             aliases[slot], units[slot] = _parse_channel_header(stripped, f"CH{slot+1}")
         elif stripped.upper().startswith("REF_") and len(ref_cols) < 4:
@@ -102,13 +105,13 @@ def load_csv(path, max_rows=20000):
         elif stripped in PARAM_COLS:
             param_indices[stripped] = idx
 
-    # Generic CSV fallback: col 0 = time (or sample index), cols 1..4 = CH1..CH4
+    # Generic CSV fallback: col 0 = time (or sample index), cols 1..8 = CH1..CH8
     if not ch_cols:
-        for slot in range(min(4, max(0, len(header) - 1))):
+        for slot in range(min(8, max(0, len(header) - 1))):
             ch_cols.append((slot, slot + 1))
             aliases[slot], units[slot] = _parse_channel_header(header[slot + 1], f"CH{slot+1}")
 
-    data = np.full((len(rows), 9), np.nan, dtype=float)
+    data = np.full((len(rows), 13), np.nan, dtype=float)
     params = []
     valid_rows = 0
     max_channel_seen = 0
@@ -135,7 +138,7 @@ def load_csv(path, max_rows=20000):
                 try:
                     val = float(row[col_idx])
                     if np.isfinite(val):
-                        data[valid_rows, 5 + ref_slot] = val
+                        data[valid_rows, 9 + ref_slot] = val
                 except ValueError:
                     pass
         if param_indices:
@@ -161,7 +164,7 @@ def load_csv(path, max_rows=20000):
     data = data[:valid_rows]
     references = []
     for ref_slot, (r_name, _) in enumerate(ref_cols):
-        col_vals = data[:, 5 + ref_slot]
+        col_vals = data[:, 9 + ref_slot]
         finite_vals = col_vals[np.isfinite(col_vals)]
         last_val = float(finite_vals[-1]) if len(finite_vals) else 0.0
         references.append((r_name, last_val))

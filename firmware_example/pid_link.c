@@ -10,7 +10,7 @@ PID_Loop pid_loops[PID_GROUPS];
 volatile uint8_t pid_running;
 
 static const char *const groups[] = {"ANG", "SPD", "YAW", "AUX"};
-static char line[100];
+static char line[128];
 static unsigned used;
 static uint8_t skip_line;
 static uint32_t now_ms, last_ping_ms;
@@ -219,6 +219,7 @@ static void command(void)
         last_ping_ms = now_ms;
         pid_running = 1;
         write_text("#CAP:PING\n");
+        write_text("#CAP:SET\n");
         write_text("@ACK:RUN\n");
         return;
     }
@@ -244,6 +245,35 @@ static void command(void)
     }
     if (strcmp(op, "RST") == 0) {
         reset_state(p);
+    } else if (strncmp(op, "SET=", 4) == 0) {
+        char copy[120];
+        float vals[4];
+        size_t plen = strlen(op + 4);
+        if (plen == 0 || plen >= sizeof copy) {
+            write_text("@ERR:value out of range\n");
+            return;
+        }
+        memcpy(copy, op + 4, plen + 1);
+        char *cur = copy;
+        for (int i = 0; i < 4; ++i) {
+            char *comma = strchr(cur, ',');
+            if ((i < 3 && !comma) || (i == 3 && comma)) {
+                write_text("@ERR:expected 4 values\n");
+                return;
+            }
+            if (comma) *comma = 0;
+            if (!parse_number(cur, &vals[i]) || !isfinite(vals[i]) || fabsf(vals[i]) > 1000000.0f) {
+                write_text("@ERR:value out of range\n");
+                return;
+            }
+            if (comma) cur = comma + 1;
+        }
+        /* Atomic update: all 4 parameters validated before applying together.
+         * Wrap with __disable_irq()/__enable_irq() if ISR reads pid_loops concurrently. */
+        p->kp = vals[0];
+        p->ki = vals[1];
+        p->kd = vals[2];
+        p->target = vals[3];
     } else {
         if (!eq || eq[1] == '\0') { write_text("@ERR:expected key=value\n"); return; }
         float v;
@@ -285,9 +315,9 @@ void PID_Consume(uint8_t b)
 
 void PID_ReportValues(const float *values, unsigned count)
 {
-    char buf[88], num[16];
+    char buf[160], num[16];
     unsigned pos = 0;
-    if (count < 1 || count > 4) return;
+    if (count < 1 || count > 8) return;
     buf[0] = 0;
     for (unsigned i = 0; i < count; ++i) {
         if (i) append(buf, sizeof buf, &pos, ",");

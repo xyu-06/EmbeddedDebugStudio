@@ -14,7 +14,7 @@ import numpy as np
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 from autotune import AutoTuner, evaluate_step
 from diagnostics import RuntimeMonitor, analyze_frame_timing, dominant_fft, format_c_code
-from engine import Lines, Simulator, match_ack, step_metrics
+from engine import Lines, MAX_CHANNELS, REF_BASE, Simulator, match_ack, step_metrics
 from generator import TargetGenerator
 from main import Window
 from remote_studio import AtCommandBuilder, button_axis, format_drive_command, held_speed, mix_wheels
@@ -39,9 +39,9 @@ class CoreChecks(unittest.TestCase):
     def test_stream_recovery(self):
         p = Lines()
         self.assertEqual(list(p.feed(b"12,")),[])
-        events = list(p.feed(b"3\r\n#NAMES:t,y\nwave:4,5\nangle:1,gyro:2\n\xff\ninf\n1,2,3,4,5\n"))
-        self.assertEqual(events[:4],[("data",[12.,3.]),("names",["t","y"]),("data",[4.,5.]),("data",[1.,2.])])
-        self.assertEqual([x[0] for x in events[4:]],["bad"]*3)
+        events = list(p.feed(b"3\r\n#NAMES:t,y\nwave:4,5\nangle:1,gyro:2\n1,2,3,4,5\n\xff\ninf\n1,2,3,4,5,6,7,8,9\n"))
+        self.assertEqual(events[:5],[("data",[12.,3.]),("names",["t","y"]),("data",[4.,5.]),("data",[1.,2.]),("data",[1.,2.,3.,4.,5.])])
+        self.assertEqual([x[0] for x in events[5:]],["bad"]*3)
         self.assertEqual([x[0] for x in p.feed(b"9"*2049)],["bad"])
         self.assertEqual(list(p.feed(b"12\n5\n")),[("data",[5.])])
 
@@ -95,7 +95,9 @@ class CoreChecks(unittest.TestCase):
             sim.command("@SPD.KP=3")
             self.assertEqual(sim.params["ANG"]["KP"],2)
             sim.command("@RUN")
-            for _ in range(600):
+            for k in range(600):
+                if k % 20 == 0:
+                    sim.ping()
                 samples = sim.step("SPD")
             self.assertTrue(all(np.isfinite(samples)))
             sim.command("@STOP")
@@ -103,16 +105,27 @@ class CoreChecks(unittest.TestCase):
 
     def test_pendulum_balances_and_falls(self):
         sim = Simulator(3)
-        self.assertEqual(sim.command("@RUN"),"#CAP:PING\n@ACK:RUN")
-        for _ in range(500):
+        self.assertEqual(sim.command("@RUN"),"#CAP:PING\n#CAP:SET\n@ACK:RUN")
+        for k in range(500):
+            if k % 20 == 0:
+                sim.ping()
             target,angle,_,_ = sim.step("ANG")
         self.assertTrue(sim.running)
-        self.assertAlmostEqual(angle,target,delta=.2)
+        self.assertAlmostEqual(angle,target,delta=.65)
+        sim.nudge("ANG", 22.0)
+        for k in range(400):
+            if k % 20 == 0:
+                sim.ping()
+            target,angle,_,_ = sim.step("ANG")
+        self.assertTrue(sim.running)
+        self.assertAlmostEqual(angle,target,delta=.65)
         sim.command("@STOP")
         for key in ("KP","KI","KD"):
             sim.command(f"@ANG.{key}=0")
         sim.command("@RUN")
-        for _ in range(300):
+        for k in range(300):
+            if k % 20 == 0:
+                sim.ping()
             sim.step("ANG")
             if not sim.running:
                 break
@@ -123,15 +136,20 @@ class CoreChecks(unittest.TestCase):
     def test_simulated_heartbeat(self):
         sim = Simulator(0)
         sim.command("@RUN")
-        for _ in range(100):
+        for _ in range(55):
             sim.step("ANG")
-        self.assertTrue(sim.running)        # not armed until the host pings
+        self.assertFalse(sim.running)       # matches firmware: stops 0.5 s after @RUN if never pinged
+        self.assertEqual(sim.drain(),["#STOP:heartbeat"])
+        sim.command("@RUN")
         self.assertEqual(sim.command("@PING"),"")
-        for _ in range(49):
+        for _ in range(40):
             sim.step("ANG")
         self.assertTrue(sim.running)
         sim.ping()
-        for _ in range(60):
+        for _ in range(40):
+            sim.step("ANG")
+        self.assertTrue(sim.running)
+        for _ in range(55):
             sim.step("ANG")
         self.assertFalse(sim.running)
         self.assertEqual(sim.drain(),["#STOP:heartbeat"])
@@ -178,13 +196,17 @@ class CoreChecks(unittest.TestCase):
                 _,cand,_ = nxt
                 sim.params["ANG"].update(cand,TGT=0.)
                 sim.command("@ANG.RST")
-                for _ in range(int(1.0/sim.dt)):
+                for step_i in range(int(1.0/sim.dt)):
+                    if step_i % 20 == 0:
+                        sim.ping()
                     sim.step("ANG")
                 base_y = sim.states["ANG"][0]
                 sim.command("@ANG.RST")
                 sim.params["ANG"]["TGT"] = target
                 ts,ys,us = [],[],[]
                 for k in range(int(obs_s/sim.dt)):
+                    if k % 20 == 0:
+                        sim.ping()
                     _,y,u,_ = sim.step("ANG")
                     ts.append(k*sim.dt); ys.append(y); us.append(u)
                 tuner.record_result(ts,ys,base_y=base_y,outputs=us)
@@ -248,6 +270,80 @@ class CoreChecks(unittest.TestCase):
         self.assertIn("BALANCE_KP", format_c_code("ANG", params, 1))
         self.assertIn("pid_loops[PID_YAW]", format_c_code("YAW", params, 2))
 
+    def test_v17_eight_channels_atomic_set_and_autotune_guards(self):
+        from storage import csv_header, csv_row
+        p = Lines()
+        ev8 = list(p.feed(b"1,2,3,4,5,6,7,8\n"))
+        self.assertEqual(ev8, [("data", [1., 2., 3., 4., 5., 6., 7., 8.])])
+        self.assertEqual([x[0] for x in p.feed(b"1,2,3,4,5,6,7,8,9\n")], ["bad"])
+
+        # CSV roundtrip with 6 channels & backward-compat 21 columns for 4 channels
+        with TemporaryDirectory() as tmp:
+            p4 = Path(tmp) / "four.csv"
+            with open(p4, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(csv_header(["C1", "C2", "C3", "C4"]))
+                w.writerow(csv_row(0.0, [1, 2, 3, 4], ("",) * 16, ch_cols=4))
+            d4 = load_csv(p4)
+            self.assertEqual(d4["count"], 4)
+
+            p6 = Path(tmp) / "six.csv"
+            with open(p6, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(csv_header(["A", "B", "C", "D", "E", "F"], ["Ref0"]))
+                w.writerow(csv_row(0.05, [10, 20, 30, 40, 50, 60], ("",) * 16, [99.0], ch_cols=6))
+            d6 = load_csv(p6)
+            self.assertEqual(d6["count"], 6)
+            self.assertEqual(d6["aliases"][:6], ["A", "B", "C", "D", "E", "F"])
+            np.testing.assert_allclose(d6["data"][0, 1:7], [10, 20, 30, 40, 50, 60])
+            self.assertAlmostEqual(float(d6["data"][0, REF_BASE + 1]), 99.0)
+
+        # Atomic @SET command in Simulator and match_ack
+        sim = Simulator(0)
+        ack = sim.command("@ANG.SET=1.5,2.5,0.25,12")
+        self.assertEqual(ack, "@ACK:ANG.SET=1.5,2.5,0.25,12")
+        self.assertEqual(sim.params["ANG"], {"KP": 1.5, "KI": 2.5, "KD": 0.25, "TGT": 12.0})
+        self.assertTrue(match_ack("@ANG.SET=1.5,2.5,0.25,12", "ANG.SET=1.5000,2.5000,0.2500,12.0000"))
+        bad_ack = sim.command("@ANG.SET=1,2,3")
+        self.assertTrue(bad_ack.startswith("@ERR:"))
+        self.assertEqual(sim.params["ANG"]["TGT"], 12.0)
+
+        # Pendulum actuator lag + noise + nudge & fall
+        pend = Simulator(3, noise=True, seed=42)
+        pend.command("@ANG.TGT=0")
+        pend.command("@RUN")
+        for k in range(250):
+            if k % 20 == 0:
+                pend.ping()
+            _, ang, _, _ = pend.step("ANG")
+        self.assertTrue(pend.running)
+        self.assertLess(abs(ang), 0.7)
+        pend.command("@NUDGE")
+        for k in range(500):
+            if k % 20 == 0:
+                pend.ping()
+            _, ang_after, _, _ = pend.step("ANG")
+        self.assertTrue(pend.running)
+        self.assertLess(abs(ang_after), 0.7)
+        pend.nudge("ANG", 400.0)
+        for k in range(200):
+            if k % 20 == 0:
+                pend.ping()
+            pend.step("ANG")
+            if not pend.running:
+                break
+        self.assertFalse(pend.running)
+        self.assertEqual(pend.drain(), ["#STOP:fall"])
+
+        # AutoTuner strategy=1 safety validation & per-round cap
+        rules = {"KP": (0., 100., 5.), "KI": (0., 100., 5.), "KD": (0., 20., 1.)}
+        with self.assertRaises(ValueError):
+            AutoTuner(0, 1, 1, {"KP": 0., "KI": 0., "KD": 0.}, rules, 0., 10., 1.5, 6)
+        capped = AutoTuner(0, 1, 1, {"KP": 4., "KI": 2., "KD": 0.2}, rules, 0., 10., 1.5, 6)
+        safe = capped._cap_step_change({"KP": 100., "KI": 0.01, "KD": 10.}, capped.initial)
+        self.assertLessEqual(safe["KP"], 4. * 1.35 + 1e-9)
+        self.assertGreaterEqual(safe["KI"], 2. / 1.35 - 1e-9)
+
     def test_thread_heartbeat_needs_a_live_ui(self):
         link = SerialLink({"url":"loop://","baudrate":115200})
         link.start()
@@ -291,7 +387,7 @@ class GuiChecks(unittest.TestCase):
             w.sample(0.,[12345,700])
             w.configure_channels([.01,1,1,1],["RPM","PWM","",""],1,["SPD","","",""])
             self.assertEqual(w.actual_ch.currentData(),0)
-            self.assertEqual(w.target_ch.currentData(),4)
+            self.assertEqual(w.target_ch.currentData(),REF_BASE)
             self.assertFalse(w.scope.references[0].isVisible())
             self.assertAlmostEqual(w.buffer.view()[0,1],123.45)
             w.commands.pending = ("@SPD.TGT=150","SPD",None)
@@ -305,7 +401,7 @@ class GuiChecks(unittest.TestCase):
             self.assertLess(w.scope.viewRange()[1][1],200)
             self.assertGreater(w.scope.secondary.viewRange()[1][1],850)
             self.assertIn("RPM",w.names()[0])
-            self.assertEqual(w.buffer.view()[-1,5],150)
+            self.assertEqual(w.buffer.view()[-1,REF_BASE+1],150)
             w.select_channel(1)
             w.actual_ch.setCurrentIndex(w.actual_ch.findData(1))
             w.refresh_channels()
@@ -479,6 +575,7 @@ class GuiChecks(unittest.TestCase):
             w.commands.confirm = lambda changes: True
             w.source.setCurrentIndex(1)
             w.model.setCurrentIndex(0)
+            w.group.setCurrentIndex(1)  # SPD group supports auto-identification strategy=0
             w.toggle_connection()
             w.fields["KP"].setValue(0.3)
             w.fields["KI"].setValue(0.05)
@@ -487,7 +584,7 @@ class GuiChecks(unittest.TestCase):
             w.send_group()
             for _ in range(6):
                 w.commands.dispatch()
-            self.assertAlmostEqual(w.confirmed["ANG.KP"], 0.3)
+            self.assertAlmostEqual(w.confirmed["SPD.KP"], 0.3)
 
             ok = w.autotuner.start(mode=0,style=1,strategy=0,base=0.,target=100.,step_seconds=1.5,max_rounds=6,hold_target=True)
             self.assertTrue(ok)
@@ -500,9 +597,9 @@ class GuiChecks(unittest.TestCase):
             self.assertFalse(w.autotuner.active)
             for _ in range(8):
                 w.commands.dispatch()
-            self.assertGreater(w.confirmed["ANG.KP"], 1.5)
-            self.assertGreater(w.confirmed["ANG.KI"], 3.0)
-            self.assertAlmostEqual(w.confirmed["ANG.TGT"], 100.0)
+            self.assertGreater(w.confirmed["SPD.KP"], 1.5)
+            self.assertGreater(w.confirmed["SPD.KI"], 3.0)
+            self.assertAlmostEqual(w.confirmed["SPD.TGT"], 100.0)
             self.assertIn("评分 J=", w.autotune_status.text())
             self.assertTrue(w.undo_btn.isEnabled())
 
@@ -510,9 +607,9 @@ class GuiChecks(unittest.TestCase):
             w.commands.undo_parameter()
             for _ in range(8):
                 w.commands.dispatch()
-            self.assertAlmostEqual(w.confirmed["ANG.KP"], 0.3)
-            self.assertAlmostEqual(w.confirmed["ANG.KI"], 0.05)
-            self.assertAlmostEqual(w.confirmed["ANG.TGT"], 10.0)
+            self.assertAlmostEqual(w.confirmed["SPD.KP"], 0.3)
+            self.assertAlmostEqual(w.confirmed["SPD.KI"], 0.05)
+            self.assertAlmostEqual(w.confirmed["SPD.TGT"], 10.0)
 
             # Emergency stop aborts an active auto-tune cleanly
             w.autotuner.start(mode=0,style=1,strategy=0,base=0.,target=80.,step_seconds=1.5,max_rounds=6)
@@ -531,12 +628,16 @@ class GuiChecks(unittest.TestCase):
             w.model.setCurrentIndex(1)
             w.toggle_connection()
             w.run_device()
-            for _ in range(30):
+            for k in range(30):
+                if k % 20 == 0:
+                    w.sim.ping()
                 w.sample(w.frames * .01, w.sim.step("ANG"))
             w.fields["TGT"].setValue(25.0)
             w.send_field("TGT")
             w.commands.dispatch()
-            for _ in range(250):
+            for k in range(250):
+                if k % 20 == 0:
+                    w.sim.ping()
                 w.sample(w.frames * .01, w.sim.step("ANG"))
             w.paint_scope()
             w.analyze()
@@ -553,7 +654,9 @@ class GuiChecks(unittest.TestCase):
             for _ in range(6):
                 w.commands.dispatch()
             step2_t = w.latest + .01
-            for _ in range(200):
+            for k in range(200):
+                if k % 20 == 0:
+                    w.sim.ping()
                 w.sample(w.frames * .01, w.sim.step("ANG"))
             w.paint_scope()
             w.analyze()
@@ -633,7 +736,7 @@ class GuiChecks(unittest.TestCase):
             C.QTimer.singleShot(0,lambda: select("#00ff00",False))
             w.color_buttons[0].click()
             C.QTimer.singleShot(0,lambda: select("#aa3377",True))
-            w.color_buttons[4].click()
+            w.color_buttons[MAX_CHANNELS].click()
             w.line.setValue(1.75)
             self.assertEqual(w.scope.curves[0].opts["pen"].color().name(),"#e6194b")
             self.assertEqual(w.scope.references[0].pen.color().name(),"#aa3377")
@@ -644,7 +747,7 @@ class GuiChecks(unittest.TestCase):
             self.assertEqual(reopened.x_div.value(),.25)
             self.assertEqual(reopened.y_div.value(),20)
             self.assertEqual(reopened.colors[0],"#e6194b")
-            self.assertEqual(reopened.colors[4],"#aa3377")
+            self.assertEqual(reopened.colors[MAX_CHANNELS],"#aa3377")
             reopened.close()
 
     def test_edge_capture_and_cancel(self):
@@ -756,7 +859,7 @@ class GuiChecks(unittest.TestCase):
             w.name_edits[0].setText("实际转速")
             w.channel_names()
             self.assertEqual(w.actual_ch.currentData(),0)
-            self.assertEqual(w.target_ch.currentData(),4)
+            self.assertEqual(w.target_ch.currentData(),REF_BASE)
             self.assertTrue(w.channel_form.isRowVisible(w.name_edits[0]))
             self.assertFalse(w.channel_form.isRowVisible(w.name_edits[1]))
             w.receive(b"#NAMES:rpm,extra\n",time.monotonic())
@@ -987,8 +1090,9 @@ class GuiChecks(unittest.TestCase):
         self.assertEqual(AtCommandBuilder.set_role(0), "AT+ROLE=0")
         with self.assertRaises(ValueError):
             AtCommandBuilder.set_pin("12,34")
+        self.assertEqual(AtCommandBuilder.set_uart(57600, 0, 0), "AT+UART=57600,0,0")
         with self.assertRaises(ValueError):
-            AtCommandBuilder.set_uart(57600, 0, 0)  # verbatim manual list check
+            AtCommandBuilder.set_uart(12345, 0, 0)
 
         self.assertEqual(held_speed(0), 18)
         self.assertEqual(held_speed(1600), 100)
@@ -1032,6 +1136,118 @@ class GuiChecks(unittest.TestCase):
                 rp.tick()
                 time.sleep(0.01)
             self.assertIn("J,0,0", rp.console.toPlainText())
+            rp.release_port()
+            w.close()
+
+    def test_v17_safety_rollback_remote_focus_keepalive_and_hc05_uart(self):
+        # 1) ANG forces local fine-tuning, and abort without winner restores original params to device
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "cfg.ini")
+            w.timer.stop()
+            w.source.setCurrentIndex(1)
+            w.model.setCurrentIndex(0)
+            w.toggle_connection()
+
+            # ANG + strategy=0 is rejected
+            w.group.setCurrentIndex(0)
+            self.assertFalse(w.autotuner.start(mode=1, style=1, strategy=0, base=0., target=5., step_seconds=1.5, max_rounds=4))
+
+            # Switch to SPD with custom pre-autotune values and abort before winner
+            w.group.setCurrentIndex(1)
+            for k, v in (("KP", 0.8), ("KI", 1.2), ("KD", 0.05), ("TGT", 30.0)):
+                w.fields[k].setValue(v)
+            w.send_group()
+            for _ in range(6):
+                w.commands.dispatch()
+            self.assertTrue(w.autotuner.start(mode=0, style=1, strategy=0, base=0., target=60., step_seconds=1.5, max_rounds=6))
+            w.epoch -= 0.1
+            w.tick()  # dispatches @SPD.TGT=0, @RUN and enters PREPARE probe with changed KP
+            for _ in range(8):
+                w.commands.dispatch()
+            # Timeout / cancel without winner must roll back simulator params too!
+            w.autotuner.stop("模拟采样超时", apply_best=False)
+            for _ in range(8):
+                w.commands.dispatch()
+            self.assertAlmostEqual(w.sim.params["SPD"]["KP"], 0.8)
+            self.assertAlmostEqual(w.sim.params["SPD"]["KI"], 1.2)
+            self.assertAlmostEqual(w.sim.params["SPD"]["KD"], 0.05)
+            self.assertAlmostEqual(w.sim.params["SPD"]["TGT"], 30.0)
+            w.close()
+
+        # 2) 8-channel GUI display & release_port @STOP flush over loop://
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "cfg8.ini")
+            w.timer.stop()
+            w.receive(b"1,2,3,4,5,6,7,8\n", time.monotonic())
+            self.assertEqual(w.count, MAX_CHANNELS)
+            self.assertTrue(w.channel_form.isRowVisible(w.name_edits[7]))
+            w.port.setCurrentText("loop://")
+            w.toggle_connection()
+            deadline = time.monotonic() + 1.5
+            while not w.connected and time.monotonic() < deadline:
+                w.tick()
+                time.sleep(0.01)
+            self.assertTrue(w.connected)
+            w.release_port()
+            self.assertFalse(w.connected)
+            self.assertTrue(any(k == "TX" and b"@STOP" in bytes(d) for _, k, d in w.logs if isinstance(d, (bytes, bytearray))))
+            w.close()
+
+        # 3) RemoteBtPage focus-loss anti-stuck stop, 100ms keepalive resend, and HC-05 AT+UART? safety
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "remote.ini")
+            w.timer.stop()
+            w.serial_page.poll_timer.stop()
+            w.imu_page.timer.stop()
+            rp = w.remote_page
+            rp.timer.stop()
+            w.switch_module(3)
+            rp.port_box.setCurrentText("loop://")
+            rp.toggle_port()
+            deadline = time.monotonic() + 1.5
+            while not rp.connected and time.monotonic() < deadline:
+                rp.tick()
+                time.sleep(0.01)
+            self.assertTrue(rp.connected)
+
+            # Held keyboard motion clears on WindowDeactivate and transmits J,0,0
+            rp.mode_box.setCurrentIndex(2)
+            rp._dir_pressed("up")
+            self.assertGreater(rp.throttle_y, 0)
+            W.QApplication.sendEvent(w, C.QEvent(C.QEvent.Type.WindowDeactivate))
+            self.assertEqual(rp.held_keys, {})
+            self.assertEqual((rp.steering_x, rp.throttle_y), (0, 0))
+
+            # Non-zero joystick keeps alive every 100 ms in tick()
+            rp.rx_bytes = 0
+            rp._on_single_joy(35, 65, False)
+            rp.last_drive_tx = time.monotonic() - 0.15
+            rp.tick()
+            deadline = time.monotonic() + 1.0
+            while rp.rx_bytes < len(b"J,35,65\n") * 2 and time.monotonic() < deadline:
+                rp.tick()
+                time.sleep(0.01)
+            self.assertGreaterEqual(rp.console.toPlainText().count("J,35,65"), 2)
+
+            # HC-05 5760 warning + 57600 support + AT+UART? read-before-write compare
+            self.assertIn("57600", [rp.at_baud_box.itemText(i) for i in range(rp.at_baud_box.count())])
+            prompts = []
+            rp.confirm_at = lambda title, text: prompts.append((title, text)) or True
+            idx_5760 = rp.at_baud_box.findData(5760)
+            self.assertGreaterEqual(idx_5760, 0)
+            self.assertIn("疑似笔误", rp.at_baud_box.itemText(idx_5760))
+            rp.at_baud_box.setCurrentIndex(idx_5760)
+            rp._apply_at_uart(copy_only=False)
+            self.assertEqual(len(prompts), 1)
+            # Simulate HC-05 replying different current UART so write confirmation fires
+            deadline = time.monotonic() + 1.0
+            while "+UART?" not in rp.console.toPlainText() and time.monotonic() < deadline:
+                rp.tick()
+                time.sleep(0.01)
+            rp.link.event("rx", b"+UART:9600,0,0\r\nOK\r\n")
+            rp.tick()
+            self.assertEqual(len(prompts), 2)
+            self.assertIn("9600,0,0", prompts[1][1])
             rp.release_port()
             w.close()
 

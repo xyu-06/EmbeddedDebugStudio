@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import numpy as np
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 
-from engine import KEYS, LOOPS
+from engine import KEYS, LOOPS, MAX_CHANNELS
 
 
 @dataclass
@@ -90,7 +90,7 @@ def inspect_channels(data, count, names):
     if not len(data) or count <= 0:
         return results
     times = data[:, 0]
-    for ch in range(min(4, count)):
+    for ch in range(min(MAX_CHANNELS, count)):
         col = data[:, ch + 1]
         valid = col[np.isfinite(col)]
         if not len(valid):

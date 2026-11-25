@@ -1,9 +1,14 @@
-"""Build EmbeddedDebugStudio-v1.6-Manual.docx (and HTML for headless Edge PDF export) from docs/images."""
+"""Build EmbeddedDebugStudio-<tag>-Manual.docx (and HTML for headless Edge PDF export) from docs/images."""
 from pathlib import Path
-import shutil
 import sys
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from version import APP_TAG, APP_TITLE_ZH
+
 IMG_DIR = HERE / "images"
 OUT_DIR = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else HERE
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -13,9 +18,8 @@ def main():
     import docx
     from docx.shared import Inches, Pt, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.enum.table import WD_TABLE_ALIGNMENT
-    from docx.oxml import OxmlElement, parse_xml
-    from docx.oxml.ns import nsdecls, qn
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
 
     def set_font(run_or_style, name="Microsoft YaHei UI"):
         rPr = run_or_style._element.get_or_add_rPr()
@@ -31,7 +35,7 @@ def main():
     doc.styles["Normal"].font.size = Pt(10.5)
 
     p = doc.add_paragraph()
-    r = p.add_run("嵌入式综合调试助手 v1.6 · 图文使用手册（PID / 串口 / IMU / 蓝牙遥控）")
+    r = p.add_run(f"{APP_TITLE_ZH} {APP_TAG} · 图文使用手册（PID / 串口 / IMU / 蓝牙遥控）")
     r.bold = True
     r.font.size = Pt(19)
     r.font.color.rgb = RGBColor(0x18, 0x3B, 0x6B)
@@ -39,22 +43,22 @@ def main():
 
     sections = [
         ("1. 软件全景与四大模块导航（Ctrl+1~4）",
-         "双击运行 PIDTuner.exe 即可免安装启动。顶栏支持一键切换【📈 PID 调参】、【🔌 串口调试】、【🧭 IMU 姿态】、【🎮 遥控与 HC-05】四大工作台，支持同串口跨页自动让渡与全局 Esc 急停。",
+         "双击运行 PIDTuner.exe 即可免安装启动。顶栏支持一键切换【📈 PID 调参】、【🔌 串口调试】、【🧭 IMU 姿态】、【🎮 遥控与 HC-05】四大工作台，支持同串口跨页让渡（释放前先冲洗发送急停）与全局 Esc 急停。",
          "fig01_overview.png"),
-        ("2. 串口连接、通道缩放与独立双 Y 轴",
-         "支持将下位机整数放大数据按比例还原为工程物理量（如 RPM），并将转速与 PWM 分配至左右独立坐标轴同屏观察。",
+        ("2. 串口连接、8 通道缩放与独立双 Y 轴",
+         "支持最多 8 通道实时示波与 4 条参考线，可将下位机整数放大数据按比例还原为工程物理量（如 RPM），并将转速与 PWM 分配至左右独立坐标轴同屏观察。",
          "fig02_serial_and_channels.png"),
-        ("3. 在线调参、三色确认状态与参数保护",
-         "绿框代表单片机已确认(@ACK)，琥珀色为未发送草稿，红框为超限或超时告警；支持上下限保护与一键撤销。",
+        ("3. 在线调参、原子 @SET 写入与三色确认保护",
+         "绿框代表单片机已确认(@ACK)，琥珀色为未发送草稿，红框为超限或超时告警；支持原子命令 @<GRP>.SET=kp,ki,kd,tgt 一次同步生效、上下限保护与一键撤销。",
          "fig03_pid_panel_states.png"),
-        ("4. 智能 PID 自动整定（Auto-Tune）向导与前后对比",
-         "无需改动下位机固件，设定目标值后自动执行闭环比例探针模型辨识（SIMC/极点配置）与 Hooke–Jeeves 多轮闭环寻优。",
+        ("4. 智能 PID 自动整定（Auto-Tune）安全向导",
+         "设定目标值后自动执行探针辨识与 Hooke–Jeeves 多轮闭环寻优；直立环 ANG 强制锁定局部微调(单轮 <=±35%)、须勾选车轮架空安全确认、中途失败或断线自动写回原参数至设备。",
          "fig04_autotune_dialog.png"),
         ("5. 自动整定全过程波形实录",
          "软件自动记录每轮评分 J 并在完成后写回最优 KP/KI/KD，不满意可一键撤销恢复原参数。",
          "fig05_autotune_compare.png"),
-        ("6. 目标值信号发生器与平衡车倒立摆仿真",
-         "内置单次阶跃/方波/正弦/三角波发生器，以及带 45° 倒地自动停机保护(#STOP:fall)的平衡车倒立摆物理模型。",
+        ("6. 目标值发生器与平衡车倒立摆仿真（含推一下扰动）",
+         "内置单次阶跃/方波/正弦/三角波发生器；倒立摆仿真新增 25 ms 执行器滞后、测量噪声、工具栏“👋 推一下”扰动测试与 45° 倒地保护(#STOP:fall)。",
          "fig06_generator_and_pendulum.png"),
         ("7. 单次边沿触发捕获、双游标与暗色护眼主题",
          "支持上升沿/下降沿自动冻结抓拍突加负载瞬态，放置 A/B 双游标精确测量 Δt 与 ΔY，并支持夜间暗色主题。",
@@ -69,7 +73,7 @@ def main():
          "零 OpenGL 渲染可旋转 3D 平衡车与航空人工地平仪(±30°保护线)，内置六轴实时互补滤波与 50 帧机械中值角一键标定同步 PID。",
          "fig12_imu_studio.png"),
         ("11. 【🎮 遥控与 HC-05】工作台：联动 BlueSerialStudio（Ctrl+4）",
-         "完整兼容 BlueSerialStudio 的 J,x,y 三模式差速遥控（360° 单摇杆/双摇杆/WASD 长按加速）与支持 USB-TTL 直发收看 OK 的 HC-05 AT 配置工具箱。",
+         "兼容 J,x,y 三模式差速遥控（失焦自动停车、非零摇杆 100 ms 心跳重发）；HC-05 工具箱含 57600 与 5760 笔误安全警告，写入 AT+UART= 前自动发 AT+UART? 对比确认。",
          "fig13_remote_hc05.png"),
     ]
 
@@ -78,7 +82,7 @@ def main():
         "<style>body{font-family:'Microsoft YaHei UI',sans-serif;color:#223449;max-width:920px;margin:24px auto;padding:0 20px;line-height:1.6}"
         "h1{color:#183b6b;border-bottom:2px solid #225fc1;padding-bottom:8px}h2{color:#197a63;margin-top:26px}"
         "img{max-width:100%;border:1px solid #cfd8e2;border-radius:6px;margin:8px 0 18px 0}</style></head><body>",
-        "<h1>嵌入式综合调试助手 v1.6 · 图文使用手册</h1>",
+        f"<h1>{APP_TITLE_ZH} {APP_TAG} · 图文使用手册</h1>",
     ]
 
     for heading, body, img_name in sections:
@@ -102,7 +106,7 @@ def main():
             html_parts.append(f"<h2>{heading}</h2><p>{body}</p><img src='{img_file.as_uri()}'>")
 
     html_parts.append("</body></html>")
-    out_docx = OUT_DIR / "EmbeddedDebugStudio-v1.6-Manual.docx"
+    out_docx = OUT_DIR / f"EmbeddedDebugStudio-{APP_TAG}-Manual.docx"
     out_html = OUT_DIR / "_manual_print.html"
     doc.save(str(out_docx))
     out_html.write_text("\n".join(html_parts), encoding="utf-8")

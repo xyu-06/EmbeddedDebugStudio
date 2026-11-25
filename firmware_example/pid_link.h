@@ -29,7 +29,7 @@ void PID_WatchdogTick(uint32_t now_ms);
  * so newlib-nano does not need -u _printf_float (saves Flash on F103C8). */
 void PID_CheckFloatFormat(void);
 
-/* Telemetry: 1..4 channels per line, 4 decimals, trailing zeros trimmed. */
+/* Telemetry: 1..8 channels per line, 6/4 decimals, trailing zeros trimmed. */
 void PID_ReportValues(const float *values, unsigned count);
 void PID_Report(float target, float actual, float output);
 

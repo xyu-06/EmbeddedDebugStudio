@@ -3,7 +3,7 @@ import math
 
 from PySide6 import QtWidgets as W
 
-from engine import KEYS, LOOPS, LIMIT
+from engine import KEYS, LOOPS, LIMIT, MAX_CHANNELS
 from layout_ui import combo, number
 
 
@@ -44,9 +44,10 @@ def calibration_dialog(w):
     grid = W.QGridLayout()
     outer.addLayout(grid)
     rows = []
+    n_ch = max(4, min(MAX_CHANNELS, getattr(w, "count", 4)))
     for col,text in enumerate(("通道","系数","单位")):
         grid.addWidget(W.QLabel(text),0,col)
-    for i in range(4):
+    for i in range(n_ch):
         factor = number(w.scales[i],-LIMIT,LIMIT,.01,6)
         factor.setSizePolicy(W.QSizePolicy.Policy.Preferred,W.QSizePolicy.Policy.Fixed)
         factor.setMinimumWidth(100)
@@ -58,7 +59,7 @@ def calibration_dialog(w):
         rows.append((factor,unit))
     form = W.QFormLayout()
     outer.addLayout(form)
-    axis = combo(["共用左轴","CH1","CH2","CH3","CH4"],w.right_channel+1)
+    axis = combo(["共用左轴", *[f"CH{i+1}" for i in range(n_ch)]], min(n_ch, w.right_channel+1) if w.right_channel >= 0 else 0)
     form.addRow("独立右轴",axis)
     bindings = {}
     for i in w.active_refs():
@@ -69,7 +70,12 @@ def calibration_dialog(w):
         following = w.follow.copy()
         for i,bind in bindings.items():
             following[i] = bind.currentText() if bind.currentIndex() else ""
-        w.configure_channels([f.value() for f,_ in rows],[u.text().strip() for _,u in rows],axis.currentIndex()-1,following)
+        scales = list(w.scales)
+        units = list(w.units)
+        for i, (f, u) in enumerate(rows):
+            scales[i] = f.value()
+            units[i] = u.text().strip()
+        w.configure_channels(scales, units, axis.currentIndex()-1, following)
 
 
 def limits_dialog(w):

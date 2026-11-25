@@ -11,20 +11,20 @@
 
 👉 **[前往 GitHub Releases 下载最新 Windows 免安装版 EXE 与 PDF/Word 图文使用手册](https://github.com/xyu-06/EmbeddedDebugStudio/releases/latest)**
 
-- **Windows 免安装单文件**：下载 `PIDTuner.exe`（或 `EmbeddedDebugStudio-v1.6-win64.exe`）双击即用，无需安装 Python 环境。
+- **Windows 免安装单文件**：下载 `PIDTuner.exe`（或 `EmbeddedDebugStudio-v1.7-win64.exe`）双击即用，无需安装 Python 环境。
 - **在线阅读完整图文操作手册**：[点击在线查看完整图文使用手册 (docs/MANUAL.md)](docs/MANUAL.md)（Releases 中亦提供打包好的 `.pdf` 与 `.docx` 离线文档）
-- **历史版本归档**：`v1.1` → `v1.6` 各历史版本的安装包、源码快照与配套操作手册均完整归档于 [Releases 页面](https://github.com/xyu-06/EmbeddedDebugStudio/releases)。
+- **历史版本归档**：`v1.1` → `v1.7` 各历史版本的安装包、源码快照与配套操作手册均完整归档于 [Releases 页面](https://github.com/xyu-06/EmbeddedDebugStudio/releases)。
 
 ---
 
 ## 四大内置调试工作台（顶栏菜单 / `Ctrl+1~4` 一键切换）
 
-支持**跨模块同串口冲突智能让渡**（切换模块打开同一 `COM` 口时自动安全释放原页面连接并无缝接管）与**跨页面全局 `Esc` 最高优先级急停**。
+支持**跨模块同串口冲突智能让渡**（切换模块打开同一 `COM` 口时自动安全释放原页面连接并无缝接管）与**跨页面全局 `Esc` 最高优先级急停**（含断开连接前硬件缓冲冲洗发停机指令）。
 
 ### 1. 📈 PID 闭环调参与智能自动整定（`Ctrl+1`）
-- **高刷多通道示波器**：支持 1～4 通道实时曲线 + 4 条固定/跟随参考线、通道缩放系数与工程单位换算、独立双 Y 轴分流（如左轴转速 `RPM`、右轴 `PWM`）、单次边沿触发抓拍、A/B 双游标测量与历史 CSV 离线导入回放。
-- **三色状态安全调参**：支持 `ANG / SPD / YAW / AUX` 四环独立参数、连续滑块微调 + 5 档步长、上下限保护、大幅跳变二次确认与一键撤销。
-- **⚡ 智能 PID 自动整定（Auto-Tune）**：无需修改单片机固件，给定目标值后自动完成闭环比例探针辨识（SIMC 内模 / 二阶极点配置初值）与 Hooke–Jeeves 闭环多轮打分寻优。
+- **高刷多通道示波器**：支持 **1～8 通道实时曲线** + 4 条固定/跟随参考线、通道缩放系数与工程单位换算、独立双 Y 轴分流（如左轴转速 `RPM`、右轴 `PWM`）、单次边沿触发抓拍、A/B 双游标测量与历史 CSV 离线导入回放。
+- **三色状态安全调参与原子组写入**：支持 `ANG / SPD / YAW / AUX` 四环独立参数、原子下发 `@<GRP>.SET=kp,ki,kd,tgt`（`#CAP:SET` 探测，防新旧参数短暂混用）、连续滑块微调 + 5 档步长、上下限保护、大幅跳变二次确认与一键撤销。
+- **⚡ 智能 PID 自动整定（Auto-Tune）**：无需修改单片机固件，自动辨识 + Hooke–Jeeves 多轮寻优；支持 **直立环 `ANG` 强制局部微调（单轮 `≤±35%`）、车轮架空安全勾选确认、失败/超时/断线自动写回原参数**，并内置带 `25 ms` 滞后、传感器噪声及 `👋 推一下` 扰动按钮的倒立摆仿真。
 - **📌 Ghost 同起点残影对比 + 🩺 FFT 信号体检 + 📋 C 代码导出**：锁定旧参数阶跃底图同起点叠加对比；一键分析零偏、底噪 `σ` 与 FFT 主振荡频率；一键生成 STM32 `#define` 参数宏代码。
 
 ![PID 调参工作台全景](docs/images/fig01_overview.png)
@@ -46,8 +46,8 @@
 ![3D IMU 姿态与六轴标定工作台](docs/images/fig12_imu_studio.png)
 
 ### 4. 🎮 小车差速遥控与 HC-05 AT 配置工具箱（`Ctrl+4`）
-- **兼容 `BlueSerialStudio` `J,{x},{y}` 差速遥控协议**：支持 **360° 单摇杆**、**左右双摇杆**、**四按键 / 键盘 `WASD` 长按渐进加速（18%→100%）** 三种控制模式，实时预览 `BlueSerial_MixWheels` 左右轮混控输出，切页或按 `Esc` 自动发 `J,0,0` 停车。
-- **HC-05 USB-TTL 串口直连 AT 配置箱**：自动附加标准 `CRLF (\r\n)`，支持电脑 USB-TTL 直发配置 `AT+NAME=`、`AT+UART=`、`AT+PSWD=`、`AT+ROLE=` 并实时回显 `OK` 响应，同时支持一键复制到剪贴板。
+- **兼容 `BlueSerialStudio` `J,{x},{y}` 差速遥控协议**：支持 **360° 单摇杆**、**左右双摇杆**、**四按键 / 键盘 `WASD` 长按渐进加速（18%→100%）** 三种控制模式，实时预览 `BlueSerial_MixWheels` 左右轮混控输出；内置窗口失焦/隐藏自动清零 `J,0,0` 防卡键保护与非零摇杆 `100 ms` 心跳重发保活，切页或按 `Esc` 立即急停。
+- **HC-05 USB-TTL 串口直连 AT 配置箱**：自动附加标准 `CRLF (\r\n)`，支持完整波特率表（含 `57600` 及对 `5760` 疑误项的二次安全确认）并在写入 `AT+UART=` 前自动发送 `AT+UART?` 读出对比，避免误写导致模块失联。
 
 ![小车遥控与 HC-05 AT 配置工作台](docs/images/fig13_remote_hc05.png)
 
@@ -76,7 +76,7 @@ self.register_module("📷 摄像头调试", CameraDebugPage(self))
 | `autotune.py` / `autotune_ui.py` | 闭环阶跃辨识（SIMC / 极点配置）+ Hooke–Jeeves 自动整定引擎 |
 | `diagnostics.py` / `scope.py` / `engine.py` | FFT 信号体检、C 代码导出、高刷示波器（含 Ghost 底图）、协议解析与仿真器 |
 | `firmware_example/` | STM32 C99 零 `printf_float` 依赖协议栈 `pid_link.c/.h`、HAL 队列与平衡车三环串级模板 |
-| `tests/` & `test_tuner.py` | STM32 C99 协议/平衡车闭环测试与 32 项 Python 自动化回归测试 |
+| `tests/` & `test_tuner.py` | STM32 C99 协议/平衡车闭环测试与 34 项 Python 自动化回归测试 |
 | `.github/workflows/build-windows.yml` | GitHub Actions 自动运行 C + Python 全套测试并构建单文件 `PIDTuner.exe` |
 
 ---

@@ -245,7 +245,8 @@ def identify_from_p_step(times, actual, base_y, goal_y, kp_probe, mode=0, style=
 class AutoTuner:
     """Stateful round-by-round optimizer producing candidate {KP, KI, KD} dicts."""
 
-    def __init__(self, mode, style, strategy, initial, rules, base, target, step_seconds=2.0, max_rounds=12):
+    def __init__(self, mode, style, strategy, initial, rules, base, target,
+                 step_seconds=2.0, max_rounds=12, max_ratio=None):
         if mode not in range(len(MODES)):
             raise ValueError("未知整定模式")
         if style not in range(len(STYLES)):
@@ -262,6 +263,7 @@ class AutoTuner:
         self.base, self.target = float(base), float(target)
         self.step_seconds = float(step_seconds)
         self.max_rounds = int(max_rounds)
+        self.max_ratio = float(max_ratio if max_ratio is not None else (1.35 if strategy == 1 else 2.5))
         self.initial = {k: float(initial.get(k, 0.)) for k in ("KP", "KI", "KD")}
 
         # Respect user's parameter limits and keep gain signs consistent (default >= 0).
@@ -274,6 +276,14 @@ class AutoTuner:
                 lo = 0.
             elif sign < 0 and lo <= 0 < hi:
                 hi = 0.
+            # In local fine-tuning mode, also constrain total excursion relative to safe baseline.
+            if strategy == 1 and abs(self.initial[k]) >= 1e-3:
+                v0 = self.initial[k]
+                env = sorted((v0 * 0.4, v0 * 2.5))
+                lo = max(lo, env[0])
+                hi = min(hi, env[1])
+                if hi < lo:
+                    lo = hi = min(max(v0, float(rules[k][0])), float(rules[k][1]))
             self.bounds[k] = (float(lo), float(hi))
 
         self.round = 0
@@ -291,8 +301,28 @@ class AutoTuner:
         self._coord_index = 0
         self._coord_dir = 0
         self._coord_improved = False
-        self._step_scale = 0.18 if strategy == 1 else 0.28
+        self._step_scale = 0.16 if strategy == 1 else 0.28
         self._setup_initial_queue()
+
+    def _cap_step_change(self, candidate, ref):
+        """Limit per-round multiplicative ratio relative to ref (and initial in local mode)."""
+        if ref is None:
+            return dict(candidate)
+        capped = dict(candidate)
+        ratio = max(1.05, self.max_ratio)
+        for k in self.active_keys:
+            r = ref.get(k, 0.)
+            v = capped.get(k, 0.)
+            if abs(r) >= 1e-3:
+                lo_r, hi_r = sorted((r / ratio, r * ratio))
+                v = min(hi_r, max(lo_r, v))
+            elif self.strategy == 1:
+                kp_ref = max(abs(ref.get("KP", 0.)), 0.2)
+                max_seed = kp_ref * (0.35 if k == "KI" else 0.08 if k == "KD" else 0.5)
+                if abs(v) > max_seed:
+                    v = math.copysign(max_seed, v)
+            capped[k] = v
+        return self._clamp_params(capped)
 
     def _clamp_params(self, raw):
         out = {}
@@ -318,7 +348,7 @@ class AutoTuner:
         has_initial = abs(start["KP"]) > 1e-4 or abs(start["KI"]) > 1e-4
         if self.strategy == 1:
             if not has_initial:
-                start["KP"] = self._clamp_params({"KP": 1.0 * self.sign})["KP"]
+                raise ValueError("局部微调模式要求先设定可基本稳定运行的非零初始 KP/KI 参数")
             self._enqueue(start, "当前基准")
             return
 
@@ -374,7 +404,7 @@ class AutoTuner:
             delta = math.copysign(0.0002, delta)
         candidate = dict(base_params)
         candidate[key] = val + delta
-        clamped = self._clamp_params(candidate)
+        clamped = self._cap_step_change(candidate, base_params)
         return None if self._signature(clamped) == self._signature(base_params) else clamped
 
     def _advance_search(self):
@@ -414,7 +444,7 @@ class AutoTuner:
                         moved = True
                 self._coord_anchor = None
                 if moved:
-                    cand = self._clamp_params(pattern)
+                    cand = self._cap_step_change(pattern, self.best_params)
                     if self._signature(cand) not in self._tried:
                         return cand, "加速外推"
             else:

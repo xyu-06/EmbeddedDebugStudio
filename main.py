@@ -18,7 +18,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 from serial.tools import list_ports
 
-from engine import DEFAULTS, KEYS, LIMIT, LOOPS, Lines, Simulator, step_metrics
+from engine import DEFAULTS, KEYS, LIMIT, LOOPS, MAX_CHANNELS, MAX_REFS, REF_BASE, Lines, Simulator, step_metrics
 from generator import SHAPES, TargetGenerator
 from imu_studio import ImuStudioPage
 from layout_ui import STYLE, build, number
@@ -27,6 +27,7 @@ from scope import COLORS, REF_COLORS
 from serial_studio import SerialAssistantPage
 from storage import History, PARAM_COLS, csv_header, csv_row, load_csv
 from transport import SerialLink
+from version import APP_NAME, APP_TITLE_ZH, APP_VERSION
 
 
 class Window(W.QMainWindow):
@@ -44,7 +45,7 @@ class Window(W.QMainWindow):
         self.monitor = RuntimeMonitor()
         self.macros = [("读参数","@GET"),("清积分","@RST"),("启动","@RUN"),("急停","@STOP"),("校准IMU","@CAL")]
         self.slider_spans = {k: (-10., 10.) for k in KEYS}
-        self.ping_capable = self.send_heartbeat = False
+        self.ping_capable = self.set_capable = self.send_heartbeat = False
         self.next_ping = 0.
         self.generator = None
         self.reconnect_at = self.reconnect_opts = None
@@ -55,16 +56,16 @@ class Window(W.QMainWindow):
         self.rollback = None
         self.retry_command = None
         self.connection_error = False
-        self.buffer = History(channels=8)
-        self.ref_active = [False] * 4
-        self.scales = [1.] * 4
-        self.units = [""] * 4
+        self.buffer = History(channels=MAX_CHANNELS + MAX_REFS)
+        self.ref_active = [False] * MAX_REFS
+        self.scales = [1.] * MAX_CHANNELS
+        self.units = [""] * MAX_CHANNELS
         self.right_channel = -1
-        self.follow = [""] * 4
+        self.follow = [""] * MAX_REFS
         self.rules = {group:DEFAULT_RULES.copy() for group in LOOPS}
         self.frozen_count = 0
         self.channel_preferences = [None,None]
-        self.colors = list(COLORS + REF_COLORS)
+        self.colors = list(COLORS[:MAX_CHANNELS] + REF_COLORS[:MAX_REFS])
         self.capture = CaptureController(self)
         self.drafts = {g: dict(DEFAULTS) for g in LOOPS}
         self.confirmed = {}
@@ -107,6 +108,7 @@ class Window(W.QMainWindow):
         self.load_fields()
         self.loading = False
         self.source.currentIndexChanged.connect(self.source_ui)
+        self.model.currentIndexChanged.connect(lambda _: self.source_ui())
         self.group.currentIndexChanged.connect(self.change_group)
         self.address.currentIndexChanged.connect(self.address_ui)
         self.raw.returnPressed.connect(self.send_raw)
@@ -264,14 +266,14 @@ class Window(W.QMainWindow):
 
     def show_extension_guide(self):
         dlg = W.QDialog(self)
-        dlg.setWindowTitle("综合调试台 · 模块化扩展接口说明")
+        dlg.setWindowTitle(f"{APP_TITLE_ZH} v{APP_VERSION} · 模块化扩展接口说明")
         dlg.resize(620, 440)
         lay = W.QVBoxLayout(dlg)
         info = W.QLabel(
-            "<b>插件化多模块架构说明</b><br>"
+            f"<b>插件化多模块架构说明（当前版本 v{APP_VERSION}）</b><br>"
             "本上位机采用统一的 <code>WorkbenchModule</code> 页面接口，当前已内置 "
-            "<b>📈 PID 调参</b>、<b>🔌 串口调试</b>、<b>🧭 IMU 姿态</b> 三大工作台。<br>"
-            "后续接入 <b>📷 摄像头图传 (OV7670/OpenMV)</b>、<b>🎮 蓝牙遥控</b>、<b>🔋 电源监测</b> 等模块时，"
+            "<b>📈 PID 调参</b>、<b>🔌 串口调试</b>、<b>🧭 IMU 姿态</b>、<b>🎮 遥控与 HC-05</b> 四大工作台。<br>"
+            "后续接入 <b>📷 摄像头图传 (OV7670/OpenMV)</b>、<b>📈 CAN 总线分析</b> 等模块时，"
             "只需新建一个独立的 <code>QWidget</code> 子类并在 <code>Window.__init__</code> 注册一行即可自动获得："
             "顶部导航栏页签、<code>调试模块(M)</code> 菜单与快捷键、跨页面串口冲突自动让渡、暗色主题同步与配置持久化。"
         )
@@ -303,6 +305,14 @@ class Window(W.QMainWindow):
         lay.addWidget(bb)
         dlg.exec()
 
+    def nudge_pendulum(self):
+        if not self.sim or not self.sim.pendulum or not self.connected:
+            self.feedback("请先连接“倒立摆（平衡车直立）”仿真并启动再施加扰动", True)
+            return
+        self.sim.nudge(self.selected(), 22.0)
+        self.mark("外部扰动 · 推一下")
+        self.log("系统", "已向倒立摆施加 +22°/s 外力扰动（测试恢复能力）")
+
     def try_simulation(self):
         if self.connected or self.link:
             return
@@ -329,6 +339,9 @@ class Window(W.QMainWindow):
         if self.writer:
             return
         self.capture.cancel_capture("通道设置已更改")
+        scales = list(scales)[:MAX_CHANNELS] + [1.0]*max(0,MAX_CHANNELS-len(scales))
+        units = [str(u)[:16] for u in list(units)[:MAX_CHANNELS]] + [""]*max(0,MAX_CHANNELS-len(units))
+        follow = list(follow)[:MAX_REFS] + [""]*max(0,MAX_REFS-len(follow))
         for i,(old,new) in enumerate(zip(self.scales,scales),1):
             if old != new:
                 for part in self.buffer.slices():
@@ -340,7 +353,7 @@ class Window(W.QMainWindow):
         self.analyze()
 
     def set_auto_names(self):
-        defaults = ("目标值","实际值","输出","误差") if self.source.currentIndex() else ("CH1","CH2","CH3","CH4")
+        defaults = ("目标值","实际值","输出","误差","CH5","CH6","CH7","CH8") if self.source.currentIndex() else tuple(f"CH{i}" for i in range(1,MAX_CHANNELS+1))
         for field,name in zip(self.name_edits,defaults):
             field.setPlaceholderText(name)
 
@@ -377,15 +390,15 @@ class Window(W.QMainWindow):
     def restore(self):
         try:
             opts = json.loads(self.settings.value("options","{}"))
-            for i,v in enumerate(opts.get("scales",[])[:4]):
+            for i,v in enumerate(opts.get("scales",[])[:MAX_CHANNELS]):
                 if isinstance(v,(float,int)) and 1e-6 <= abs(v) <= LIMIT:
                     self.scales[i] = v
-            for i,v in enumerate(opts.get("units",[])[:4]):
+            for i,v in enumerate(opts.get("units",[])[:MAX_CHANNELS]):
                 self.units[i] = str(v)[:16]
-            for i,v in enumerate(opts.get("follow",[])[:4]):
+            for i,v in enumerate(opts.get("follow",[])[:MAX_CHANNELS]):
                 self.follow[i] = v if v in LOOPS else ""
             axis = opts.get("right_channel",-1)
-            self.right_channel = axis if isinstance(axis,int) and -1<=axis<4 else -1
+            self.right_channel = axis if isinstance(axis,int) and -1<=axis<MAX_CHANNELS else -1
             for g,rules in opts.get("rules",{}).items():
                 if g in LOOPS and isinstance(rules,dict):
                     self.rules[g].update({k:tuple(v) for k,v in rules.items() if k in KEYS and valid_rule(v)})
@@ -398,7 +411,7 @@ class Window(W.QMainWindow):
             old_windows = (5,10,30,60)
             default_window = old_windows[old_index] if isinstance(old_index,int) and 0<=old_index<4 else 10
             self.window.setValue(float(opts.get("window_seconds",default_window)))
-            for i,color in enumerate(opts.get("colors",[])[:8]):
+            for i,color in enumerate(opts.get("colors",[])[:MAX_CHANNELS+MAX_REFS]):
                 if isinstance(color,str) and QtGui.QColor.isValidColorName(color):
                     self.colors[i] = QtGui.QColor(color).name()
             for key in ("rate","ymin","ymax","line","trigger_level","capture_seconds","pre_percent","x_div","y_div","gen_amp","gen_period","gen_rate"):
@@ -561,6 +574,10 @@ class Window(W.QMainWindow):
         self.autotune_btn.setEnabled(self.connected or self.autotuner.active)
         self.badge.setText("仿真练习" if self.sim else "串口已连接" if self.connected else "正在关闭…" if self.closing
                            else "等待重连…" if waiting or self.reconnecting else "正在连接…" if busy else "未连接")
+        if hasattr(self,"nudge_btn"):
+            pendulum = sim and self.model.currentIndex() == 3
+            self.nudge_btn.setVisible(pendulum)
+            self.nudge_btn.setEnabled(pendulum and self.connected)
         if hasattr(self,"workbench"):
             self.workbench.connection()
             self.workbench.fields()
@@ -576,7 +593,7 @@ class Window(W.QMainWindow):
         self.autotune_status.clear()
         self.autotune_status.hide()
         self.monitor.reset()
-        self.send_heartbeat = self.ping_capable = False
+        self.send_heartbeat = self.ping_capable = self.set_capable = False
         self.end_record()
         self.rx_log_tail = None
         self.clear_plot()
@@ -653,6 +670,14 @@ class Window(W.QMainWindow):
         self.source_ui()
 
     def disconnect(self):
+        final_cmds = []
+        if self.connected and self.link:
+            final_cmds.append("@STOP")
+            if self.autotuner.active and self.autotuner.saved_before:
+                p = self.autotuner.saved_before
+                final_cmds.extend(self.autotuner._build_param_cmds(p["KP"],p["KI"],p["KD"],p["TGT"],reset=True))
+        if self.sim and self.connected:
+            self.sim.command("@STOP")
         self.autotuner.stop("连接已关闭",apply_best=False)
         self.stop_generator("连接已关闭",restore=False)
         self.reconnect_at = None
@@ -662,7 +687,11 @@ class Window(W.QMainWindow):
         self.end_record()
         self.commands.clear()
         if self.link:
-            self.link.closed.set()
+            payload = "".join(c + "\n" for c in final_cmds).encode() if final_cmds else b""
+            self.link.flush_and_close(payload)
+            if payload:
+                self.tx += len(payload)
+                self.log("TX",payload)
             self.closing = True
         self.sim = None
         self.connected = False
@@ -747,7 +776,11 @@ class Window(W.QMainWindow):
         if not self.connected:
             self.feedback("请先连接串口或打开仿真",True)
             return
-        self.commands.submit([self.key(k)+"="+format(self.fields[k].value(),".4f") for k in KEYS])
+        if self.set_capable:
+            vals = ",".join(format(self.fields[k].value(),".4f") for k in KEYS)
+            self.commands.submit([self.key("SET")+"="+vals])
+        else:
+            self.commands.submit([self.key(k)+"="+format(self.fields[k].value(),".4f") for k in KEYS])
 
     def read_params(self):
         self.enqueue(self.key("GET"))
@@ -764,12 +797,12 @@ class Window(W.QMainWindow):
     def stop_device(self):
         if not self.connected:
             return
-        self.autotuner.on_device_stopped("急停")
         self.stop_generator("急停",restore=False)
         self.workbench.stop_feedback()
         self.send_heartbeat = False
         self.commands.clear()
         self.enqueue("@STOP",urgent=True)
+        self.autotuner.on_device_stopped("急停")
 
     def toggle_generator(self):
         if self.generator:
@@ -876,8 +909,8 @@ class Window(W.QMainWindow):
                     self.log("解析",f"错误帧 {self.bad}：{payload}")
             elif kind == "log" and payload == "#CAP:PING":
                 self.ping_capable = True
-            elif kind == "log" and payload.startswith("#ERROR:float printf"):
-                self.feedback("设备浮点格式化自检失败，请启用 -u _printf_float 后重新链接",True)
+            elif kind == "log" and payload == "#CAP:SET":
+                self.set_capable = True
             elif kind == "log" and payload.startswith("#BALANCE:"):
                 self.handle_balance_log(payload[9:].strip())
             elif kind == "log" and payload.startswith("#STOP:"):
@@ -965,12 +998,13 @@ class Window(W.QMainWindow):
         self.rate_frames += 1
         self.latest = t
         refs = [self.reference_value(i) if active else np.nan for i,active in enumerate(self.ref_active)]
-        self.buffer.add(t,[*values,*([np.nan]*(4-self.count)),*refs],self.param_tuple)
+        self.buffer.add(t,[*values,*([np.nan]*(MAX_CHANNELS-self.count)),*refs],self.param_tuple)
         if self.capture.capture_channel is not None:
             self.capture.check_capture(t,values)
         if self.writer:
             try:
-                self.writer.writerow(csv_row(t,values,self.param_tuple,[refs[i] for i in self.active_refs()]))
+                n_ch = getattr(self,"record_cols",max(4,self.count))
+                self.writer.writerow(csv_row(t,values[:n_ch],self.param_tuple,[refs[i] for i in self.active_refs()],ch_cols=n_ch))
             except (OSError,ValueError) as exc:
                 self.end_record()
                 self.feedback("录制失败  " + str(exc),True)
@@ -1089,7 +1123,7 @@ class Window(W.QMainWindow):
                     self.feedback("写入失败  "+str(exc),True)
 
     def update_status(self):
-        self.status.setText(f"{self.badge.text()}     RX  {self.rx:,} B     TX  {self.tx:,} B     {self.fps} 帧/s     通道  {self.count}/4     错误帧  {self.bad}     溢出  {self.dropped} B")
+        self.status.setText(f"{self.badge.text()}     RX  {self.rx:,} B     TX  {self.tx:,} B     {self.fps} 帧/s     通道  {self.count}/{MAX_CHANNELS}     错误帧  {self.bad}     溢出  {self.dropped} B")
 
     def channel_names(self):
         self.refresh_channels()
@@ -1131,9 +1165,9 @@ class Window(W.QMainWindow):
             return
         self.ref_active[slot] = False
         self.follow[slot] = ""
-        self.buffer.data[:,slot+5] = np.nan
+        self.buffer.data[:,slot+REF_BASE+1] = np.nan
         if self.scope.frozen:
-            self.scope.data[:,slot+5] = np.nan
+            self.scope.data[:,slot+REF_BASE+1] = np.nan
         self.channel_names()
 
     def reference_changed(self,slot):
@@ -1152,7 +1186,7 @@ class Window(W.QMainWindow):
 
     def refresh_channels(self):
         count = self.frozen_count if self.scope.frozen else self.count
-        names = self.names() + [self.ref_name(i) for i in range(4)]
+        names = self.names() + [self.ref_name(i) for i in range(MAX_REFS)]
         self.scope.set_names(names)
         self.scope.set_right_channel(self.right_channel if self.right_channel<count else -1)
         trigger_index = self.trigger_ch.currentData()
@@ -1171,20 +1205,20 @@ class Window(W.QMainWindow):
             tag.setText("跟随" if self.follow[i] else "固定")
             level = self.reference_value(i)
             if self.scope.frozen and self.follow[i] and len(self.scope.data):
-                level = self.scope.data[-1,5+i]
+                level = self.scope.data[-1,REF_BASE+1+i]
             if self.follow[i] and np.isfinite(level):
                 with C.QSignalBlocker(value):
                     value.setValue(level)
             value.setEnabled(not self.follow[i])
             value.setToolTip(f"跟随 {self.follow[i]}.TGT；等待读取或下发确认" if self.follow[i] else "")
-            self.scope.set_reference(i,names[4+i],level,self.ref_active[i] and np.isfinite(level))
+            self.scope.set_reference(i,names[REF_BASE+i],level,self.ref_active[i] and np.isfinite(level))
             name.setEnabled(not self.writer)
             remove.setEnabled(not self.writer)
-        self.add_ref_btn.setEnabled(len(refs)<4 and not self.writer)
+        self.add_ref_btn.setEnabled(len(refs)<MAX_REFS and not self.writer)
         self.calibrate_btn.setEnabled(not self.writer)
-        ids = [*range(count),*(4+i for i in refs)]
+        ids = [*range(count),*(REF_BASE+i for i in refs)]
         speed_pwm = count==2 and not self.sim and any(tag in names[1].lower() for tag in ("pwm","占空","duty"))
-        defaults = [4+refs[0] if refs else None if speed_pwm else 0,
+        defaults = [REF_BASE+refs[0] if refs else None if speed_pwm else 0,
                     1 if count>=2 and (self.sim or not (refs or speed_pwm)) else 0]
         for role,widget in enumerate((self.target_ch,self.actual_ch)):
             with C.QSignalBlocker(widget):
@@ -1192,7 +1226,7 @@ class Window(W.QMainWindow):
                 if role==0 and speed_pwm and not refs:
                     widget.addItem("选择目标通道",None)
                 for i in ids:
-                    widget.addItem(names[i] if i<4 else "固定 · "+names[i],i)
+                    widget.addItem(names[i] if i<MAX_CHANNELS else "固定 · "+names[i],i)
                 preferred = self.channel_preferences[role]
                 if preferred not in ids:
                     preferred = defaults[role]
@@ -1217,13 +1251,13 @@ class Window(W.QMainWindow):
         tile.fill(QtGui.QColor(color))
         chip.setIcon(QtGui.QIcon(tile))
         chip.setToolTip(f"选择颜色  {color.upper()}")
-        if slot<4:
+        if slot<MAX_CHANNELS:
             self.scope.curves[slot].setPen(pg.mkPen(color,width=self.line.value()))
             self.enabled_ch[slot].setIcon(QtGui.QIcon(tile))
             for sample,_ in self.scope.legend.items:
                 sample.update()
         else:
-            guide = self.scope.references[slot-4]
+            guide = self.scope.references[slot-MAX_CHANNELS]
             guide.setPen(pg.mkPen(color,width=self.line.value(),style=C.Qt.PenStyle.DashLine))
             guide.label.setColor(color)
 
@@ -1338,7 +1372,7 @@ class Window(W.QMainWindow):
         if metrics is None:
             self.scope.clear_step()
             text = "等待所选目标通道发生阶跃"
-            if actual is not None and actual < 4 and len(a) >= 24:
+            if actual is not None and actual < MAX_CHANNELS and len(a) >= 24:
                 left, right = self.scope.viewRange()[0]
                 vis = a[(a[:, 0] >= left) & (a[:, 0] <= right)]
                 freq, amp = dominant_fft(vis[:, 0], vis[:, actual + 1]) if len(vis) >= 24 else (None, 0.0)
@@ -1366,7 +1400,7 @@ class Window(W.QMainWindow):
                 g_os = f"{gm[0]:.3g}%" if gm[0] is not None else "—"
                 g_st = f"{gm[2]:.3g}s" if gm[2] is not None else "—"
                 msg += f"\n对比底图 ({self.scope.ghost['tag']})：超调 {g_os} · 调节 {g_st}"
-            if actual < 4 and len(segment) >= 24:
+            if actual < MAX_CHANNELS and len(segment) >= 24:
                 freq, amp = dominant_fft(segment[:, 0], segment[:, actual + 1])
                 if freq is not None and amp > 0.08 * max(float(np.nanmax(segment[:, actual + 1]) - np.nanmin(segment[:, actual + 1])), 1e-3):
                     msg += f"\n主频 FFT ≈ {freq:.2f} Hz"
@@ -1422,10 +1456,11 @@ class Window(W.QMainWindow):
         if self.connected or self.link:
             self.disconnect()
         self.clear_plot()
-        for i in range(4):
+        for i in range(MAX_CHANNELS):
             self.scales[i] = 1.0
-            self.units[i] = loaded["units"][i]
-            self.name_edits[i].setText(loaded["aliases"][i])
+            self.units[i] = loaded["units"][i] if i < len(loaded["units"]) else ""
+            self.name_edits[i].setText(loaded["aliases"][i] if i < len(loaded["aliases"]) else "")
+        for i in range(MAX_REFS):
             self.ref_active[i] = False
             self.follow[i] = ""
         for slot, (r_name, r_val) in enumerate(loaded["references"]):
@@ -1438,7 +1473,7 @@ class Window(W.QMainWindow):
         self.count = loaded["count"]
         self.buffer.reset()
         for row, snap in zip(mat, snaps):
-            self.buffer.add(float(row[0]), row[1:9], snap)
+            self.buffer.add(float(row[0]), row[1:1+MAX_CHANNELS+MAX_REFS], snap)
         self.frames = len(mat)
         self.latest = float(mat[-1, 0])
         # Populate confirmed dictionary from the last non-empty parameter snapshot if present
@@ -1538,7 +1573,8 @@ class Window(W.QMainWindow):
             return
         left,right = self.scope.viewRange()[0]
         params = self.frozen_params if self.scope.frozen else self.buffer.snapshots()
-        names = self.names()
+        n_ch = max(4,self.frozen_count if self.scope.frozen else self.count)
+        names = self.names()[:n_ch]
         refs = self.active_refs()
         ref_names = [self.ref_name(i) for i in refs]
         path = self.choose_file("导出当前可见时间段","csv")
@@ -1550,7 +1586,7 @@ class Window(W.QMainWindow):
                 out.writerow(csv_header(names,ref_names))
                 for data,p in zip(a,params):
                     if left <= data[0] <= right:
-                        out.writerow(csv_row(data[0], data[1:5], p,[data[5+i] for i in refs]))
+                        out.writerow(csv_row(data[0], data[1:1+n_ch], p,[data[REF_BASE+1+i] for i in refs],ch_cols=n_ch))
             self.feedback("已导出视图 CSV")
         except OSError as exc:
             self.feedback(str(exc),True)
@@ -1573,9 +1609,10 @@ class Window(W.QMainWindow):
         if not path:
             return
         try:
+            self.record_cols = max(4,self.count)
             self.record_file = open(path,"w",newline="",encoding="utf-8-sig")
             self.writer = csv.writer(self.record_file)
-            self.writer.writerow(csv_header(self.names(),[self.ref_name(i) for i in self.active_refs()]))
+            self.writer.writerow(csv_header(self.names()[:self.record_cols],[self.ref_name(i) for i in self.active_refs()]))
         except OSError as exc:
             self.end_record()
             self.feedback(str(exc),True)
@@ -1657,7 +1694,8 @@ def main():
         windll.shell32.SetCurrentProcessExplicitAppUserModelID("PIDLab.PIDTuner")
     app = W.QApplication(sys.argv)
     app.setOrganizationName("PIDLab")
-    app.setApplicationName("PIDTuner")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
     app.setWindowIcon(QtGui.QIcon(str(Path(__file__).resolve().parent/"assets"/"pidtuner.ico")))
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
@@ -1673,7 +1711,7 @@ def main():
             received = win.terminal.toPlainText().splitlines()
             terminal_ok = len(received) == 1 and received[0].endswith("接收  156")
             win.set_reference(0,"目标转速",150)
-            win.configure_channels([.01,1,1,1],["RPM","","",""],1,["","","",""])
+            win.configure_channels([.01,1,1,1,1,1,1,1],["RPM","","","","","","",""],1,["","","",""])
             win.receive(b"15600,600\n",monotonic())
             win.paint_scope()
             calibrated_ok = win.actual_ch.currentData()==0 and win.scope.secondary is win.scope.curves[1].getViewBox()
@@ -1681,7 +1719,7 @@ def main():
             win.window.setValue(7.5)
             win.apply_color(0,"#e6194b")
             viewport_ok = win.scope.width_s == 7.5 and win.scope.curves[0].opts["pen"].color().name() == "#e6194b"
-            channels_ok = win.count == 2 and win.actual_ch.currentData() == 0 and win.target_ch.currentData() == 4
+            channels_ok = win.count == 2 and win.actual_ch.currentData() == 0 and win.target_ch.currentData() == REF_BASE
             channels_ok = channels_ok and win.scope.references[0].value() == 150 and win.tx == 0
             win.source.setCurrentIndex(1)
             win.toggle_connection()

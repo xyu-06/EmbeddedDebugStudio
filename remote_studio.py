@@ -19,9 +19,9 @@ from PySide6 import QtCore as C, QtGui, QtWidgets as W
 from transport import SerialLink
 
 
-# Verbatim baud rate table from BlueSerialStudio AtCommandBuilder.java (includes 5760 per manual)
+# Baud rate table from BlueSerialStudio AtCommandBuilder.java + standard 57600 (keep 5760 explicitly flagged)
 HC05_BAUD_RATES = (
-    2400, 4800, 9600, 19200, 38400, 5760, 115200, 230400, 460800, 921600, 1382400
+    2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1382400, 5760
 )
 
 HC05_CAUTIONS = (
@@ -29,7 +29,7 @@ HC05_CAUTIONS = (
     "2. 进入 AT 模式：模块上电后红灯先快闪约 3 秒，在此 3 秒内长按板载 KEY 按键，红灯变为慢闪即进入 AT 模式（默认 38400,8,N,1）。\n"
     "3. 电平注意：底板通常标供电 3.6–6V，但串口 RXD 逻辑电平为 3.3V，请勿将 5V 供电误认为 RXD 可直接承受 5V。\n"
     "4. 指令格式：8 数据位、1 停止位、无校验、无流控，所有 AT 指令末尾必须带 CRLF（\\r\\n），本页发送与复制均自动附加 CRLF。\n"
-    "5. 修改 AT+UART 后需同步切换串口波特率才能继续通信；兼容版说明书原文含 5760，请核对实际固件勿盲目当成 57600。\n"
+    "5. 已补充常用标准速率 57600；兼容说明书原文中的 5760 已明确标注“疑似笔误”并设二次确认。若误设成难连接速率，可用 KEY 上电进 38400 AT 模式发送 AT+ORGL 恢复。\n"
     "6. AT+RESET 与 AT+ORGL 均会退出 AT 模式；执行 AT+ORGL 后串口恢复为 38400,0,0（与部分模块出厂预设的 9600 不同）。"
 )
 
@@ -165,6 +165,16 @@ class SingleJoystickWidget(W.QWidget):
         if self.dragging and event.button() == C.Qt.MouseButton.LeftButton:
             self.reset_center(emit_signal=True)
 
+    def focusOutEvent(self, event):
+        if self.dragging:
+            self.reset_center(emit_signal=True)
+        super().focusOutEvent(event)
+
+    def hideEvent(self, event):
+        if self.dragging:
+            self.reset_center(emit_signal=True)
+        super().hideEvent(event)
+
     def paintEvent(self, event):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
@@ -237,6 +247,16 @@ class AxisBarJoystick(W.QWidget):
         if self.dragging and event.button() == C.Qt.MouseButton.LeftButton:
             self.reset_center(emit_signal=True)
 
+    def focusOutEvent(self, event):
+        if self.dragging:
+            self.reset_center(emit_signal=True)
+        super().focusOutEvent(event)
+
+    def hideEvent(self, event):
+        if self.dragging:
+            self.reset_center(emit_signal=True)
+        super().hideEvent(event)
+
     def paintEvent(self, event):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
@@ -287,6 +307,8 @@ class RemoteBtPage(W.QWidget):
         self.last_sent_xy = (0, 0)
         self.last_drive_tx = 0.0
         self.held_keys = {}  # dir_name -> monotonic_ms
+        self.confirm_at = None
+        self._pending_uart_write = None  # (cmd, (baud, stop, parity), deadline_mono)
         self.logs = deque(maxlen=300)
         self.rx_tail = ""
 
@@ -566,8 +588,10 @@ class RemoteBtPage(W.QWidget):
         # 2. UART
         uart_w = W.QWidget(); uw = W.QHBoxLayout(uart_w); uw.setContentsMargins(0, 0, 0, 0); uw.setSpacing(4)
         self.at_baud_box = W.QComboBox()
-        self.at_baud_box.addItems([str(b) for b in HC05_BAUD_RATES])
-        self.at_baud_box.setCurrentText("115200")
+        for b in HC05_BAUD_RATES:
+            label = f"{b}（说明书原文，疑似笔误）" if b == 5760 else str(b)
+            self.at_baud_box.addItem(label, b)
+        self.at_baud_box.setCurrentIndex(self.at_baud_box.findData(115200))
         self.at_stop_box = W.QComboBox(); self.at_stop_box.addItems(["0 (1停止位)", "1 (2停止位)"])
         self.at_parity_box = W.QComboBox(); self.at_parity_box.addItems(["0 (无校验)", "1 (奇校验)", "2 (偶校验)"])
         for box in (self.at_baud_box, self.at_stop_box, self.at_parity_box):
@@ -692,13 +716,20 @@ class RemoteBtPage(W.QWidget):
         self._sync_conn_ui()
 
     def disconnect_port(self):
+        had_conn = self.connected and self.link is not None
         self.stop_all_motion(send_stop=False)
+        self._pending_uart_write = None
         if self.link:
-            self.link.closed.set()
             self.closing = True
+            if had_conn:
+                suf = self._suffix_str()
+                stop_bytes = (format_drive_command(self.fmt_edit.text(), 0, 0) + suf + "S" + suf).encode("utf-8")
+                self.link.flush_and_close(stop_bytes, timeout=0.25)
+            else:
+                self.link.closed.set()
         self.connected = False
         self._sync_conn_ui()
-        self._log("系统", "已关闭串口连接")
+        self._log("系统", "已安全停车并关闭串口连接" if had_conn else "已关闭串口连接")
 
     def _sync_conn_ui(self):
         busy = self.connected or self.link is not None
@@ -759,6 +790,24 @@ class RemoteBtPage(W.QWidget):
             now_ms,
         )
         self._emit_drive(force=force_zero or (self.steering_x == 0 and self.throttle_y == 0))
+
+    def hideEvent(self, event):
+        if self.held_keys or self.steering_x or self.throttle_y:
+            self.stop_all_motion(send_stop=self.connected)
+        super().hideEvent(event)
+
+    def focusOutEvent(self, event):
+        focus_now = W.QApplication.focusWidget()
+        if (self.held_keys or self.steering_x or self.throttle_y) and (focus_now is None or not self.isAncestorOf(focus_now)):
+            self.stop_all_motion(send_stop=self.connected)
+        super().focusOutEvent(event)
+
+    def changeEvent(self, event):
+        if event.type() in (C.QEvent.Type.ActivationChange, C.QEvent.Type.WindowStateChange):
+            win = self.window()
+            if (self.held_keys or self.steering_x or self.throttle_y) and (win is None or not win.isActiveWindow()):
+                self.stop_all_motion(send_stop=self.connected)
+        super().changeEvent(event)
 
     def keyPressEvent(self, event):
         if event.isAutoRepeat() or self.mode_box.currentIndex() != 2:
@@ -848,9 +897,28 @@ class RemoteBtPage(W.QWidget):
         )
 
     # ---------- HC-05 AT Builder & Direct UART Execution ----------
+    def _selected_at_baud(self) -> int:
+        val = self.at_baud_box.currentData()
+        if val is not None:
+            return int(val)
+        txt = self.at_baud_box.currentText().split("（", 1)[0].strip()
+        return int(txt)
+
+    def _ask_at(self, title: str, text: str) -> bool:
+        if self.confirm_at is not None:
+            return bool(self.confirm_at(title, text))
+        ans = W.QMessageBox.question(
+            self,
+            title,
+            text,
+            W.QMessageBox.StandardButton.Yes | W.QMessageBox.StandardButton.No,
+            W.QMessageBox.StandardButton.No,
+        )
+        return ans == W.QMessageBox.StandardButton.Yes
+
     def _refresh_at_previews(self):
         name = self.at_name_edit.text().strip() or "BlueCar"
-        baud = self.at_baud_box.currentText()
+        baud = self._selected_at_baud()
         stop = self.at_stop_box.currentIndex()
         par = self.at_parity_box.currentIndex()
         pin = self.at_pin_edit.text().strip() or "1234"
@@ -882,14 +950,48 @@ class RemoteBtPage(W.QWidget):
 
     def _apply_at_uart(self, copy_only=False):
         try:
-            cmd = AtCommandBuilder.set_uart(
-                int(self.at_baud_box.currentText()),
-                self.at_stop_box.currentIndex(),
-                self.at_parity_box.currentIndex(),
-            )
-            self.exec_at(cmd, copy_only=copy_only)
+            baud = self._selected_at_baud()
+            stop = self.at_stop_box.currentIndex()
+            parity = self.at_parity_box.currentIndex()
+            cmd = AtCommandBuilder.set_uart(baud, stop, parity)
         except ValueError as exc:
             self._log("校验拦截", str(exc))
+            return False
+
+        if baud == 5760:
+            ok = self._ask_at(
+                "HC-05 波特率安全确认",
+                "你选择了 5760 bps（兼容版说明书原文，疑似 57600 的笔误）。\n"
+                "若写入非标准速率，普通串口模式下将难以连接；如误写可按住 KEY 上电进入 38400 AT 模式后发送 AT+ORGL 恢复。\n\n"
+                "仍确认使用 5760 吗？",
+            )
+            if not ok:
+                self._log("校验拦截", "已取消非标准波特率 5760 操作")
+                return False
+
+        if copy_only or not (self.connected and self.link):
+            return self.exec_at(cmd, copy_only=True)
+
+        # Read back current module UART first before writing!
+        self._pending_uart_write = (cmd, (baud, stop, parity), monotonic() + 0.65)
+        self.link.send(AtCommandBuilder.with_crlf("AT+UART?").encode("utf-8"))
+        self._log("AT校验", f"写入前正在发送 AT+UART? 读取模块当前参数以对比 {baud},{stop},{parity}…")
+        return True
+
+    def _finish_uart_write(self, cmd: str, target_tuple: tuple[int, int, int], current):
+        tgt_str = f"{target_tuple[0]},{target_tuple[1]},{target_tuple[2]}"
+        if current == target_tuple:
+            self._log("AT跳过", f"模块当前 UART 已是 {tgt_str}，无需重复写入")
+            return
+        if current is not None:
+            cur_str = f"{current[0]},{current[1]},{current[2]}"
+            msg = f"模块当前 UART：{cur_str}\n即将写入 UART：{tgt_str}\n\n确认发送 {cmd}？（修改后需同步切换串口波特率）"
+        else:
+            msg = f"未能从串口读回当前 +UART 应答（模块可能未处于 38400 AT 模式）。\n\n是否仍确认写入 {cmd}？"
+        if self._ask_at("写入前参数对比确认", msg):
+            self.exec_at(cmd, copy_only=False)
+        else:
+            self._log("AT取消", f"已取消写入 {cmd}")
 
     def _apply_at_pin(self, copy_only=False):
         try:
@@ -937,6 +1039,9 @@ class RemoteBtPage(W.QWidget):
     def tick(self):
         if self.mode_box.currentIndex() == 2 and self.held_keys:
             self._update_held_axes()
+        elif self.connected and self.link and (self.steering_x != 0 or self.throttle_y != 0):
+            if monotonic() - self.last_drive_tx >= 0.10:
+                self._emit_drive(force=True)
 
         if self.link:
             batch, _ = self.link.take()
@@ -960,6 +1065,16 @@ class RemoteBtPage(W.QWidget):
                         clean_line = line.rstrip("\r")
                         if clean_line:
                             self._log("RX", clean_line)
+                            if self._pending_uart_write is not None and "+UART:" in clean_line.upper():
+                                try:
+                                    raw_vals = clean_line.split(":", 1)[1].split(",")[:3]
+                                    cur_tuple = tuple(int(v.strip()) for v in raw_vals)
+                                    if len(cur_tuple) == 3:
+                                        pending_cmd, target_tuple, _ = self._pending_uart_write
+                                        self._pending_uart_write = None
+                                        self._finish_uart_write(pending_cmd, target_tuple, cur_tuple)
+                                except ValueError:
+                                    pass
                 elif kind == "error":
                     self._log("异常", str(data))
                 elif kind == "closed":
@@ -968,6 +1083,11 @@ class RemoteBtPage(W.QWidget):
                     self._sync_conn_ui()
                     break
             self._update_status_bar()
+
+        if self._pending_uart_write is not None and monotonic() >= self._pending_uart_write[2]:
+            pending_cmd, target_tuple, _ = self._pending_uart_write
+            self._pending_uart_write = None
+            self._finish_uart_write(pending_cmd, target_tuple, None)
 
     def _update_status_bar(self):
         self.status_bar.setText(

@@ -7,7 +7,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
 
-COLORS = ("#1b62c7", "#008673", "#d47b12", "#8651b8")
+COLORS = ("#1b62c7", "#008673", "#d47b12", "#8651b8", "#c23b5a", "#2b8cbe", "#6a994e", "#7f5539")
 REF_COLORS = ("#b42e57", "#875a28", "#356a84", "#6e718a")
 
 class DivisionAxis(pg.AxisItem):
@@ -82,9 +82,9 @@ class Scope(pg.PlotWidget):
         self.trigger_guide.hide()
         self.cursors = []
         self.frozen = False
-        self.data = np.empty((0, 9))
-        self.names = ["目标值", "实际值", "输出", "误差"]
-        self.visible = [True] * 4
+        self.data = np.empty((0, 13))
+        self.names = ["目标值", "实际值", "输出", "误差", "CH5", "CH6", "CH7", "CH8"]
+        self.visible = [True] * 8
         self.width_s = 10
         self.fixed_y = None
         self.include_zero = True
@@ -355,7 +355,7 @@ class Scope(pg.PlotWidget):
         self.ghost_label.hide()
         self.selection.hide()
         self.press = None
-        self.data = np.empty((0, 9))
+        self.data = np.empty((0, 13))
         for curve in self.curves:
             curve.clear()
         for item in (*self.markers, *self.cursors):

@@ -43,6 +43,11 @@ class Workbench(C.QObject):
 
     def eventFilter(self,obj,event):
         w = self.w
+        if event.type() in (C.QEvent.Type.ApplicationDeactivate, C.QEvent.Type.WindowDeactivate):
+            if obj is w or obj is W.QApplication.instance():
+                rp = getattr(w, "remote_page", None)
+                if rp is not None and (rp.held_keys or rp.steering_x or rp.throttle_y):
+                    rp.stop_all_motion(send_stop=rp.connected)
         if event.type()==C.QEvent.Type.KeyPress and not event.isAutoRepeat() and w.isVisible():
             key = event.key()
             if key==C.Qt.Key.Key_Escape and (w.connected or getattr(getattr(w, "remote_page", None), "connected", False)):

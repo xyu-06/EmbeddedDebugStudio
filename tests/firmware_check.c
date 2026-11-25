@@ -67,6 +67,14 @@ int main(void)
     send_line("@SPD.GET");
     assert(!strcmp(reply,"@PARAM:SPD.KP=-12.3456,SPD.KI=0.0025,SPD.KD=0.75,SPD.TGT=0\n"));
 
+    /* Atomic SET updates all four loop parameters at once; bad value leaves all untouched. */
+    send_line("@SPD.SET=1.5,2.5,0.25,80");
+    assert(!strcmp(reply,"@ACK:SPD.SET=1.5,2.5,0.25,80\n"));
+    assert(fabsf(pid_loops[PID_SPD].kp - 1.5f) < 1e-6f && fabsf(pid_loops[PID_SPD].target - 80.0f) < 1e-6f);
+    send_line("@SPD.SET=9,9,bad,9");
+    assert(!strcmp(reply,"@ERR:value out of range\n"));
+    assert(fabsf(pid_loops[PID_SPD].kp - 1.5f) < 1e-6f && fabsf(pid_loops[PID_SPD].kd - 0.25f) < 1e-6f);
+
     PID_WatchdogTick(0xffffffc8u);
     send_line("@PING");
     PID_WatchdogTick(0x1bbu);
@@ -92,5 +100,8 @@ int main(void)
     const float two[] = {-3, 4.5f};
     PID_ReportValues(two, 2);
     assert(!strcmp(reply,"-3,4.5\n"));
+    const float six[] = {1, 2, 3, 4, 5.5f, -6.25f};
+    PID_ReportValues(six, 6);
+    assert(!strcmp(reply,"1,2,3,4,5.5,-6.25\n"));
     return 0;
 }

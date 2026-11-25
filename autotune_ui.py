@@ -4,7 +4,7 @@ import numpy as np
 from PySide6 import QtCore as C, QtWidgets as W
 
 from autotune import MODES, STYLES, STRATEGIES, AutoTuner
-from engine import KEYS, LIMIT
+from engine import KEYS, LIMIT, MAX_CHANNELS
 from layout_ui import combo, number, check
 
 
@@ -45,10 +45,10 @@ class AutoTuneController:
         return self.state != self.IDLE
 
     def detect_channels(self):
-        """Return (actual_channel_index_0_to_3, optional_output_channel_index_0_to_3)."""
+        """Return (actual_channel_index, optional_output_channel_index)."""
         w = self.ui
         actual = w.actual_ch.currentData()
-        if actual is None or actual >= 4:
+        if actual is None or actual >= MAX_CHANNELS:
             if w.sim or w.count >= 4:
                 actual = 1
             elif w.count >= 1:
@@ -60,7 +60,7 @@ class AutoTuneController:
             output = 2 if actual != 2 else None
         elif w.count == 2:
             other = 1 - actual
-            names = [n.lower() for n in w.names()]
+            names = [n.lower() for n in w.names()[:w.count]]
             if w.right_channel == other or any(tag in names[other] for tag in ("pwm", "输出", "out", "duty", "占空")):
                 output = other
         return actual, output
@@ -102,15 +102,21 @@ class AutoTuneController:
             base_spin.setValue(0.0 if abs(default_tgt) > 1e-3 else -10.0)
 
         default_mode = 2 if (w.sim and w.sim.pendulum) else 1 if w.sim and w.sim.model == 1 else self.cfg["mode"]
-        default_strategy = 1 if (w.sim and w.sim.pendulum) else self.cfg["strategy"]
+        is_ang = group == "ANG"
+        default_strategy = 1 if (is_ang or (w.sim and w.sim.pendulum)) else self.cfg["strategy"]
         mode_box = combo(list(MODES), default_mode)
         style_box = combo(list(STYLES), self.cfg["style"])
         strat_box = combo(list(STRATEGIES), default_strategy)
+        if is_ang:
+            strat_box.setCurrentIndex(1)
+            strat_box.setEnabled(False)
+            strat_box.setToolTip("直立环 (ANG) 属于开环不稳定对象，为防止倒地飞车已强制锁定为局部微调")
         step_spin = number(self.cfg["step_s"], 0.5, 30.0, 0.5, 2)
         rounds_spin = W.QSpinBox()
         rounds_spin.setRange(3, 25)
         rounds_spin.setValue(int(self.cfg["rounds"]))
         hold_chk = check("整定完成后保持在目标值运行", self.cfg["hold"])
+        safety_chk = check("我已确认：车轮已架空离地或已加装机械限位，且知晓随时可按 Esc 急停", False)
 
         form.addRow("目标值（如控速 100）", target_spin)
         form.addRow("起始基准值", base_spin)
@@ -120,17 +126,27 @@ class AutoTuneController:
         form.addRow("单轮观察时长 s", step_spin)
         form.addRow("最大寻优轮数", rounds_spin)
         form.addRow(hold_chk)
+        form.addRow(safety_chk)
+
+        if is_ang:
+            ang_warn = W.QLabel("⚠ 当前选中直立环 (ANG)：已强制锁定“从当前参数局部微调”（单轮变化 ≤ ±35%），请先确保现有初始 KP/KD 能稳住车身且目标值仅设小幅阶跃（如 0°→3°）。")
+            ang_warn.setWordWrap(True)
+            ang_warn.setStyleSheet("color:#a22d38;font-size:9pt;font-weight:600;padding-top:2px;")
+            outer.addWidget(ang_warn)
 
         tip = W.QLabel(
             "提示：电机控速建议选“PI 整定 + 均衡推荐”；二阶位置/角度选“PID 整定”；"
-            "平衡车直立环等不稳定对象请选“从当前参数局部微调”并做好限位保护。途中随时可按 Esc 急停。"
+            "若整定失败或被中断，软件会自动将设备恢复到整定前的原始参数。途中随时可按 Esc 急停。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#5b7083;font-size:9pt;padding-top:4px;")
         outer.addWidget(tip)
 
         buttons = W.QDialogButtonBox(W.QDialogButtonBox.StandardButton.Ok | W.QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(W.QDialogButtonBox.StandardButton.Ok).setText("开始自动整定")
+        ok_btn = buttons.button(W.QDialogButtonBox.StandardButton.Ok)
+        ok_btn.setText("开始自动整定")
+        ok_btn.setEnabled(False)
+        safety_chk.toggled.connect(ok_btn.setEnabled)
         buttons.button(W.QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
@@ -166,6 +182,9 @@ class AutoTuneController:
             w.feedback("请先连接串口或打开仿真", True)
             return False
         group = w.selected()
+        if group == "ANG" and strategy == 0:
+            w.feedback("直立环 (ANG) 属于开环不稳定对象，仅允许使用【从当前参数局部微调】策略", True)
+            return False
         tgt_lo, tgt_hi, _ = w.rules[group]["TGT"]
         if not (tgt_lo <= base <= tgt_hi and tgt_lo <= target <= tgt_hi):
             w.feedback(f"起始基准与目标值必须在 {group}.TGT 允许范围 {tgt_lo:g} 至 {tgt_hi:g} 内", True)
@@ -214,6 +233,38 @@ class AutoTuneController:
         prefix = "@" if self.ui.address.currentIndex() else f"@{self.group}."
         return f"{prefix}{key}" if value is None else f"{prefix}{key}={value:.4f}"
 
+    def _build_param_cmds(self, kp, ki, kd, tgt, reset=True):
+        """Prefer atomic @<GRP>.SET=kp,ki,kd,tgt when firmware advertises #CAP:SET."""
+        if getattr(self.ui, "set_capable", False):
+            prefix = "@" if self.ui.address.currentIndex() else f"@{self.group}."
+            cmds = [f"{prefix}SET={kp:.4f},{ki:.4f},{kd:.4f},{tgt:.4f}"]
+            if reset:
+                cmds.append(self._cmd("RST"))
+            return cmds
+        cmds = [self._cmd("KP", kp), self._cmd("KI", ki), self._cmd("KD", kd)]
+        if reset:
+            cmds.append(self._cmd("RST"))
+        cmds.append(self._cmd("TGT", tgt))
+        return cmds
+
+    def _restore_original(self, reason, send_to_device=True):
+        """Always roll back UI and device to saved_before when no verified winner exists."""
+        w = self.ui
+        self.state = self.IDLE
+        if self.saved_before:
+            for k in KEYS:
+                w.drafts[self.group][k] = self.saved_before[k]
+            w.load_fields()
+            if send_to_device and w.connected:
+                p = self.saved_before
+                cmds = self._build_param_cmds(p["KP"], p["KI"], p["KD"], p["TGT"], reset=True)
+                w.commands.submit(cmds, quiet=True)
+        self.sync_ui()
+        msg = reason or "已中止整定并恢复整定前参数"
+        self._set_status(msg)
+        w.log("系统", "自动整定  " + msg)
+        w.feedback(msg, True)
+
     def sync_ui(self):
         w = self.ui
         running = self.active
@@ -245,23 +296,38 @@ class AutoTuneController:
         """Called when device reports #STOP:fall / #STOP:heartbeat or user hits emergency stop."""
         if not self.active:
             return
+        w = self.ui
         if reason == "急停":
-            self.state = self.IDLE
-            self._set_status("已响应急停，自动整定中止", self._best_brief())
-            self.sync_ui()
+            self._restore_original("已响应急停 · 已恢复整定前参数至设备", send_to_device=w.connected)
             return
         if self.state in (self.OBSERVE, self.SETTLE_BASE, self.WAIT_STEP_ACK, self.WAIT_BASE_ACK) and self.current_cand:
             self.engine.record_result([], [], aborted_reason=reason)
         if self.engine and self.engine.best_params:
             p = self.engine.best_params
+            base_tgt = self.engine.base
+            if self.saved_before:
+                entry = {}
+                for k, old_v in self.saved_before.items():
+                    new_v = base_tgt if k == "TGT" else p[k]
+                    if abs(new_v - old_v) > 1e-5:
+                        addr = f"{self.group}.{k}"
+                        wire_key = k if w.address.currentIndex() else addr
+                        entry[addr] = (wire_key, old_v)
+                if entry:
+                    w.commands.batch += 1
+                    w.undo_history.append((w.commands.batch, entry))
             for k in ("KP", "KI", "KD"):
-                self.ui.drafts[self.group][k] = p[k]
-            self.ui.load_fields()
+                w.drafts[self.group][k] = p[k]
+            w.drafts[self.group]["TGT"] = base_tgt
+            w.load_fields()
             self.state = self.IDLE
-            self._set_status(f"因“{reason}”中止 · 已在输入框载入安全最优组", self._best_brief())
             self.sync_ui()
+            if w.connected:
+                w.commands.submit(self._build_param_cmds(p["KP"], p["KI"], p["KD"], base_tgt, reset=True), quiet=True)
+            self._set_status(f"因“{reason}”中止 · 已将安全最优组同步写回设备", self._best_brief())
+            w.log("系统", f"自动整定因“{reason}”中止，已将安全最优组写回设备（未启动电机）")
         else:
-            self.stop(f"自动整定中止：{reason}", apply_best=False)
+            self._restore_original(f"因“{reason}”中止（无可用最优组）· 已恢复整定前参数", send_to_device=w.connected)
 
     def stop(self, message="", apply_best=True):
         w = self.ui
@@ -271,11 +337,7 @@ class AutoTuneController:
         if has_best:
             self._apply_winner(message or "已停止并应用最优参数")
             return
-        self.state = self.IDLE
-        self.sync_ui()
-        self._set_status(message or "自动整定已停止")
-        if message:
-            w.log("系统", "自动整定  " + message)
+        self._restore_original(message or "自动整定已停止，已恢复整定前参数", send_to_device=w.connected)
 
     def _apply_winner(self, reason):
         w = self.ui
@@ -299,13 +361,7 @@ class AutoTuneController:
         w.drafts[self.group]["TGT"] = final_tgt
         w.load_fields()
 
-        cmds = [
-            self._cmd("KP", best["KP"]),
-            self._cmd("KI", best["KI"]),
-            self._cmd("KD", best["KD"]),
-            self._cmd("RST"),
-            self._cmd("TGT", final_tgt),
-        ]
+        cmds = self._build_param_cmds(best["KP"], best["KI"], best["KD"], final_tgt, reset=True)
         self.state = self.IDLE
         self.sync_ui()
         summary = self.engine.summary_text()
@@ -343,13 +399,7 @@ class AutoTuneController:
             for k in ("KP", "KI", "KD"):
                 with C.QSignalBlocker(w.fields[k]):
                     w.fields[k].setValue(cand[k])
-            cmds = [
-                self._cmd("KP", cand["KP"]),
-                self._cmd("KI", cand["KI"]),
-                self._cmd("KD", cand["KD"]),
-                self._cmd("RST"),
-                self._cmd("TGT", self.engine.base),
-            ]
+            cmds = self._build_param_cmds(cand["KP"], cand["KI"], cand["KD"], self.engine.base, reset=True)
             if not w.commands.submit(cmds, quiet=True):
                 self.stop("命令队列已满，整定中止", apply_best=True)
                 return

@@ -70,22 +70,34 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Continue'
+          python -m pip install python-docx Pillow
+          if (Test-Path docs/build_manual.py) {
+            python docs/build_manual.py release
+            $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+            if (-not (Test-Path $edge)) { $edge = "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe" }
+            if (Test-Path $edge) {
+              $htmlUri = [System.Uri]::new((Resolve-Path "release/_manual_print.html").Path).AbsoluteUri
+              & $edge --headless --disable-gpu "--print-to-pdf=$PWD\release\EmbeddedDebugStudio-${{ github.ref_name }}-Manual.pdf" $htmlUri
+            }
+            Remove-Item release/_manual_print.html -ErrorAction SilentlyContinue
+          }
           $repo = "${{ github.repository }}"
           $tag = "${{ github.ref_name }}"
           Copy-Item release/PIDTuner.exe "release/EmbeddedDebugStudio-$tag-win64.exe" -Force
           $files = @("release/PIDTuner.exe", "release/EmbeddedDebugStudio-$tag-win64.exe")
+          Get-ChildItem release -File | Where-Object { $_.Extension -in @('.pdf', '.docx') } | ForEach-Object { $files += $_.FullName }
           if (Test-Path docs) {
             Get-ChildItem docs -File | Where-Object { $_.Extension -in @('.pdf', '.docx') } | ForEach-Object { $files += $_.FullName }
           }
           gh release view $tag -R $repo *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag @files -R $repo --title "$tag" --generate-notes
+            gh release create $tag @files -R $repo --title "$tag" --generate-notes --latest
           } else {
             gh release upload $tag @files -R $repo --clobber
           }
 
   publish-all-tags:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     strategy:
       fail-fast: false

@@ -31,10 +31,25 @@ class SerialLink(Thread):
         self.queued_bytes = 0
         self.dropped = 0
         self._modem_lines = None
+        self._final_tx = None
+        self._final_done = Event()
 
     def set_modem_lines(self, dtr=None, rts=None):
         with self.lock:
             self._modem_lines = (dtr, rts)
+
+    def flush_and_close(self, data: bytes = b"", timeout=0.25):
+        """Queue urgent final safety bytes (e.g. @STOP / J,0,0), stop queued writes,
+        wait briefly for transmission to flush to OS driver, and close the worker."""
+        with self.lock:
+            self.writes.clear()
+            self.ping_due = False
+            self.heartbeat = False
+            if data:
+                self._final_tx = data
+        self.closed.set()
+        if data and self.is_alive():
+            self._final_done.wait(timeout)
 
     def send(self, data, urgent=False):
         with self.lock:
@@ -115,7 +130,17 @@ class SerialLink(Thread):
                     data = port.read(min(32768, port.in_waiting or 1))
                     if data:
                         self.event("rx", data)
+                with self.lock:
+                    final_tx, self._final_tx = self._final_tx, None
+                if final_tx:
+                    try:
+                        port.write(final_tx)
+                        port.flush()
+                        self.event("tx", final_tx)
+                    finally:
+                        self._final_done.set()
         except (OSError, ValueError, serial.SerialException) as exc:
             self.event("error", str(exc))
         finally:
+            self._final_done.set()
             self.event("closed", None)

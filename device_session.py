@@ -46,22 +46,22 @@ class DeviceSession(CommandQueue):
         for command in commands:
             if "=" not in command:
                 continue
-            name,raw = command.lstrip("@").split("=",1)
-            g,k = name.split(".",1) if "." in name else ("ANG",name)
-            if g not in LOOPS or k not in KEYS:
-                continue
-            low,high,threshold = self.ui.rules[g][k]
             try:
-                value = float(raw)
+                updates = parameter_pairs(command.lstrip("@"), group)
             except ValueError:
-                value = float("nan")
-            if not low<=value<=high:
-                self.ui.feedback(f"{g}.{k} 允许范围为 {low:g} 至 {high:g}",True)
-                return
-            previous = self.ui.confirmed.get(g+"."+k)
-            if not quiet and abs(value-(previous if previous is not None else 0.)) >= threshold:
-                before = "未读回" if previous is None else f"{previous:g}"
-                changes.append(f"{g}.{k}　{before} → {value:g}")
+                updates = {}
+            if not updates:
+                continue
+            for full_key, value in updates.items():
+                g, k = full_key.split(".", 1)
+                low, high, threshold = self.ui.rules[g][k]
+                if not low <= value <= high:
+                    self.ui.feedback(f"{g}.{k} 允许范围为 {low:g} 至 {high:g}", True)
+                    return
+                previous = self.ui.confirmed.get(full_key)
+                if not quiet and abs(value - (previous if previous is not None else 0.)) >= threshold:
+                    before = "未读回" if previous is None else f"{previous:g}"
+                    changes.append(f"{g}.{k}　{before} → {value:g}")
         if changes and not self.confirm(changes):
             return
         if not self.ui.connected or not self.append(commands,group,urgent,quiet):
@@ -119,6 +119,8 @@ class DeviceSession(CommandQueue):
         if cmd and "." not in cmd.partition("=")[0]:
             group = "ANG"
         if kind == "ERR":
+            if (".SET=" in cmd or cmd.startswith("@SET=")) and any(tag in payload.lower() for tag in ("unknown", "expected")):
+                self.ui.set_capable = False
             if "only spd" in payload.lower() and self.ui.selected() != "SPD":
                 was_get = cmd.endswith("GET")
                 self.clear()
@@ -187,7 +189,7 @@ class DeviceSession(CommandQueue):
                     batch = self.active_batch
                     if not self.ui.undo_history or self.ui.undo_history[-1][0]!=batch:
                         self.ui.undo_history.append((batch,{}))
-                    wire_key = cmd[1:].split("=",1)[0]
+                    wire_key = addr if "." in cmd.partition("=")[0] else addr.split(".", 1)[1]
                     self.ui.undo_history[-1][1].setdefault(addr,(wire_key,old))
                 self.ui.field_errors.discard(addr)
             self.ui.confirmed.update(updates)

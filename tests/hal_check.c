@@ -38,6 +38,7 @@ int main(void)
     /* The wire is stalled. The frame remains intact, and commands precede telemetry. */
     expect_frame("#NAMES:target,actual,output,error\n");
     expect_frame("#CAP:PING\n");
+    expect_frame("#CAP:SET\n");
     expect_frame("@ACK:RUN\n");
     tick = 500; PID_DemoPoll();
     assert(!pid_running);

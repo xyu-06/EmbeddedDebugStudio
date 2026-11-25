@@ -2,9 +2,10 @@ from functools import partial
 
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 
-from engine import DEFAULTS, KEYS, LIMIT, LOOPS, MODELS
+from engine import DEFAULTS, KEYS, LIMIT, LOOPS, MAX_CHANNELS, MODELS
 from generator import SHAPES
 from scope import COLORS, REF_COLORS, Scope
+from version import APP_TITLE_ZH, APP_VERSION
 
 
 def button(text, fn, role=""):
@@ -120,7 +121,7 @@ def card(side, title, opened):
 
 
 def build(w):
-    w.setWindowTitle("嵌入式综合调试助手 · PID / 串口 / IMU / 蓝牙遥控")
+    w.setWindowTitle(f"{APP_TITLE_ZH} v{APP_VERSION} · PID / 串口 / IMU / 蓝牙遥控")
     w.resize(1280, 820)
     w.setMinimumSize(920, 590)
 
@@ -219,8 +220,11 @@ def build(w):
     w.baud.setEditable(True)
     f.addRow("波特率", w.baud)
     w.model = combo(list(MODELS))
-    w.model.setToolTip("倒立摆：不加控制会倒下，D 项作用于角速度（相当于陀螺仪），倾角超过 45° 自动停机")
+    w.model.setToolTip("倒立摆：含 25 ms 执行器滞后、传感器底噪，D 项作用于角速度，倾角超过 45° 自动停机")
     f.addRow("仿真对象", w.model)
+    w.nudge_btn = button("👋 推一下（施加倾角扰动）", w.nudge_pendulum)
+    w.nudge_btn.setToolTip("向倒立摆仿真模型施加 ±22°/s 外力冲击，测试抗扰与自恢复能力")
+    f.addRow(w.nudge_btn)
     w.auto_reconnect = check("断线后自动重连（只读回参数，不自动启动）", True)
     f.addRow(w.auto_reconnect)
     w.serial_form = f
@@ -233,12 +237,12 @@ def build(w):
     for label, widget in [("数据位",w.bits),("校验",w.parity),("停止位",w.stops),("流控",w.flow),
                           ("时间来源",w.time_mode),("上报频率 Hz",w.rate)]:
         f.addRow(label,widget)
-    f.addRow(W.QLabel("文本 A / FireWater　·　每行 1–4 个数值"))
+    f.addRow(W.QLabel(f"文本 A / FireWater　·　每行 1–{MAX_CHANNELS} 个数值"))
 
     f = w.channel_form = section("通道", True)
     w.enabled_ch, w.name_edits = [], []
     w.color_buttons = []
-    for i, color in enumerate(COLORS):
+    for i, color in enumerate(COLORS[:MAX_CHANNELS]):
         enabled = W.QPushButton()
         enabled.setCheckable(True)
         enabled.setChecked(True)
@@ -263,7 +267,7 @@ def build(w):
         value.setSizePolicy(W.QSizePolicy.Policy.Fixed, W.QSizePolicy.Policy.Fixed)
         value.setFixedWidth(88)
         remove = button("移除", partial(w.remove_reference, i))
-        tag = color_button(w,4+i,"固定")
+        tag = color_button(w, MAX_CHANNELS + i, "固定")
         editors = W.QWidget()
         editors.setLayout(row(name,value,remove))
         f.addRow(tag,editors)

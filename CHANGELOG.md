@@ -1,5 +1,31 @@
 # 嵌入式综合调试助手（EmbeddedDebugStudio）更新记录
 
+## v1.7（2026-11-25）
+
+针对 v1.6 工程审计报告完成全部 **12 项协议一致性、控制安全性与多通道扩展加固**：
+
+### 安全加固与协议一致性
+- **自动整定全链路安全保护**（`autotune.py`、`autotune_ui.py`、`main.py`）：
+  - **无赢家退出强制回滚下位机参数**：凡整定中途失败、采样超时、设备异常停机且尚无有效最优组、或中途断开串口，均自动把整定前的原 `KP/KI/KD/TGT` 写回下位机与界面，绝不将第 N 轮试探参数留在设备上；
+  - **直立环（`ANG`）强约束与安全确认**：选中 `ANG` 组时强制锁定“从当前参数局部微调”策略（对话框与 `start()` 双重校验），局部模式拒绝全零 `KP/KI`，单轮变化比例上限收紧至 `±35%`（总体限制 `[0.4x, 2.5x]`），开始按钮须勾选“车轮已架空离地或已加装机械限位”后才解锁。
+- **原子组参数写入命令 `@<GRP>.SET=kp,ki,kd,tgt`**（`firmware_example/pid_link.c`、`engine.py`、`device_session.py`、`autotune_ui.py`、`main.py`）：
+  - 下位机 `@RUN` 新增上报 `#CAP:SET`，上位机自动识别并在“发送本组”和自动整定切参时优先使用单条 `@<GRP>.SET=kp,ki,kd,tgt` 一次生效（全 4 项校验通过才更新控制环），消除分条发送导致新旧参数短暂混用的风险；旧固件自动兼容回退分条下发。
+- **断开连接 / 串口让渡前先冲洗急停报文**（`transport.py`、`main.py`、`remote_studio.py`）：
+  - 新增 `SerialLink.flush_and_close()`，PID 页 `disconnect()` / `release_port()` 与遥控页 `disconnect_port()` 在关闭串口句柄前均先写入 `@STOP`（及整定回滚参数）或 `J,0,0` + `S` 并 `flush()` 确认发出。
+- **遥控防卡死与摇杆 100 ms 心跳保活**（`remote_studio.py`、`workbench.py`）：
+  - 捕获 `hideEvent`、`focusOutEvent`、`ActivationChange`/`WindowStateChange` 与全局 `ApplicationDeactivate`/`WindowDeactivate`，弹窗或切走窗口失焦时立即清零 `held_keys` 并急发 `J,0,0`；
+  - 鼠标拖拽非零摇杆保持不动时，`tick()` 每 `100 ms` 自动重发当前控制指令充当心跳保活（配合车端 0.5 s 无指令自动停车）。
+- **HC-05 波特率列表修复与写前对比校验**（`remote_studio.py`）：
+  - 补全标准波特率 **`57600`**，将兼容手册原文 `5760` 明确标注为 **`5760（说明书原文，疑似笔误）`** 并在选中写入时弹窗二次确认；串口已连接执行 `AT+UART=` 写入前先下发 `AT+UART?` 读回模块当前配置对比确认，避免误改失联。
+- **仿真器与固件心跳完全对齐**（`engine.py`）：移除仿真器延迟布防开关 `armed`，与 STM32 `pid_link.c` 保持一致：`@RUN` 后若未持续收到 `@PING` 心跳，满 `0.5 s` 即自动 `#STOP:heartbeat` 停机。
+
+### 多通道扩展、倒立摆扰动测试与代码清理
+- **全链路扩展至 8 通道实时示波器 + 4 参考线**（`pid_link.c/.h`、`engine.py`、`scope.py`、`storage.py`、`layout_ui.py`、`configuration.py`、`diagnostics.py`、`main.py`）：协议、示波器、换算标定与 CSV 导出导入均支持 1～8 通道（`<= 4` 通道导出仍保持 21 列向后兼容）。
+- **倒立摆仿真物理增强与 `👋 推一下` 扰动按钮**（`engine.py`、`layout_ui.py`、`main.py`）：新增 `25 ms` 一阶执行器滞后与姿态测量噪声，新增 `@NUDGE` 指令与倒立摆仿真工具栏 `👋 推一下` 按钮以测试抗扰动恢复能力。
+- **统一版本常量与死代码清理**（`version.py`、`main.py`）：新增 `version.py` 统一管理版本号，删除 `main.py` 中已废弃的 `#ERROR:float printf` 死代码分支。
+
+---
+
 ## v1.6（2026-11-25）
 
 联动整合 Android 端 [BlueSerialStudio](https://github.com/xyu-06/BlueSerialStudio) 协议生态，升级为四大工作台一体机并同步至云端仓库：
