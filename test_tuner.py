@@ -17,6 +17,7 @@ from diagnostics import RuntimeMonitor, analyze_frame_timing, dominant_fft, form
 from engine import Lines, Simulator, match_ack, step_metrics
 from generator import TargetGenerator
 from main import Window
+from remote_studio import AtCommandBuilder, button_axis, format_drive_command, held_speed, mix_wheels
 from serial_studio import append_checksum, crc16_modbus
 from storage import History, load_csv
 from transport import SerialLink
@@ -917,8 +918,9 @@ class GuiChecks(unittest.TestCase):
             w.timer.stop()
             w.serial_page.poll_timer.stop()
             w.imu_page.timer.stop()
+            w.remote_page.timer.stop()
 
-            # Dynamic 4th module plug-in test (e.g. future Camera module)
+            # Dynamic 5th module plug-in test (e.g. future Camera module)
             class DummyCameraPage(W.QWidget):
                 module_id = "camera"
                 module_title = "📷 摄像头调试"
@@ -931,8 +933,8 @@ class GuiChecks(unittest.TestCase):
 
             cam = DummyCameraPage(w)
             w.register_module(cam.module_title, cam)
-            self.assertEqual(w.module_stack.count(), 4)
-            w.switch_module(3)
+            self.assertEqual(w.module_stack.count(), 5)
+            w.switch_module(4)
             self.assertIs(w.module_stack.currentWidget(), cam)
 
             # Open loop:// on SerialAssistantPage
@@ -974,6 +976,63 @@ class GuiChecks(unittest.TestCase):
             self.assertIsNone(imu.active_port())
             self.assertEqual(w.active_port(), "loop://")
             w.release_port()
+            w.close()
+
+    def test_blueserial_remote_and_hc05_at_toolbox(self):
+        # 1) BlueSerialStudio protocol & AT command parity checks
+        self.assertEqual(AtCommandBuilder.with_crlf(AtCommandBuilder.set_name("BlueCar")), "AT+NAME=BlueCar\r\n")
+        self.assertEqual(AtCommandBuilder.set_uart(5760, 0, 0), "AT+UART=5760,0,0")
+        self.assertEqual(AtCommandBuilder.set_uart(115200, 1, 2), "AT+UART=115200,1,2")
+        self.assertEqual(AtCommandBuilder.set_pin("1234"), "AT+PSWD=1234")
+        self.assertEqual(AtCommandBuilder.set_role(0), "AT+ROLE=0")
+        with self.assertRaises(ValueError):
+            AtCommandBuilder.set_pin("12,34")
+        with self.assertRaises(ValueError):
+            AtCommandBuilder.set_uart(57600, 0, 0)  # verbatim manual list check
+
+        self.assertEqual(held_speed(0), 18)
+        self.assertEqual(held_speed(1600), 100)
+        self.assertEqual(button_axis(True, 0, True, 100, 500), 0)
+        self.assertEqual(mix_wheels(0, 80), (80, 80))
+        self.assertEqual(mix_wheels(50, 80), (80, 40))
+        self.assertEqual(mix_wheels(60, 0), (60, -60))
+        self.assertEqual(format_drive_command("J,{x},{y}", -35, 90), "J,-35,90")
+
+        # 2) Loopback TX/RX & auto-stop on tab switch
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "settings.ini")
+            w.timer.stop()
+            w.serial_page.poll_timer.stop()
+            w.imu_page.timer.stop()
+            rp = w.remote_page
+            rp.timer.stop()
+            w.switch_module(3)
+            rp.port_box.setCurrentText("loop://")
+            rp.toggle_port()
+            deadline = time.monotonic() + 1.5
+            while not rp.connected and time.monotonic() < deadline:
+                rp.tick()
+                time.sleep(0.01)
+            self.assertTrue(rp.connected)
+
+            rp.exec_at("AT+VERSION?")
+            rp._on_single_joy(40, 80, False)
+            deadline = time.monotonic() + 1.0
+            while rp.rx_bytes < len(b"AT+VERSION?\r\nJ,40,80\n") and time.monotonic() < deadline:
+                rp.tick()
+                time.sleep(0.01)
+            self.assertIn("AT+VERSION?", rp.console.toPlainText())
+            self.assertIn("J,40,80", rp.console.toPlainText())
+
+            # Switching away from remote tab automatically zeroes joystick & sends J,0,0
+            w.switch_module(0)
+            self.assertEqual((rp.steering_x, rp.throttle_y), (0, 0))
+            deadline = time.monotonic() + 1.0
+            while "J,0,0" not in rp.console.toPlainText() and time.monotonic() < deadline:
+                rp.tick()
+                time.sleep(0.01)
+            self.assertIn("J,0,0", rp.console.toPlainText())
+            rp.release_port()
             w.close()
 
 

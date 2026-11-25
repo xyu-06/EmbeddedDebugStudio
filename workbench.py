@@ -45,11 +45,14 @@ class Workbench(C.QObject):
         w = self.w
         if event.type()==C.QEvent.Type.KeyPress and not event.isAutoRepeat() and w.isVisible():
             key = event.key()
-            if key==C.Qt.Key.Key_Escape and w.connected:
+            if key==C.Qt.Key.Key_Escape and (w.connected or getattr(getattr(w, "remote_page", None), "connected", False)):
                 modal = W.QApplication.activeModalWidget()
                 if isinstance(modal,W.QDialog):
                     modal.reject()
-                w.stop_device()
+                if w.connected:
+                    w.stop_device()
+                if getattr(w, "remote_page", None) is not None and w.remote_page.connected:
+                    w.remote_page.emergency_stop()
                 return True
             if W.QApplication.activeModalWidget() or not w.isActiveWindow():
                 return False

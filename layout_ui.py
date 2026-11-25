@@ -120,7 +120,7 @@ def card(side, title, opened):
 
 
 def build(w):
-    w.setWindowTitle("嵌入式综合调试助手 · PID / 串口 / IMU")
+    w.setWindowTitle("嵌入式综合调试助手 · PID / 串口 / IMU / 蓝牙遥控")
     w.resize(1280, 820)
     w.setMinimumSize(920, 590)
 
@@ -525,10 +525,10 @@ QToolButton#section {border:none;padding:7px 6px;text-align:left;font-weight:600
 QPushButton,QComboBox,QLineEdit,QDoubleSpinBox {border:1px solid #c6d0da;border-radius:4px;background:white;padding:3px 5px;min-height:18px;}
 QPushButton:hover {background:#eaf1fa;border-color:#8daaca;}
 QPushButton:pressed {background:#d5e5f7;}
-QPushButton#primary {background:#225fc1;color:white;border:1px solid #225fc1;font-weight:600;padding:4px 12px;}
-QPushButton#accent {background:#197a63;color:white;border:1px solid #197a63;font-weight:600;padding:4px 10px;}
-QPushButton#accent:hover {background:#146652;border-color:#146652;}
-QPushButton#danger {background:#ba333b;color:white;border:1px solid #ba333b;font-weight:600;padding:4px 18px;}
+QPushButton#primary,QFrame#card QPushButton#primary {background:#225fc1;color:white;border:1px solid #225fc1;font-weight:600;padding:4px 12px;}
+QPushButton#accent,QFrame#card QPushButton#accent {background:#197a63;color:white;border:1px solid #197a63;font-weight:600;padding:4px 10px;}
+QPushButton#accent:hover,QFrame#card QPushButton#accent:hover {background:#146652;border-color:#146652;}
+QPushButton#danger,QFrame#card QPushButton#danger {background:#ba333b;color:white;border:1px solid #ba333b;font-weight:600;padding:4px 18px;}
 QPushButton:disabled,QWidget:disabled {color:#929ba5;}
 QPlainTextEdit {background:white;border:1px solid #d5dce3;font:10pt 'Consolas','Microsoft YaHei UI';}
 QLabel#measure,QLabel#status {padding:4px 10px;color:#52687b;font-size:9pt;}

@@ -22,6 +22,7 @@ from engine import DEFAULTS, KEYS, LIMIT, LOOPS, Lines, Simulator, step_metrics
 from generator import SHAPES, TargetGenerator
 from imu_studio import ImuStudioPage
 from layout_ui import STYLE, build, number
+from remote_studio import RemoteBtPage
 from scope import COLORS, REF_COLORS
 from serial_studio import SerialAssistantPage
 from storage import History, PARAM_COLS, csv_header, csv_row, load_csv
@@ -94,9 +95,11 @@ class Window(W.QMainWindow):
         self.module_group.setExclusive(True)
         self.serial_page = SerialAssistantPage(self)
         self.imu_page = ImuStudioPage(self)
+        self.remote_page = RemoteBtPage(self)
         self.register_module(self.module_title, self.pid_page, host_owned=True)
         self.register_module(self.serial_page.module_title, self.serial_page)
         self.register_module(self.imu_page.module_title, self.imu_page)
+        self.register_module(self.remote_page.module_title, self.remote_page)
         self.dark_action.toggled.connect(self.dark.setChecked)
         self.refresh_ports()
         self.restore()
@@ -180,6 +183,9 @@ class Window(W.QMainWindow):
     def switch_module(self, index: int):
         if not (0 <= index < self.module_stack.count()):
             return
+        prev_idx = self.module_stack.currentIndex()
+        if prev_idx != index and hasattr(self, "remote_page") and self.module_stack.widget(prev_idx) is self.remote_page:
+            self.remote_page.stop_all_motion(send_stop=self.remote_page.connected)
         self.module_stack.setCurrentIndex(index)
         for i, (_, tab, _) in enumerate(self.module_tabs):
             with C.QSignalBlocker(tab):
@@ -252,9 +258,9 @@ class Window(W.QMainWindow):
             elif sim_on:
                 active_notes.append(f"{clean_name}: 仿真")
         if active_notes:
-            self.global_ports_label.setText("活动连接：" + "  |  ".join(active_notes) + "  ·  Ctrl+1/2/3 切换模块")
+            self.global_ports_label.setText("活动连接：" + "  |  ".join(active_notes) + "  ·  Ctrl+1~4 切换模块")
         else:
-            self.global_ports_label.setText("就绪 · 点击上方页签或按 Ctrl+1/2/3 快速切换调试模块")
+            self.global_ports_label.setText("就绪 · 点击上方页签或按 Ctrl+1~4 快速切换调试模块")
 
     def show_extension_guide(self):
         dlg = W.QDialog(self)
@@ -1697,8 +1703,11 @@ def main():
             app.processEvents()
             imu_ok = win.imu_page.frames >= 3 and not win.imu_page.canvas.grab().isNull()
             win.imu_page.disconnect_source()
+            win.switch_module(3)
+            app.processEvents()
+            remote_ok = win.module_stack.currentWidget() is win.remote_page and not win.remote_page.grab().isNull()
             win.switch_module(0)
-            ok = ok and serial_ok and imu_ok and not win.windowIcon().pixmap(32,32).isNull()
+            ok = ok and serial_ok and imu_ok and remote_ok and not win.windowIcon().pixmap(32,32).isNull()
             win.close()
             win.deleteLater()
             C.QCoreApplication.sendPostedEvents(None,C.QEvent.Type.DeferredDelete)

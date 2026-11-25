@@ -1,0 +1,182 @@
+name: Test & Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt ziglang
+
+      - name: Run STM32 C99 firmware protocol & balance tests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .build/ctests | Out-Null
+          python -m ziglang cc -std=c99 -Wall -Wextra -Werror -Ifirmware_example tests/firmware_check.c firmware_example/pid_link.c -o .build/ctests/fw.exe
+          ./.build/ctests/fw.exe
+          python -m ziglang cc -std=c99 -Wall -Wextra -Werror -Ifirmware_example -Itests/hal_stub tests/hal_check.c firmware_example/hal_demo.c firmware_example/pid_link.c -o .build/ctests/hal.exe
+          ./.build/ctests/hal.exe
+          if (Test-Path tests/balance_check.c) {
+            python -m ziglang cc -std=c99 -Wall -Wextra -Werror -Ifirmware_example tests/balance_check.c firmware_example/balance_example.c firmware_example/pid_link.c -o .build/ctests/bal.exe
+            ./.build/ctests/bal.exe
+          }
+
+      - name: Run Python GUI & protocol regression suite
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m unittest -v test_tuner.py
+          python main.py --self-test
+
+      - name: Package standalone Windows executable
+        shell: pwsh
+        run: |
+          ./build.ps1
+          ./release/PIDTuner.exe --self-test
+
+      - name: Upload Windows EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EmbeddedDebugStudio-Windows-x64
+          path: release/PIDTuner.exe
+
+      - name: Attach EXE & Manuals to GitHub Release on Tag Push
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $repo = "${{ github.repository }}"
+          $tag = "${{ github.ref_name }}"
+          Copy-Item release/PIDTuner.exe "release/EmbeddedDebugStudio-$tag-win64.exe" -Force
+          $files = @("release/PIDTuner.exe", "release/EmbeddedDebugStudio-$tag-win64.exe")
+          if (Test-Path docs) {
+            Get-ChildItem docs -File | Where-Object { $_.Extension -in @('.pdf', '.docx') } | ForEach-Object { $files += $_.FullName }
+          }
+          gh release view $tag -R $repo *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag @files -R $repo --title "$tag" --generate-notes
+          } else {
+            gh release upload $tag @files -R $repo --clobber
+          }
+
+  publish-all-tags:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: [ 'v1.1', 'v1.2', 'v1.3', 'v1.4', 'v1.5', 'v1.6' ]
+    steps:
+      - name: Check if Release ${{ matrix.tag }} already has EXE
+        id: check_rel
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $repo = "${{ github.repository }}"
+          $tag = "${{ matrix.tag }}"
+          $json = gh release view $tag -R $repo --json assets 2>$null
+          if ($LASTEXITCODE -eq 0 -and $json -match "PIDTuner-$tag\.exe" -and "${{ github.event_name }}" -ne "workflow_dispatch") {
+            Write-Host "Release $tag already has EXE uploaded; skipping."
+            "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+          exit 0
+
+      - name: Checkout tag ${{ matrix.tag }}
+        if: steps.check_rel.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ matrix.tag }}
+
+      - name: Set up Python 3.11
+        if: steps.check_rel.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        if: steps.check_rel.outputs.skip != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt python-docx Pillow
+
+      - name: Build & Self-Test ${{ matrix.tag }}
+        if: steps.check_rel.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          ./build.ps1
+          ./release/PIDTuner.exe --self-test
+          if (Test-Path docs/build_manual.py) {
+            python docs/build_manual.py release
+            $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+            if (-not (Test-Path $edge)) { $edge = "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe" }
+            if (Test-Path $edge) {
+              $ErrorActionPreference = 'Continue'
+              $htmlUri = [System.Uri]::new((Resolve-Path "release/_manual_print.html").Path).AbsoluteUri
+              & $edge --headless --disable-gpu "--print-to-pdf=$PWD\release\EmbeddedDebugStudio-v1.6-Manual.pdf" $htmlUri
+              $ErrorActionPreference = 'Stop'
+            }
+          }
+
+      - name: Create or Upload EXE & Manuals to Release ${{ matrix.tag }}
+        if: steps.check_rel.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $repo = "${{ github.repository }}"
+          $tag = "${{ matrix.tag }}"
+          $verExe = "release/PIDTuner-$tag.exe"
+          Copy-Item release/PIDTuner.exe $verExe -Force
+          $files = @($verExe)
+          if ($tag -eq 'v1.6') {
+            Copy-Item release/PIDTuner.exe "release/EmbeddedDebugStudio-v1.6-win64.exe" -Force
+            $files += "release/PIDTuner.exe"
+            $files += "release/EmbeddedDebugStudio-v1.6-win64.exe"
+          }
+          Get-ChildItem release -File | Where-Object { $_.Extension -in @('.pdf', '.docx') } | ForEach-Object {
+            $files += $_.FullName
+          }
+          if (Test-Path docs) {
+            Get-ChildItem docs -File | Where-Object { $_.Extension -in @('.pdf', '.docx') } | ForEach-Object {
+              $files += $_.FullName
+            }
+          }
+          gh release view $tag -R $repo *> $null
+          if ($LASTEXITCODE -ne 0) {
+            $latestFlag = if ($tag -eq 'v1.6') { '--latest' } else { '--latest=false' }
+            gh release create $tag @files -R $repo --title "$tag" --notes "EmbeddedDebugStudio $tag standalone Windows x64 package & manuals." $latestFlag
+          } else {
+            gh release upload $tag @files -R $repo --clobber
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

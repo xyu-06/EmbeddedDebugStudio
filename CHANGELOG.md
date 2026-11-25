@@ -1,4 +1,15 @@
-# 嵌入式综合调试助手（PID / 串口 / IMU）更新记录
+# 嵌入式综合调试助手（EmbeddedDebugStudio）更新记录
+
+## v1.6（2026-11-25）
+
+联动整合 Android 端 [BlueSerialStudio](https://github.com/xyu-06/BlueSerialStudio) 协议生态，升级为四大工作台一体机并同步至云端仓库：
+
+### 新增功能
+- **第四工作台【🎮 遥控与 HC-05】（`remote_studio.py`，快捷键 `Ctrl+4`）**：
+  - **小车差速遥控台（100% 兼容 `BlueSerialStudio` `J,{x},{y}` 协议）**：支持 **360° 单摇杆（鼠标拖拽回中）**、**左右双摇杆（左油门 Y / 右转向 X 独立归零）**、**四按键 / 键盘 `WASD` 长按渐进加速（18% 起步、1.6s 满速 100%、反向键互消）** 三种控制模式；实时计算并预览 `BlueSerial_MixWheels` 左右轮差速百分比，支持自定义数据包模板、`LED_ON / LED_OFF / BEEP / SERVO` 快捷控制、切走页面自动发 `J,0,0` 安全归零、全局 `Esc` 急停以及一键复制 STM32 差速混控 C 代码。
+  - **HC-05 蓝牙模块 AT 配置工具箱（USB-TTL 串口直发 + 剪贴板复制双模式）**：完整移植 `AtCommandBuilder` 参数校验规则（名称 `AT+NAME=`、配对码 `AT+PSWD=`、主从角色 `AT+ROLE=`、串口参数 `AT+UART=` 含兼容说明书原文 `5760` 波特率及 `AT+ORGL` `38400,0,0` 必读提示），所有指令自动附加 `CRLF (\r\n)`，既可一键复制，也可直接通过当前打开的电脑 USB-TTL 端口发送并在底部回显区实时查看 `OK` / `+VERSION` 响应。
+
+---
 
 ## v1.5（2026-11-25）
 
