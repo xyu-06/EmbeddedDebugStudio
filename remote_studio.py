@@ -11,11 +11,21 @@ from collections import deque
 from datetime import datetime
 import json
 import math
+import os
+from queue import Empty, Queue
+from threading import Thread
 from time import monotonic
 
 from serial.tools import list_ports
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 
+from bluetooth_link import (
+    BluetoothDevice,
+    BluetoothRfcommLink,
+    discover_bluetooth_devices,
+    open_windows_bluetooth_settings,
+    pair_bluetooth_device,
+)
 from transport import SerialLink
 
 
@@ -301,6 +311,11 @@ class RemoteBtPage(W.QWidget):
         self.connected = False
         self.closing = False
         self.reconnect_opts = None
+        self.active_bt_label: str | None = None
+        self._bt_devices: list[BluetoothDevice] = []
+        self._bt_results: Queue = Queue()
+        self._bt_busy = False
+        self._bt_initial_loaded = False
         self.rx_bytes = self.tx_bytes = 0
         self.steering_x = 0
         self.throttle_y = 0
@@ -325,7 +340,7 @@ class RemoteBtPage(W.QWidget):
 
     # ---------- WorkbenchModule standard interface ----------
     def active_port(self):
-        if (self.connected or self.link is not None) and self.reconnect_opts:
+        if (self.connected or self.link is not None) and (not self.active_bt_label) and self.reconnect_opts:
             return self.reconnect_opts.get("url")
         return None
 
@@ -337,6 +352,7 @@ class RemoteBtPage(W.QWidget):
                 if not self.link.is_alive():
                     self.link = None
                     self.closing = False
+                    self.active_bt_label = None
                     self._sync_conn_ui()
 
     def apply_theme(self, dark: bool):
@@ -349,9 +365,14 @@ class RemoteBtPage(W.QWidget):
         bg = "#19212a" if dark else "#ffffff"
         fg = "#e4eaf1" if dark else "#1f2f40"
         bd = "#4a5868" if dark else "#d5dce3"
+        hdr_bg = "#25303a" if dark else "#f2f5f8"
         self.console.setStyleSheet(
             f"QPlainTextEdit {{background:{bg};color:{fg};border:1px solid {bd};"
             "font:9.5pt 'Consolas','Microsoft YaHei UI';}}"
+        )
+        self.bt_table.setStyleSheet(
+            f"QTableWidget {{background:{bg};color:{fg};border:1px solid {bd};gridline-color:{bd};}}"
+            f"QHeaderView::section {{background:{hdr_bg};color:{fg};padding:4px 6px;border:none;border-bottom:1px solid {bd};}}"
         )
 
     def save_state(self, settings: C.QSettings):
@@ -367,6 +388,8 @@ class RemoteBtPage(W.QWidget):
             "bt_stop_idx": self.at_stop_box.currentIndex(),
             "bt_parity_idx": self.at_parity_box.currentIndex(),
             "bt_role_idx": self.at_role_box.currentIndex(),
+            "bt_drawer_open": self.bt_drawer_btn.isChecked(),
+            "bt_pair_pin": self.bt_pin_edit.text(),
         }
         settings.setValue("remote_bt/state", json.dumps(st, ensure_ascii=False))
 
@@ -389,6 +412,10 @@ class RemoteBtPage(W.QWidget):
                     self.at_name_edit.setText(str(st["bt_name"])[:32])
                 if st.get("bt_pin"):
                     self.at_pin_edit.setText(str(st["bt_pin"])[:16])
+                if "bt_drawer_open" in st:
+                    self.toggle_bt_drawer(bool(st["bt_drawer_open"]))
+                if st.get("bt_pair_pin") is not None:
+                    self.bt_pin_edit.setText(str(st["bt_pair_pin"])[:16])
                 for key, box in (
                     ("bt_baud_idx", self.at_baud_box),
                     ("bt_stop_idx", self.at_stop_box),
@@ -447,6 +474,13 @@ class RemoteBtPage(W.QWidget):
         tbar.addWidget(W.QLabel("波特率:"))
         tbar.addWidget(self.baud_box)
         tbar.addWidget(self.conn_btn)
+        self.bt_drawer_btn = W.QPushButton("🔵 收起蓝牙列表 ▴")
+        self.bt_drawer_btn.setCheckable(True)
+        self.bt_drawer_btn.setChecked(True)
+        self.bt_drawer_btn.setCursor(C.Qt.CursorShape.PointingHandCursor)
+        self.bt_drawer_btn.setToolTip("展开 / 收起经典蓝牙搜索、PIN 配对与 SPP 无线直连面板")
+        self.bt_drawer_btn.toggled.connect(self.toggle_bt_drawer)
+        tbar.addWidget(self.bt_drawer_btn)
         tbar.addWidget(self.at_baud_quick)
         tbar.addWidget(self._btn("⚠ AT 必读说明", self.show_cautions_dialog))
         rem_iface_btn = self._btn("🧩 遥控接口与说明", self.open_remote_interface_builder)
@@ -456,6 +490,55 @@ class RemoteBtPage(W.QWidget):
         tbar.addStretch()
         tbar.addWidget(self.estop_btn)
         root.addWidget(top)
+
+        # Collapsible Bluetooth Discovery, PIN Pairing & SPP Direct Connect Drawer
+        self.bt_panel = W.QFrame()
+        self.bt_panel.setObjectName("card")
+        btl = W.QVBoxLayout(self.bt_panel)
+        btl.setContentsMargins(10, 6, 10, 6)
+        btl.setSpacing(5)
+        bt_bar = W.QHBoxLayout()
+        bt_bar.setSpacing(6)
+        bt_bar.addWidget(W.QLabel("<b>🔵 蓝牙扫描、配对与 SPP 直连（HC-05 / HC-06 / ESP32）</b>"))
+        self.bt_scan_btn = self._btn("🔍 搜索附近蓝牙", lambda: self.scan_bluetooth(inquiry=True), "primary")
+        self.bt_quick_btn = self._btn("↻ 已配对设备", lambda: self.scan_bluetooth(inquiry=False))
+        bt_bar.addWidget(self.bt_scan_btn)
+        bt_bar.addWidget(self.bt_quick_btn)
+        bt_bar.addWidget(W.QLabel("配对码 PIN:"))
+        self.bt_pin_edit = W.QLineEdit("1234")
+        self.bt_pin_edit.setFixedWidth(56)
+        self.bt_pin_edit.setMaxLength(16)
+        self.bt_pin_edit.setToolTip("HC-05/HC-06 默认配对码为 1234（少数模块为 0000；留空由系统弹窗输入）")
+        bt_bar.addWidget(self.bt_pin_edit)
+        self.bt_pair_btn = self._btn("🔗 配对选中", self.pair_selected_bluetooth)
+        self.bt_connect_btn = self._btn("⚡ 蓝牙直连 (SPP)", self.connect_selected_bluetooth, "accent")
+        self.bt_com_btn = self._btn("🔌 用映射串口连接", self.use_selected_bt_com)
+        self.bt_sys_btn = self._btn("⚙ 系统蓝牙", open_windows_bluetooth_settings)
+        for b in (self.bt_pair_btn, self.bt_connect_btn, self.bt_com_btn, self.bt_sys_btn):
+            bt_bar.addWidget(b)
+        bt_bar.addStretch()
+        btl.addLayout(bt_bar)
+
+        self.bt_table = W.QTableWidget(0, 4)
+        self.bt_table.setHorizontalHeaderLabels(["设备名称", "蓝牙地址 (MAC)", "配对 / 连接状态", "蓝牙串口 (SPP 传出)"])
+        self.bt_table.verticalHeader().setVisible(False)
+        self.bt_table.setSelectionBehavior(W.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.bt_table.setSelectionMode(W.QAbstractItemView.SelectionMode.SingleSelection)
+        self.bt_table.setEditTriggers(W.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.bt_table.setMaximumHeight(112)
+        hdr = self.bt_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, W.QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, W.QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, W.QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(3, W.QHeaderView.ResizeMode.Stretch)
+        self.bt_table.itemSelectionChanged.connect(self._sync_bt_buttons)
+        self.bt_table.itemDoubleClicked.connect(lambda _: self.connect_or_pair_selected_bluetooth())
+        btl.addWidget(self.bt_table)
+
+        self.bt_status_lbl = W.QLabel("提示：点击【🔍 搜索附近蓝牙】查找未配对模块；若已配对，可直接点【⚡ 蓝牙直连 (SPP)】或双击设备行连接。")
+        self.bt_status_lbl.setStyleSheet("color:#5b7083;font-size:9pt;")
+        btl.addWidget(self.bt_status_lbl)
+        root.addWidget(self.bt_panel)
 
         vsplit = W.QSplitter(C.Qt.Orientation.Vertical)
         root.addWidget(vsplit, 1)
@@ -679,7 +762,134 @@ class RemoteBtPage(W.QWidget):
         root.addWidget(self.status_bar)
         self._update_status_bar()
 
-    # ---------- Port handling ----------
+    # ---------- Port & Bluetooth SPP handling ----------
+    def toggle_bt_drawer(self, opened: bool):
+        with C.QSignalBlocker(self.bt_drawer_btn):
+            self.bt_drawer_btn.setChecked(bool(opened))
+        self.bt_panel.setVisible(bool(opened))
+        self.bt_drawer_btn.setText("🔵 收起蓝牙列表 ▴" if opened else "🔵 展开搜索蓝牙 ▾")
+
+    def _selected_bt_device(self) -> BluetoothDevice | None:
+        row_idx = self.bt_table.currentRow()
+        if 0 <= row_idx < len(self._bt_devices):
+            return self._bt_devices[row_idx]
+        return None
+
+    def set_bt_devices(self, devices: list[BluetoothDevice], status_msg: str | None = None):
+        prev_mac = self._selected_bt_device().address if self._selected_bt_device() else None
+        self._bt_devices = list(devices)
+        self.bt_table.setRowCount(len(self._bt_devices))
+        select_row = 0
+        for row_i, dev in enumerate(self._bt_devices):
+            if prev_mac and dev.address == prev_mac:
+                select_row = row_i
+            status_txt = "● 系统已连" if dev.connected else ("✓ 已配对" if dev.authenticated else "○ 未配对")
+            com_txt = f"{dev.com_port}（传出 SPP）" if dev.com_port else "可直连 SPP（未分配 COM）"
+            for col_i, txt in enumerate((dev.name, dev.address, status_txt, com_txt)):
+                item = W.QTableWidgetItem(txt)
+                if col_i == 2:
+                    item.setForeground(QtGui.QColor("#188467" if dev.authenticated else "#8d691e"))
+                self.bt_table.setItem(row_i, col_i, item)
+        if self._bt_devices:
+            self.bt_table.selectRow(select_row)
+        if status_msg is not None:
+            self.bt_status_lbl.setText(status_msg)
+        else:
+            paired_cnt = sum(1 for d in self._bt_devices if d.authenticated)
+            self.bt_status_lbl.setText(f"共发现 {len(self._bt_devices)} 台蓝牙设备（其中 {paired_cnt} 台已配对）；可配对后直接 SPP 连接。")
+        self._sync_bt_buttons()
+
+    def _sync_bt_buttons(self):
+        dev = self._selected_bt_device()
+        connected_now = self.connected or self.link is not None
+        self.bt_scan_btn.setEnabled(not self._bt_busy)
+        self.bt_quick_btn.setEnabled(not self._bt_busy)
+        self.bt_pair_btn.setEnabled((not self._bt_busy) and (dev is not None) and (not dev.authenticated))
+        self.bt_connect_btn.setEnabled((not self._bt_busy) and (dev is not None) and (not connected_now or bool(self.active_bt_label)))
+        self.bt_connect_btn.setText("断开蓝牙" if (connected_now and self.active_bt_label) else "⚡ 蓝牙直连 (SPP)")
+        self.bt_com_btn.setEnabled((not connected_now) and (dev is not None) and bool(dev.com_port))
+
+    def scan_bluetooth(self, inquiry: bool = True):
+        if self._bt_busy:
+            return
+        self._bt_busy = True
+        self._sync_bt_buttons()
+        self.bt_status_lbl.setText(
+            "正在搜索附近经典蓝牙设备（约 3~5 秒，请确保模块红灯快闪处于可发现状态）…"
+            if inquiry
+            else "正在刷新已配对蓝牙设备与系统分配串口…"
+        )
+
+        def worker():
+            try:
+                devs = discover_bluetooth_devices(inquiry=inquiry, timeout_units=3)
+                self._bt_results.put(("scan", devs, None))
+            except Exception as exc:
+                self._bt_results.put(("scan", [], str(exc)))
+
+        Thread(target=worker, daemon=True).start()
+
+    def pair_selected_bluetooth(self):
+        dev = self._selected_bt_device()
+        if dev is None or self._bt_busy:
+            return
+        pin = self.bt_pin_edit.text().strip()
+        hwnd = int(self.winId()) if self.isVisible() else 0
+        self._bt_busy = True
+        self._sync_bt_buttons()
+        self.bt_status_lbl.setText(f"正在与 {dev.name} ({dev.address}) 配对（PIN={'系统弹窗' if not pin else pin}）…")
+
+        def worker():
+            ok, msg = pair_bluetooth_device(dev.address, pin=pin, hwnd=hwnd)
+            devs = discover_bluetooth_devices(inquiry=False) if ok else None
+            self._bt_results.put(("pair", (ok, msg, devs), dev.address))
+
+        Thread(target=worker, daemon=True).start()
+
+    def connect_or_pair_selected_bluetooth(self):
+        dev = self._selected_bt_device()
+        if dev is None:
+            return
+        if not dev.authenticated:
+            self.pair_selected_bluetooth()
+        else:
+            self.connect_selected_bluetooth()
+
+    def connect_selected_bluetooth(self):
+        if self.connected or self.link is not None:
+            if self.active_bt_label:
+                self.disconnect_port()
+            else:
+                self._log("系统", "当前已打开串口连接，请先关闭串口后再建立蓝牙直连")
+            return
+        dev = self._selected_bt_device()
+        if dev is None:
+            self.bt_status_lbl.setText("请先在上方表格中选择一台蓝牙设备。")
+            return
+        if not dev.authenticated:
+            self.bt_status_lbl.setText(f"{dev.name} 尚未配对，正在先发起配对…")
+            self.pair_selected_bluetooth()
+            return
+        self.reconnect_opts = None
+        self.active_bt_label = f"{dev.name} ({dev.address})"
+        self.closing = False
+        self.rx_tail = ""
+        self.link = BluetoothRfcommLink(dev.address, channel=1, name=dev.name)
+        self.link.start()
+        self._log("系统", f"正在通过经典蓝牙 SPP 直连 {self.active_bt_label} …")
+        self._sync_conn_ui()
+
+    def use_selected_bt_com(self):
+        dev = self._selected_bt_device()
+        if dev is None or not dev.com_port:
+            self.bt_status_lbl.setText("当前设备未映射传出蓝牙 COM 口，请直接点击【⚡ 蓝牙直连 (SPP)】。")
+            return
+        if self.port_box.findText(dev.com_port) < 0:
+            self.port_box.addItem(dev.com_port)
+        self.port_box.setCurrentText(dev.com_port)
+        if not (self.connected or self.link is not None):
+            self.toggle_port()
+
     def refresh_ports(self):
         old = self.port_box.currentText()
         self.port_box.clear()
@@ -697,7 +907,7 @@ class RemoteBtPage(W.QWidget):
             return
         name = self.port_box.currentText().strip()
         if not name:
-            self._log("系统", "请先选择或输入 USB-TTL / 蓝牙虚拟串口名称（如 COM5）")
+            self._log("系统", "请先选择 USB-TTL / 虚拟串口，或展开【🔵 蓝牙列表】搜索并直连蓝牙")
             return
         if self.host is not None and hasattr(self.host, "request_port_access"):
             if not self.host.request_port_access(self, name):
@@ -710,6 +920,7 @@ class RemoteBtPage(W.QWidget):
         except ValueError as exc:
             self._log("系统", str(exc))
             return
+        self.active_bt_label = None
         self.reconnect_opts = opts
         self.closing = False
         self.rx_tail = ""
@@ -719,6 +930,7 @@ class RemoteBtPage(W.QWidget):
 
     def disconnect_port(self):
         had_conn = self.connected and self.link is not None
+        was_bt = bool(self.active_bt_label)
         self.stop_all_motion(send_stop=False)
         self._pending_uart_write = None
         if self.link:
@@ -730,24 +942,30 @@ class RemoteBtPage(W.QWidget):
             else:
                 self.link.closed.set()
         self.connected = False
+        self.active_bt_label = None
         self._sync_conn_ui()
-        self._log("系统", "已安全停车并关闭串口连接" if had_conn else "已关闭串口连接")
+        kind_label = "蓝牙连接" if was_bt else "串口连接"
+        self._log("系统", f"已安全停车并关闭{kind_label}" if had_conn else f"已关闭{kind_label}")
 
     def _sync_conn_ui(self):
         busy = self.connected or self.link is not None
         for w in (self.port_box, self.ref_btn, self.baud_box, self.at_baud_quick):
             w.setEnabled(not busy)
-        self.conn_btn.setText("关闭串口" if self.connected else "正在打开…" if busy else "打开串口")
+        if self.active_bt_label:
+            self.conn_btn.setText("断开蓝牙" if self.connected else "正在连接蓝牙…")
+            self.badge.setText(f"● 蓝牙已连 {self.active_bt_label}" if self.connected else f"● 蓝牙连接中 {self.active_bt_label}")
+        else:
+            self.conn_btn.setText("关闭串口" if self.connected else "正在打开…" if busy else "打开串口")
+            url = self.reconnect_opts["url"] if self.reconnect_opts else self.port_box.currentText()
+            self.badge.setText(f"● 已连接 {url} @ {self.baud_box.currentText()}" if self.connected else "● 未连接")
         self.conn_btn.setObjectName("danger" if self.connected else "primary")
         self.conn_btn.style().unpolish(self.conn_btn)
         self.conn_btn.style().polish(self.conn_btn)
-        if self.connected:
-            url = self.reconnect_opts["url"] if self.reconnect_opts else self.port_box.currentText()
-            self.badge.setText(f"● 已连接 {url} @ {self.baud_box.currentText()}")
+        if self.connected or (busy and self.active_bt_label):
             self.badge.setStyleSheet("color:#188467;font-weight:600;padding-left:6px;")
         else:
-            self.badge.setText("● 未连接")
             self.badge.setStyleSheet("color:#71808b;font-weight:600;padding-left:6px;")
+        self._sync_bt_buttons()
         if self.host is not None and hasattr(self.host, "update_module_badges"):
             self.host.update_module_badges()
         self._update_status_bar()
@@ -792,6 +1010,12 @@ class RemoteBtPage(W.QWidget):
             now_ms,
         )
         self._emit_drive(force=force_zero or (self.steering_x == 0 and self.throttle_y == 0))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._bt_initial_loaded and os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen":
+            self._bt_initial_loaded = True
+            self.scan_bluetooth(inquiry=False)
 
     def hideEvent(self, event):
         if self.held_keys or self.steering_x or self.throttle_y:
@@ -1048,7 +1272,31 @@ class RemoteBtPage(W.QWidget):
         self.logs.clear()
         self.console.clear()
 
+    def _drain_bt_results(self):
+        while True:
+            try:
+                kind, payload, extra = self._bt_results.get_nowait()
+            except Empty:
+                break
+            self._bt_busy = False
+            if kind == "scan":
+                if extra:
+                    self.bt_status_lbl.setText(f"蓝牙扫描出错：{extra}")
+                    self._log("蓝牙", f"扫描失败：{extra}")
+                else:
+                    self.set_bt_devices(payload)
+            elif kind == "pair":
+                ok, msg, devs = payload
+                self._log("蓝牙", msg)
+                if ok and devs is not None:
+                    self.refresh_ports()
+                    self.set_bt_devices(devs, status_msg=msg)
+                else:
+                    self.bt_status_lbl.setText(msg)
+            self._sync_bt_buttons()
+
     def tick(self):
+        self._drain_bt_results()
         if self.mode_box.currentIndex() == 2 and self.held_keys:
             self._update_held_axes()
         elif self.connected and self.link and (self.steering_x != 0 or self.throttle_y != 0):
@@ -1092,6 +1340,7 @@ class RemoteBtPage(W.QWidget):
                 elif kind == "closed":
                     self.link = None
                     self.connected = self.closing = False
+                    self.active_bt_label = None
                     self._sync_conn_ui()
                     break
             self._update_status_bar()

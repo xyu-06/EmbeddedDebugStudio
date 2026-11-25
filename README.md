@@ -45,7 +45,8 @@
 
 ![3D IMU 姿态与六轴标定工作台](docs/images/fig12_imu_studio.png)
 
-### 4. 🎮 小车差速遥控与 HC-05 AT 配置工具箱（`Ctrl+4`）
+### 4. 🎮 蓝牙遥控与 HC-05 AT 配置工具箱（`Ctrl+4`）
+- **蓝牙搜索、配对与无线 SPP 直连**（`bluetooth_link.py`）：顶栏支持展开/收起 **【🔵 蓝牙扫描与配对】** 面板，可直接搜索周边经典蓝牙设备、填写 `PIN` 码（HC-05 默认 `1234`）一键完成 Windows 配对、显示系统已匹配的传出蓝牙 `COM` 口，并支持直接建立 `RFCOMM (SPP)` 蓝牙无线连接或改走映射 `COM` 口控制。
 - **兼容 `BlueSerialStudio` `J,{x},{y}` 差速遥控协议**：支持 **360° 单摇杆**、**左右双摇杆**、**四按键 / 键盘 `WASD` 长按渐进加速（18%→100%）** 三种控制模式，实时预览 `BlueSerial_MixWheels` 左右轮混控输出；内置窗口失焦/隐藏自动清零 `J,0,0` 防卡键保护与非零摇杆 `100 ms` 心跳重发保活，切页或按 `Esc` 立即急停。
 - **HC-05 USB-TTL 串口直连 AT 配置箱**：自动附加标准 `CRLF (\r\n)`，支持完整波特率表（含 `57600` 及对 `5760` 疑误项的二次安全确认）并在写入 `AT+UART=` 前自动发送 `AT+UART?` 读出对比，避免误写导致模块失联。
 
@@ -76,7 +77,7 @@ self.register_module("📷 摄像头调试", CameraDebugPage(self))
 | `main.py` / `layout_ui.py` / `workbench.py` | 多模块综合工作台宿主、PID 主界面布局、主题与全局快捷键 |
 | `serial_studio.py` | 独立全功能串口调试助手模块（UTF-8/GBK、CRC16、12 路快捷指令） |
 | `imu_studio.py` | 3D 平衡车姿态、人工地平仪、六轴互补滤波与中值角标定模块 |
-| `remote_studio.py` | `J,x,y` 小车差速遥控台与 HC-05 USB-TTL AT 配置工具箱模块 |
+| `remote_studio.py` / `bluetooth_link.py` | 经典蓝牙搜索配对/SPP 直连、`J,x,y` 小车差速遥控台与 HC-05 AT 工具箱模块 |
 | `firmware_studio.py` | 统一串口接口构建与说明中心（PID/IMU/遥控 × HAL/SPL/ESP32·Arduino）与内置动态协议说明书 |
 | `autotune.py` / `autotune_ui.py` | 闭环阶跃辨识（SIMC / 极点配置）+ Hooke–Jeeves 自动整定引擎 |
 | `diagnostics.py` / `scope.py` / `engine.py` | FFT 信号体检、C 代码导出、高刷示波器（含 Ghost 底图）、协议解析与仿真器 |

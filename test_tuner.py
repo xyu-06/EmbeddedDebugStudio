@@ -1558,6 +1558,123 @@ class GuiChecks(unittest.TestCase):
             self.assertGreaterEqual(w.firmware_page.imu_format_box.width(), 140)
             w.close()
 
+    def test_v18_bluetooth_scanner_pairing_and_rfcomm_remote(self):
+        from types import SimpleNamespace
+        from bluetooth_link import BluetoothDevice, extract_bt_mac_from_hwid, map_bluetooth_com_ports
+
+        # 1) HWID MAC extraction & COM mapping
+        self.assertEqual(
+            extract_bt_mac_from_hwid(r"BTHENUM\{00001101-0000-1000-8000-00805F9B34FB}_LOCALMFG&005D\7&982190C&2&00260102EAC0_C00000000"),
+            "00:26:01:02:EA:C0",
+        )
+        self.assertIsNone(
+            extract_bt_mac_from_hwid(r"BTHENUM\{00001101-0000-1000-8000-00805F9B34FB}_LOCALMFG&0000\7&982190C&2&000000000000_00000009")
+        )
+        com_map = map_bluetooth_com_ports([
+            SimpleNamespace(device="COM10", hwid=r"BTHENUM\{00001101-0000-1000-8000-00805F9B34FB}_LOCALMFG&005D\7&1&00260102EAC0_C00000000"),
+            SimpleNamespace(device="COM9", hwid=r"USB\VID_0843&PID_5740"),
+        ])
+        self.assertEqual(com_map, {"00:26:01:02:EA:C0": "COM10"})
+
+        # 2) UI Bluetooth drawer expand/collapse, scan, PIN pairing, RFCOMM connect & flush_and_close
+        class FakeRfcommLink:
+            instances = []
+
+            def __init__(self, address, channel=1, name="", timeout=5.0):
+                from threading import Event
+                self.address = address
+                self.channel = channel
+                self.device_name = name
+                self.closed = Event()
+                self.events = [("open", 0.0, f"蓝牙 {name} ({address})")]
+                self.sent = []
+                self.flushed = []
+                self.closed_flag = False
+                FakeRfcommLink.instances.append(self)
+
+            def start(self):
+                return None
+
+            def send(self, data: bytes):
+                self.sent.append(data)
+                self.events.append(("tx", 0.0, data))
+
+            def take(self):
+                out = list(self.events)
+                self.events.clear()
+                return out, 0
+
+            def flush_and_close(self, final_data: bytes = b"", timeout: float = 0.25):
+                self.flushed.append(final_data)
+                self.closed_flag = True
+                self.closed.set()
+                self.events.append(("closed", 0.0, None))
+
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                return None
+
+        devs_before = [BluetoothDevice("HC-05", "00:26:01:02:EA:C0", authenticated=False, remembered=False, connected=False, com_port=None)]
+        devs_after = [BluetoothDevice("HC-05", "00:26:01:02:EA:C0", authenticated=True, remembered=True, connected=False, com_port="COM10")]
+
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "bt.ini")
+            w.timer.stop()
+            w.serial_page.poll_timer.stop()
+            w.imu_page.timer.stop()
+            rp = w.remote_page
+            rp.timer.stop()
+            w.switch_module(3)
+
+            self.assertFalse(rp.bt_panel.isHidden())
+            self.assertTrue(rp.bt_drawer_btn.isChecked())
+            rp.toggle_bt_drawer(False)
+            self.assertTrue(rp.bt_panel.isHidden())
+            self.assertFalse(rp.bt_drawer_btn.isChecked())
+            rp.toggle_bt_drawer(True)
+            self.assertFalse(rp.bt_panel.isHidden())
+            self.assertTrue(rp.bt_drawer_btn.isChecked())
+
+            rp.set_bt_devices(devs_before)
+            self.assertEqual(rp.bt_table.rowCount(), 1)
+            self.assertTrue(rp.bt_pair_btn.isEnabled())
+
+            with patch("remote_studio.pair_bluetooth_device", return_value=(True, "配对成功")) as mock_pair, \
+                 patch("remote_studio.discover_bluetooth_devices", return_value=devs_after):
+                rp.bt_pin_edit.setText("1234")
+                rp.pair_selected_bluetooth()
+                deadline = time.monotonic() + 1.5
+                while rp._bt_busy and time.monotonic() < deadline:
+                    rp.tick()
+                    time.sleep(0.01)
+                mock_pair.assert_called_once_with("00:26:01:02:EA:C0", pin="1234", hwnd=0)
+            self.assertFalse(rp.bt_pair_btn.isEnabled())
+            self.assertIn("COM10", rp.bt_table.item(0, 3).text())
+
+            with patch("remote_studio.BluetoothRfcommLink", FakeRfcommLink):
+                rp.connect_selected_bluetooth()
+                rp.tick()
+                self.assertTrue(rp.connected)
+                self.assertIsNone(rp.active_port())
+                self.assertIn("蓝牙已连 HC-05", rp.badge.text())
+                rp._on_single_joy(30, 70, False)
+                self.assertIn(b"J,30,70\n", FakeRfcommLink.instances[-1].sent)
+                rp.disconnect_port()
+                rp.tick()
+                self.assertIn(b"J,0,0\nS\n", FakeRfcommLink.instances[-1].flushed)
+                self.assertFalse(rp.connected)
+
+            # Selecting mapped COM port sets COM10 and attempts Serial connection
+            with patch("remote_studio.SerialLink") as mock_serial_cls:
+                rp.use_selected_bt_com()
+                self.assertEqual(rp.port_box.currentText(), "COM10")
+                mock_serial_cls.assert_called_once()
+            rp.link = None
+            rp.disconnect_port()
+            w.close()
+
 
 if __name__ == "__main__":
     unittest.main()
