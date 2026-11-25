@@ -205,6 +205,11 @@ class Window(W.QMainWindow):
             target.port_box.setCurrentText(default_port)
         self.update_module_badges()
 
+    def open_firmware_builder(self, iface_type: int = 0, **kwargs):
+        """Jump from any workbench straight to the centralized Interface Builder tab."""
+        self.firmware_page.configure_from_workbench(iface_type, **kwargs)
+        self.switch_module(4)
+
     def active_port(self):
         if (self.connected or self.link is not None or self.reconnect_at is not None) and not self.sim and self.reconnect_opts:
             return self.reconnect_opts.get("url")
@@ -264,9 +269,9 @@ class Window(W.QMainWindow):
             elif sim_on:
                 active_notes.append(f"{clean_name}: 仿真")
         if active_notes:
-            self.global_ports_label.setText("活动连接：" + "  |  ".join(active_notes) + "  ·  Ctrl+1~4 切换模块")
+            self.global_ports_label.setText("活动连接：" + "  |  ".join(active_notes) + "  ·  Ctrl+1~5 切换模块")
         else:
-            self.global_ports_label.setText("就绪 · 点击上方页签或按 Ctrl+1~4 快速切换调试模块")
+            self.global_ports_label.setText("就绪 · 点击上方页签或按 Ctrl+1~5 快速切换调试模块")
 
     def show_extension_guide(self):
         dlg = W.QDialog(self)
@@ -276,7 +281,7 @@ class Window(W.QMainWindow):
         info = W.QLabel(
             f"<b>插件化多模块架构说明（当前版本 v{APP_VERSION}）</b><br>"
             "本上位机采用统一的 <code>WorkbenchModule</code> 页面接口，当前已内置 "
-            "<b>📈 PID 调参</b>、<b>🔌 串口调试</b>、<b>🧭 IMU 姿态</b>、<b>🎮 遥控与 HC-05</b> 四大工作台。<br>"
+            "<b>📈 PID 调参</b>、<b>🔌 串口调试</b>、<b>🧭 IMU 姿态</b>、<b>🎮 遥控与 HC-05</b>、<b>🧩 接口构建</b> 五大工作台。<br>"
             "后续接入 <b>📷 摄像头图传 (OV7670/OpenMV)</b>、<b>📈 CAN 总线分析</b> 等模块时，"
             "只需新建一个独立的 <code>QWidget</code> 子类并在 <code>Window.__init__</code> 注册一行即可自动获得："
             "顶部导航栏页签、<code>调试模块(M)</code> 菜单与快捷键、跨页面串口冲突自动让渡、暗色主题同步与配置持久化。"

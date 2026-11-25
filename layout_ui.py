@@ -179,9 +179,12 @@ def build(w):
     w.record_btn = button("录制 CSV", w.record)
     w.stop_btn = button("急停", w.stop_device, "danger")
     w.badge = W.QLabel("未连接")
+    iface_btn = button("🧩 接口代码与说明", lambda: w.open_firmware_builder(0))
+    iface_btn.setToolTip("跳转至【🧩 接口构建】快速配置并复制 PID 串口接口代码（STM32 HAL / 标准库 SPL / ESP32·Arduino）及协议说明")
     for b in [w.connect_btn, w.pause_btn, button("清空波形", w.clear_plot), w.record_btn,
               button("快照 PNG", w.png), button("导出视图 CSV", w.export_view),
-              button("打开 CSV", w.import_csv), button("🩺 信号体检", w.open_diagnostics)]:
+              button("打开 CSV", w.import_csv), button("🩺 信号体检", w.open_diagnostics),
+              iface_btn]:
         bar.addWidget(b)
     bar.addWidget(w.badge)
     bar.addStretch()

@@ -35,15 +35,15 @@ def main():
     doc.styles["Normal"].font.size = Pt(10.5)
 
     p = doc.add_paragraph()
-    r = p.add_run(f"{APP_TITLE_ZH} {APP_TAG} · 图文使用手册（PID / 串口 / IMU / 蓝牙遥控）")
+    r = p.add_run(f"{APP_TITLE_ZH} {APP_TAG} · 图文使用手册（PID / 串口 / IMU / 遥控 / 接口构建）")
     r.bold = True
     r.font.size = Pt(19)
     r.font.color.rgb = RGBColor(0x18, 0x3B, 0x6B)
     set_font(r)
 
     sections = [
-        ("1. 软件全景与四大模块导航（Ctrl+1~4）",
-         "双击运行 PIDTuner.exe 即可免安装启动。顶栏支持一键切换【📈 PID 调参】、【🔌 串口调试】、【🧭 IMU 姿态】、【🎮 遥控与 HC-05】四大工作台，支持同串口跨页让渡（释放前先冲洗发送急停）与全局 Esc 急停。",
+        ("1. 软件全景与五大模块导航（Ctrl+1~5）",
+         "双击运行 PIDTuner.exe 即可免安装启动。顶栏支持一键切换【📈 PID 调参】、【🔌 串口调试】、【🧭 IMU 姿态】、【🎮 遥控与 HC-05】、【🧩 接口构建】五大工作台，支持同串口跨页让渡（释放前先冲洗发送急停）与全局 Esc 急停。",
          "fig01_overview.png"),
         ("2. 串口连接、8 通道缩放与独立双 Y 轴",
          "支持最多 8 通道实时示波与 4 条参考线，可将下位机整数放大数据按比例还原为工程物理量（如 RPM），并将转速与 PWM 分配至左右独立坐标轴同屏观察。",
@@ -75,8 +75,8 @@ def main():
         ("11. 【🎮 遥控与 HC-05】工作台：联动 BlueSerialStudio（Ctrl+4）",
          "兼容 J,x,y 三模式差速遥控（失焦自动停车、非零摇杆 100 ms 心跳重发）；HC-05 工具箱含 57600 与 5760 笔误安全警告，写入 AT+UART= 前自动发 AT+UART? 对比确认。",
          "fig13_remote_hc05.png"),
-        ("12. 【🧩 接口构建】工作台与任意通道顺序 #ROLES: 协议（Ctrl+5）",
-         "支持可视化配置 1~8 通道顺序并绑定 target/actual/output/error 角色，一键生成并导出 STM32 HAL / 通用裸机 C99 / Arduino 接入代码，内置完整协议说明且允许任意列顺序自动识别。",
+        ("12. 【🧩 接口构建】统一构建与说明中心（Ctrl+5）",
+         "各调试页顶栏【🧩 接口与说明】按钮可带上下文直达本页：统一构建 PID 闭环调参、IMU/MPU6050 姿态、J,x,y 差速遥控三大串口接口，支持 STM32 HAL 库、STM32 标准库 SPL（stm32f10x.h）与 ESP32 / Arduino 一键生成导出，并自带分平台使用配置说明书与 #ROLES: 任意列顺序绑定。",
          "fig10_diagnostics_and_ccode.png"),
     ]
 

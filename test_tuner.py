@@ -1348,7 +1348,7 @@ class GuiChecks(unittest.TestCase):
             w.close()
 
     def test_v18_roles_order_free_and_firmware_interface_builder(self):
-        from firmware_studio import FirmwareStudioPage, generate_interface_bundle
+        from firmware_studio import FirmwareStudioPage, build_interface_guide_html, generate_interface_bundle
 
         # 1) Lines parses valid #ROLES and rejects invalid tokens or >8 items
         parser = Lines()
@@ -1371,8 +1371,9 @@ class GuiChecks(unittest.TestCase):
             self.assertEqual(w.autotuner.detect_channels(), (2, 0))
             w.close()
 
-        # 3) Code generation & UI builder add/move/delete/export across platforms
-        custom_cfg = {
+        # 3) All 3 interfaces x 3 platforms (HAL / SPL stm32f10x / ESP32·Arduino) code generation & guides
+        pid_cfg = {
+            "interface_type": 0,
             "platform": 0,
             "uart_handle": "huart1",
             "baudrate": 115200,
@@ -1384,37 +1385,110 @@ class GuiChecks(unittest.TestCase):
             "emit_roles": True,
             "channels": [("pwm", "output"), ("err", "error"), ("vel", "actual"), ("sp", "target")],
         }
-        hal_bundle = generate_interface_bundle(custom_cfg)
+        hal_bundle = generate_interface_bundle(pid_cfg)
         self.assertEqual(set(hal_bundle), {"main_integration_example.c", "pid_port_hal.h", "pid_port_hal.c", "pid_link.h", "pid_link.c", "README_接入说明.md"})
         self.assertIn("#NAMES:pwm,err,vel,sp", hal_bundle["pid_port_hal.c"])
         self.assertIn("#ROLES:output,error,actual,target", hal_bundle["pid_port_hal.c"])
         self.assertIn("PID_Port_Init(&huart1)", hal_bundle["main_integration_example.c"])
 
-        gen_bundle = generate_interface_bundle({**custom_cfg, "platform": 1})
-        self.assertIn("pid_port_generic.c", gen_bundle)
-        ino_bundle = generate_interface_bundle({**custom_cfg, "platform": 2})
-        self.assertIn("EmbeddedDebugStudio_PID.ino", ino_bundle)
-        self.assertIn("#ROLES:output,error,actual,target", ino_bundle["EmbeddedDebugStudio_PID.ino"])
+        spl_pid = generate_interface_bundle({**pid_cfg, "platform": 1, "uart_handle": "USART1"})
+        self.assertEqual(set(spl_pid), {"main_integration_spl.c", "pid_port_spl.h", "pid_port_spl.c", "pid_link.h", "pid_link.c", "README_接入说明.md"})
+        self.assertIn('#include "stm32f10x.h"', spl_pid["pid_port_spl.h"])
+        self.assertIn("USART_IT_RXNE", spl_pid["pid_port_spl.c"])
+        self.assertIn("USART1_IRQHandler", spl_pid["main_integration_spl.c"])
 
+        ino_pid = generate_interface_bundle({**pid_cfg, "platform": 2})
+        self.assertIn("EmbeddedDebugStudio_PID.ino", ino_pid)
+        self.assertIn("#ROLES:output,error,actual,target", ino_pid["EmbeddedDebugStudio_PID.ino"])
+        self.assertNotIn("Serial.printf", ino_pid["EmbeddedDebugStudio_PID.ino"])
+
+        # IMU across 4 formats & 3 platforms
+        for fmt_id, expected_hdr in (
+            (0, "#NAMES:ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps"),
+            (1, "#NAMES:ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw"),
+            (2, "#NAMES:target,pitch,gyro,pwm"),
+            (3, "#NAMES:pitch,roll,yaw"),
+        ):
+            imu_hal = generate_interface_bundle({"interface_type": 1, "platform": 0, "imu_format": fmt_id, "imu_report_ms": 20})
+            self.assertIn(expected_hdr, imu_hal["imu_port_hal.c"])
+            imu_spl = generate_interface_bundle({"interface_type": 1, "platform": 1, "imu_format": fmt_id, "uart_handle": "USART3"})
+            self.assertIn("USART3_IRQHandler", imu_spl["main_imu_spl.c"])
+            imu_ino = generate_interface_bundle({"interface_type": 1, "platform": 2, "imu_format": fmt_id})
+            self.assertIn(expected_hdr, imu_ino["EmbeddedDebugStudio_IMU.ino"])
+
+        # Remote J,x,y across 3 platforms with exact mix_wheels parity & failsafe
+        rem_hal = generate_interface_bundle({"interface_type": 2, "platform": 0, "remote_failsafe_ms": 350, "remote_pwm_limit": 7200})
+        self.assertIn("REMOTE_FAILSAFE_MS   350U", rem_hal["remote_port_hal.h"])
+        self.assertIn("left_pct = -inner;", rem_hal["remote_port_hal.c"])
+        rem_spl = generate_interface_bundle({"interface_type": 2, "platform": 1, "uart_handle": "USART2"})
+        self.assertIn("Remote_Port_SPL_IRQHandler", rem_spl["remote_port_spl.c"])
+        rem_ino = generate_interface_bundle({"interface_type": 2, "platform": 2})
+        self.assertIn("mixWheels", rem_ino["EmbeddedDebugStudio_Remote.ino"])
+
+        # Per-interface guides exist for all 3 x 3 combinations
+        for iface in (0, 1, 2):
+            for plat in (0, 1, 2):
+                html = build_interface_guide_html(iface, plat)
+                self.assertIn("全软件三大串口接口速查总览", html)
+                self.assertTrue(("PID" in html) or ("IMU" in html) or ("遥控" in html))
+
+        # 4) UI switching, platform auto UART handle, presets, and workbench shortcuts
         page = FirmwareStudioPage()
         self.assertIsInstance(page.splitter, W.QSplitter)
         self.assertEqual(page.splitter.count(), 2)
-        page.splitter.setSizes([480, 620])
-        page.apply_preset(2)  # custom order preset
+        page.platform_box.setCurrentIndex(1)
+        self.assertEqual(page.uart_edit.text(), "USART2")
+        page.platform_box.setCurrentIndex(2)
+        self.assertEqual(page.uart_edit.text(), "Serial")
+        page.platform_box.setCurrentIndex(0)
+        self.assertEqual(page.uart_edit.text(), "huart2")
+
+        page.apply_preset(2)
         self.assertEqual(page.channels_data()[0][1], "output")
-        page.move_channel(-1) if False else None
         page.row_selector.setValue(3)
-        page.move_channel(-1)  # swap CH3 -> CH2
+        page.move_channel(-1)
         self.assertEqual(page.channels_data()[1][1], "actual")
         page.add_channel()
         self.assertEqual(len(page.channels_data()), 5)
         page.remove_channel()
         self.assertEqual(len(page.channels_data()), 4)
+        page.set_interface_type(1)
+        self.assertIn("imu_port_hal.c", page.current_bundle())
+        page.set_interface_type(2)
+        self.assertIn("remote_port_hal.c", page.current_bundle())
         with TemporaryDirectory() as exp_dir:
             written = page.export_bundle(exp_dir)
-            self.assertEqual(len(written), 6)
-            self.assertTrue((Path(exp_dir) / "pid_port_hal.c").is_file())
+            self.assertEqual(len(written), 4)
+            self.assertTrue((Path(exp_dir) / "remote_port_hal.c").is_file())
         page.close()
+
+        # 5) Cross-workbench centralized jump shortcuts from PID / IMU / Remote
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "jump.ini")
+            w.timer.stop()
+            w.serial_page.poll_timer.stop()
+            w.imu_page.timer.stop()
+            w.remote_page.timer.stop()
+
+            w.imu_page.proto_box.setCurrentIndex(2)  # 6-axis physical -> imu_format 0
+            w.imu_page.baud_box.setCurrentText("256000")
+            w.imu_page.open_imu_interface_builder()
+            self.assertIs(w.module_stack.currentWidget(), w.firmware_page)
+            self.assertEqual(w.firmware_page.interface_type(), 1)
+            self.assertEqual(w.firmware_page.imu_format_box.currentIndex(), 0)
+            self.assertEqual(w.firmware_page.baud_box.currentText(), "256000")
+
+            w.remote_page.fmt_edit.setText("CMD,{x},{y}")
+            w.remote_page.baud_box.setCurrentText("9600")
+            w.remote_page.open_remote_interface_builder()
+            self.assertIs(w.module_stack.currentWidget(), w.firmware_page)
+            self.assertEqual(w.firmware_page.interface_type(), 2)
+            self.assertEqual(w.firmware_page.remote_fmt_edit.text(), "CMD,{x},{y}")
+            self.assertEqual(w.firmware_page.baud_box.currentText(), "9600")
+
+            w.open_firmware_builder(0)
+            self.assertEqual(w.firmware_page.interface_type(), 0)
+            w.close()
 
 
 if __name__ == "__main__":

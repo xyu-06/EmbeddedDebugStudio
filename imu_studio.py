@@ -409,7 +409,9 @@ class ImuStudioPage(W.QWidget):
         tbar.addWidget(self._btn("航向归零 (Yaw=0)", self.zero_yaw))
         tbar.addWidget(self._btn("清空曲线", self.clear_history))
         tbar.addWidget(self._btn("🎯 标定机械中值角", self.start_zero_capture, "accent"))
-        tbar.addWidget(self._btn("复制 MPU6050 上报 C 代码", self.copy_imu_c_snippet))
+        imu_iface_btn = self._btn("🧩 IMU 接口与说明", self.open_imu_interface_builder)
+        imu_iface_btn.setToolTip("跳转至【🧩 接口构建】统一选择 STM32 HAL / 标准库 SPL / ESP32·Arduino，复制或导出 MPU6050 上报代码及查看配置说明")
+        tbar.addWidget(imu_iface_btn)
         self.state_badge = W.QLabel("● 未连接")
         self.state_badge.setStyleSheet("color:#71808b;font-weight:600;padding-left:8px;")
         tbar.addWidget(self.state_badge)
@@ -640,6 +642,16 @@ class ImuStudioPage(W.QWidget):
         )
         W.QApplication.clipboard().setText(snippet)
         self.zero_result.setText("✓ 已复制 STM32 MPU6050 六轴串口上报 C 代码到剪贴板！")
+
+    def open_imu_interface_builder(self):
+        # IMU_PROTOCOLS: 0=平衡车四列, 1=欧拉角三列, 2=六轴物理量, 3=原始计数
+        # firmware_studio IMU_FORMATS: 0=六轴物理量, 1=原始计数, 2=平衡车四列, 3=欧拉角三列
+        proto_map = {0: 2, 1: 3, 2: 0, 3: 1}
+        mapped = proto_map.get(self.proto_box.currentIndex(), 0)
+        if self.host is not None and hasattr(self.host, "open_firmware_builder"):
+            self.host.open_firmware_builder(1, imu_format=mapped, baudrate=self.baud_box.currentText().strip())
+        else:
+            self.copy_imu_c_snippet()
 
     # ---------- Telemetry ingestion & Complementary Filter ----------
     def ingest_values(self, vals, t_sec: float, dt_s: float):

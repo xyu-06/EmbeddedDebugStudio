@@ -449,7 +449,9 @@ class RemoteBtPage(W.QWidget):
         tbar.addWidget(self.conn_btn)
         tbar.addWidget(self.at_baud_quick)
         tbar.addWidget(self._btn("⚠ AT 必读说明", self.show_cautions_dialog))
-        tbar.addWidget(self._btn("复制 STM32 混控 C 代码", self.copy_stm32_mixer_code))
+        rem_iface_btn = self._btn("🧩 遥控接口与说明", self.open_remote_interface_builder)
+        rem_iface_btn.setToolTip("跳转至【🧩 接口构建】统一选择 STM32 HAL / 标准库 SPL / ESP32·Arduino，复制或导出差速混控代码及查看配置说明")
+        tbar.addWidget(rem_iface_btn)
         tbar.addWidget(self.badge)
         tbar.addStretch()
         tbar.addWidget(self.estop_btn)
@@ -1007,6 +1009,16 @@ class RemoteBtPage(W.QWidget):
 
     def show_cautions_dialog(self):
         W.QMessageBox.information(self, "HC-05 AT 配置注意事项（源自 BlueSerialStudio）", HC05_CAUTIONS)
+
+    def open_remote_interface_builder(self):
+        if self.host is not None and hasattr(self.host, "open_firmware_builder"):
+            self.host.open_firmware_builder(
+                2,
+                remote_cmd_fmt=self.fmt_edit.text().strip(),
+                baudrate=self.baud_box.currentText().strip(),
+            )
+        else:
+            self.copy_stm32_mixer_code()
 
     def copy_stm32_mixer_code(self):
         code = (
