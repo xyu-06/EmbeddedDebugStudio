@@ -1385,6 +1385,9 @@ class GuiChecks(unittest.TestCase):
         self.assertIn("#ROLES:output,error,actual,target", ino_bundle["EmbeddedDebugStudio_PID.ino"])
 
         page = FirmwareStudioPage()
+        self.assertIsInstance(page.splitter, W.QSplitter)
+        self.assertEqual(page.splitter.count(), 2)
+        page.splitter.setSizes([480, 620])
         page.apply_preset(2)  # custom order preset
         self.assertEqual(page.channels_data()[0][1], "output")
         page.move_channel(-1) if False else None

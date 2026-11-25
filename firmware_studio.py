@@ -25,7 +25,7 @@ PLATFORMS = (
 
 INTERFACE_PRESETS = (
     (
-        "⚡ 电机速度环 (4通道 SPD)",
+        "⚡ 速度环 (4ch SPD)",
         {
             "primary_loop": "SPD",
             "control_ms": 10,
@@ -41,7 +41,7 @@ INTERFACE_PRESETS = (
         },
     ),
     (
-        "⚖ 平衡车双环 (6通道 ANG+SPD)",
+        "⚖ 平衡车 (6ch 双环)",
         {
             "primary_loop": "ANG",
             "control_ms": 5,
@@ -59,7 +59,7 @@ INTERFACE_PRESETS = (
         },
     ),
     (
-        "🔀 自定义乱序示例 (PWM在前)",
+        "🔀 乱序示例 (PWM在前)",
         {
             "primary_loop": "SPD",
             "control_ms": 10,
@@ -75,7 +75,7 @@ INTERFACE_PRESETS = (
         },
     ),
     (
-        "🎯 位置伺服 / 云台 (4通道 ANG)",
+        "🎯 位置伺服 (4ch ANG)",
         {
             "primary_loop": "ANG",
             "control_ms": 10,
@@ -762,19 +762,25 @@ class FirmwareStudioPage(W.QWidget):
     def _build_ui(self):
         root = W.QHBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 8)
-        root.setSpacing(10)
+        root.setSpacing(6)
+
+        self.splitter = W.QSplitter(C.Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(6)
+        root.addWidget(self.splitter, 1)
 
         # ---------- Left scrollable builder config ----------
         left_scroll = W.QScrollArea()
         left_scroll.setWidgetResizable(True)
         left_scroll.setFrameShape(W.QFrame.Shape.NoFrame)
-        left_scroll.setFixedWidth(400)
+        left_scroll.setMinimumWidth(320)
+        left_scroll.setHorizontalScrollBarPolicy(C.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         left_box = W.QWidget()
         left_layout = W.QVBoxLayout(left_box)
         left_layout.setContentsMargins(2, 2, 6, 2)
         left_layout.setSpacing(8)
         left_scroll.setWidget(left_box)
-        root.addWidget(left_scroll)
+        self.splitter.addWidget(left_scroll)
 
         # Quick presets card
         preset_card = W.QFrame()
@@ -787,6 +793,7 @@ class FirmwareStudioPage(W.QWidget):
         pgrid.setSpacing(6)
         for idx, (label, _) in enumerate(INTERFACE_PRESETS):
             btn = W.QPushButton(label)
+            btn.setMinimumWidth(0)
             btn.clicked.connect(lambda _=False, i=idx: self.apply_preset(i))
             pgrid.addWidget(btn, idx // 2, idx % 2)
         pv.addLayout(pgrid)
@@ -796,30 +803,39 @@ class FirmwareStudioPage(W.QWidget):
         cfg_card = W.QFrame()
         cfg_card.setObjectName("card")
         cf = W.QFormLayout(cfg_card)
+        cf.setFieldGrowthPolicy(W.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         cf.setContentsMargins(10, 8, 10, 8)
         cf.setSpacing(6)
         cf.addRow(W.QLabel("<b>⚙ 目标工程与默认参数</b>"))
 
         self.platform_box = W.QComboBox()
         self.platform_box.addItems(list(PLATFORMS))
+        self.platform_box.setMinimumWidth(0)
+        self.platform_box.setSizeAdjustPolicy(W.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.uart_edit = W.QLineEdit("huart2")
+        self.uart_edit.setMinimumWidth(0)
         self.baud_box = W.QComboBox()
         self.baud_box.setEditable(True)
+        self.baud_box.setMinimumWidth(0)
         self.baud_box.addItems(["115200", "256000", "460800", "921600", "9600"])
         self.loop_box = W.QComboBox()
         self.loop_box.addItems(list(LOOPS))
+        self.loop_box.setMinimumWidth(0)
         self.loop_box.setCurrentText("SPD")
 
         self.ctrl_ms = W.QSpinBox()
         self.ctrl_ms.setRange(1, 200)
         self.ctrl_ms.setValue(10)
+        self.ctrl_ms.setMinimumWidth(0)
         self.rep_ms = W.QSpinBox()
         self.rep_ms.setRange(1, 500)
         self.rep_ms.setValue(20)
+        self.rep_ms.setMinimumWidth(0)
         self.pwm_lim = W.QDoubleSpinBox()
         self.pwm_lim.setRange(1.0, 100000.0)
         self.pwm_lim.setDecimals(1)
         self.pwm_lim.setValue(1000.0)
+        self.pwm_lim.setMinimumWidth(0)
 
         self.def_kp = W.QDoubleSpinBox()
         self.def_ki = W.QDoubleSpinBox()
@@ -829,6 +845,7 @@ class FirmwareStudioPage(W.QWidget):
             sp.setRange(-100000.0, 100000.0)
             sp.setDecimals(4)
             sp.setValue(val)
+            sp.setMinimumWidth(0)
 
         self.emit_roles_chk = W.QCheckBox("上报 #ROLES: 角色声明（支持任意列顺序）")
         self.emit_roles_chk.setChecked(True)
@@ -853,11 +870,12 @@ class FirmwareStudioPage(W.QWidget):
         cv.addWidget(W.QLabel("<b>📡 串口上报通道定义（1～8 通道，可任意调序）</b>"))
 
         btn_row = W.QHBoxLayout()
-        self.add_ch_btn = W.QPushButton("+ 添加通道")
-        self.del_ch_btn = W.QPushButton("- 删除通道")
+        self.add_ch_btn = W.QPushButton("+ 添加")
+        self.del_ch_btn = W.QPushButton("- 删除")
         self.up_ch_btn = W.QPushButton("↑ 上移")
         self.dn_ch_btn = W.QPushButton("↓ 下移")
         for b in (self.add_ch_btn, self.del_ch_btn, self.up_ch_btn, self.dn_ch_btn):
+            b.setMinimumWidth(0)
             btn_row.addWidget(b)
         cv.addLayout(btn_row)
 
@@ -882,10 +900,14 @@ class FirmwareStudioPage(W.QWidget):
 
         # ---------- Right output code + protocol docs ----------
         right_box = W.QWidget()
+        right_box.setMinimumWidth(340)
         right_layout = W.QVBoxLayout(right_box)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(8)
-        root.addWidget(right_box, 1)
+        self.splitter.addWidget(right_box)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([480, 760])
 
         # Top action bar
         top_bar = W.QFrame()
@@ -893,6 +915,8 @@ class FirmwareStudioPage(W.QWidget):
         tb = W.QHBoxLayout(top_bar)
         tb.setContentsMargins(10, 6, 10, 6)
         self.proto_badge = W.QLabel()
+        self.proto_badge.setMinimumWidth(0)
+        self.proto_badge.setSizePolicy(W.QSizePolicy.Policy.Ignored, W.QSizePolicy.Policy.Preferred)
         self.proto_badge.setStyleSheet("font-weight:600;color:#176a57;")
         tb.addWidget(self.proto_badge, 1)
         self.copy_file_btn = W.QPushButton("📋 复制当前文件")
@@ -900,6 +924,8 @@ class FirmwareStudioPage(W.QWidget):
         self.export_dir_btn.setObjectName("accent")
         self.goto_pid_btn = W.QPushButton("📈 去 PID 页联调")
         self.goto_pid_btn.setObjectName("primary")
+        for b in (self.copy_file_btn, self.export_dir_btn, self.goto_pid_btn):
+            b.setMinimumWidth(0)
         tb.addWidget(self.copy_file_btn)
         tb.addWidget(self.export_dir_btn)
         tb.addWidget(self.goto_pid_btn)
@@ -990,7 +1016,10 @@ class FirmwareStudioPage(W.QWidget):
                 lbl.setFixedWidth(30)
                 ed = W.QLineEdit(str(name))
                 ed.setMaxLength(24)
+                ed.setMinimumWidth(0)
                 cb = W.QComboBox()
+                cb.setMinimumWidth(0)
+                cb.setSizeAdjustPolicy(W.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
                 for rk, rlabel in CHANNEL_ROLES:
                     cb.addItem(rlabel, rk)
                 pos = cb.findData(role)
@@ -1092,7 +1121,9 @@ class FirmwareStudioPage(W.QWidget):
             return
         cfg = self.config_dict()
         names_hdr, roles_hdr = build_protocol_headers(cfg["channels"], emit_roles=cfg["emit_roles"])
-        self.proto_badge.setText(f"{names_hdr}" + (f"   |   {roles_hdr}" if roles_hdr else ""))
+        badge_txt = f"{names_hdr}" + (f"   |   {roles_hdr}" if roles_hdr else "")
+        self.proto_badge.setText(badge_txt)
+        self.proto_badge.setToolTip(badge_txt)
         self._bundle = generate_interface_bundle(cfg)
 
         prev_file = self.file_combo.currentText()
@@ -1165,9 +1196,13 @@ class FirmwareStudioPage(W.QWidget):
     def save_state(self, settings: C.QSettings):
         import json
         settings.setValue("firmware_studio/config", json.dumps(self.config_dict(), ensure_ascii=False))
+        settings.setValue("firmware_studio/splitter", self.splitter.saveState())
 
     def restore_state(self, settings: C.QSettings):
         import json
+        split_state = settings.value("firmware_studio/splitter")
+        if split_state is not None:
+            self.splitter.restoreState(split_state)
         raw = settings.value("firmware_studio/config", "")
         if not raw:
             return
