@@ -1550,6 +1550,12 @@ class GuiChecks(unittest.TestCase):
             W.QApplication.processEvents()
             wheel(fw_kp, 120)
             self.assertGreater(fw_kp.value(), v0)
+
+            # 3) Platform & IMU format QComboBoxes render at full readable width (>=140 px)
+            self.assertGreaterEqual(w.firmware_page.platform_box.width(), 140)
+            w.firmware_page.set_interface_type(1)
+            W.QApplication.processEvents()
+            self.assertGreaterEqual(w.firmware_page.imu_format_box.width(), 140)
             w.close()
 
 
