@@ -47,22 +47,33 @@ class AutoTuneController:
     def detect_channels(self):
         """Return (actual_channel_index, optional_output_channel_index)."""
         w = self.ui
+        target_tags = ("target", "目标", "setpoint", "sp", "tgt", "ref")
+        actual_tags = ("actual", "实际", "feedback", "fb", "meas")
+        output_tags = ("pwm", "输出", "output", "out", "duty", "占空")
         actual = w.actual_ch.currentData()
-        if actual is None or actual >= MAX_CHANNELS:
-            if w.sim or w.count >= 4:
+        names = [n.lower() for n in w.names()[:w.count]]
+        if actual is None or actual >= max(1, w.count) or actual >= MAX_CHANNELS:
+            matched = next((i for i, n in enumerate(names) if any(t in n for t in actual_tags)), None)
+            if matched is not None:
+                actual = matched
+            elif w.sim or w.count >= 3 or (w.count >= 2 and any(t in names[0] for t in target_tags)):
                 actual = 1
-            elif w.count >= 1:
-                actual = 0
             else:
-                actual = 1 if w.source.currentIndex() == 1 else 0
-        output = None
-        if w.sim or w.count >= 3:
-            output = 2 if actual != 2 else None
-        elif w.count == 2:
-            other = 1 - actual
-            names = [n.lower() for n in w.names()[:w.count]]
-            if w.right_channel == other or any(tag in names[other] for tag in ("pwm", "输出", "out", "duty", "占空")):
-                output = other
+                actual = 0
+        elif actual == 0 and w.count >= 2 and w.channel_preferences[1] != 0:
+            if any(t in names[0] for t in target_tags) or any(t in names[1] for t in actual_tags):
+                actual = 1
+                idx = w.actual_ch.findData(1)
+                if idx >= 0:
+                    with C.QSignalBlocker(w.actual_ch):
+                        w.actual_ch.setCurrentIndex(idx)
+
+        output = next((i for i, n in enumerate(names) if i != actual and any(t in n for t in output_tags)), None)
+        if output is None:
+            if (w.sim or w.count >= 3) and actual != 2:
+                output = 2
+            elif w.count == 2 and w.right_channel == 1 - actual:
+                output = 1 - actual
         return actual, output
 
     def open_dialog(self):
@@ -210,10 +221,6 @@ class AutoTuneController:
         self.saved_before = {
             k: w.confirmed.get(f"{group}.{k}", w.fields[k].value()) for k in KEYS
         }
-        # Ensure a target reference line or target channel is active so step overlay renders nicely
-        if not w.sim and w.count <= 2 and not any(w.ref_active):
-            w.follow[0] = group
-            w.set_reference(0, "整定目标", target)
 
         self.state = self.WAIT_START
         self.wall_deadline = monotonic() + 3.0
@@ -386,7 +393,17 @@ class AutoTuneController:
                 if now > self.wall_deadline:
                     self.stop("未收到设备上报波形，请检查串口数据输出", apply_best=False)
                 return
+            target_tags = ("target", "目标", "setpoint", "sp", "tgt", "ref")
+            if not w.sim and 1 <= w.count <= 2 and not any(w.ref_active):
+                names_lower = [n.lower() for n in w.names()[:w.count]]
+                if not any(t in names_lower[0] for t in target_tags):
+                    w.follow[0] = self.group
+                    w.set_reference(0, "整定目标", self.engine.target)
             self.actual_col, self.output_col = self.detect_channels()
+            ch_names = w.names()
+            actual_desc = ch_names[self.actual_col] if self.actual_col < len(ch_names) else f"CH{self.actual_col+1}"
+            out_desc = f"CH{self.output_col+1}({ch_names[self.output_col]})" if self.output_col is not None and self.output_col < len(ch_names) else "无"
+            w.log("整定", f"检测通道：实际反馈=CH{self.actual_col+1}({actual_desc}) · 输出参考={out_desc}")
             self.state = self.PREPARE
 
         if self.state == self.PREPARE:
@@ -482,6 +499,16 @@ class AutoTuneController:
             times = seg[:, 0]
             actual = seg[:, self.actual_col + 1]
             outputs = seg[:, self.output_col + 1] if self.output_col is not None else None
+            finite_y = actual[np.isfinite(actual)]
+            step_amp = abs(self.engine.target - self.base_y)
+            if len(finite_y) >= 6 and step_amp > 1e-3:
+                check_y = finite_y[1:] if (len(finite_y) >= 8 and abs(float(finite_y[0]) - self.base_y) <= 0.05 * step_amp) else finite_y
+                if float(np.max(np.abs(check_y - self.engine.target))) <= 0.02 * step_amp:
+                    self.stop(
+                        f"检测到反馈通道 CH{self.actual_col+1} 与目标值完全重合（疑似误选目标通道），已中止并恢复原参数，请在左侧『阶跃与游标』将实际通道改为实测反馈通道",
+                        apply_best=False,
+                    )
+                    return
             prev_best = self.engine.best_eval.score if self.engine.best_eval else float("inf")
             ev = self.engine.record_result(times, actual, base_y=self.base_y, outputs=outputs)
 

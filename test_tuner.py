@@ -1251,6 +1251,90 @@ class GuiChecks(unittest.TestCase):
             rp.release_port()
             w.close()
 
+    def test_v171_pid_debug_zero_start_channel_detection_and_target_guard(self):
+        # 1) Reproduce User/pid_debug.c: count==0 before @RUN, then #NAMES:target,actual,output,error + 4-col data
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "cfg.ini")
+            w.timer.stop()
+            w.connected = True
+            w.sim = None
+            w.group.setCurrentIndex(1)  # SPD
+            w.fields["KP"].setValue(5.0)
+            w.fields["KI"].setValue(30.0)
+            w.fields["KD"].setValue(0.05)
+            w.fields["TGT"].setValue(100.0)
+            w.confirmed.update({"SPD.KP": 5.0, "SPD.KI": 30.0, "SPD.KD": 0.05, "SPD.TGT": 100.0})
+
+            w.commands.submit = lambda cmds, quiet=False: True
+            w.commands.busy = lambda: False
+
+            ok = w.autotuner.start(mode=0, style=1, strategy=0, base=0.0, target=100.0, step_seconds=1.5, max_rounds=6)
+            self.assertTrue(ok)
+            # Must NOT prematurely create reference line when count == 0
+            self.assertFalse(w.ref_active[0])
+
+            # Simulated first frame arriving after @RUN (with STM32 #NAMES:target,actual,output,error)
+            t0 = time.monotonic()
+            w.receive(b"#NAMES:target,actual,output,error\n", t0)
+            w.receive(b"0.0,0.0,0.0,0.0\n", t0 + 0.01)
+            w.autotuner.tick(t0 + 0.02)
+
+            self.assertFalse(w.ref_active[0])
+            self.assertEqual(w.actual_ch.currentData(), 1)
+            self.assertEqual(w.autotuner.actual_col, 1)
+            self.assertEqual(w.autotuner.output_col, 2)
+
+            # 2) Even if a manual reference line exists, 4-ch named stream still picks CH2 (actual=1)
+            w.set_reference(0, "参考", 50.0)
+            w.channel_preferences[1] = None
+            w.refresh_channels()
+            self.assertEqual(w.actual_ch.currentData(), 1)
+            w.close()
+
+        # 3) Anti-target-channel guard aborts and restores original params if sampled actual tracks target at sample 0
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "guard.ini")
+            w.timer.stop()
+            w.connected = True
+            w.sim = None
+            w.group.setCurrentIndex(1)
+            w.fields["KP"].setValue(5.0)
+            w.fields["KI"].setValue(30.0)
+            w.fields["KD"].setValue(0.05)
+            w.fields["TGT"].setValue(100.0)
+            w.confirmed.update({"SPD.KP": 5.0, "SPD.KI": 30.0, "SPD.KD": 0.05, "SPD.TGT": 100.0})
+            sent = []
+            def fake_submit(cmds, quiet=False):
+                sent.extend(cmds)
+                return True
+            w.commands.submit = fake_submit
+            w.commands.busy = lambda: False
+
+            w.receive(b"100.0,15.0,69,85.0\n", time.monotonic())
+            w.channel_preferences[1] = 0
+            w.refresh_channels()
+            self.assertEqual(w.actual_ch.currentData(), 0)
+
+            self.assertTrue(w.autotuner.start(mode=0, style=1, strategy=0, base=0.0, target=100.0, step_seconds=0.5, max_rounds=6))
+            w.autotuner.tick(time.monotonic())  # WAIT_START -> PREPARE
+            w.autotuner.tick(time.monotonic())  # PREPARE -> WAIT_BASE_ACK
+            w.autotuner.tick(time.monotonic())  # WAIT_BASE_ACK -> SETTLE_BASE
+            for k in range(12):
+                w.sample(w.latest + 0.05, [0.0, 0.0, 0.0, 0.0])
+            w.autotuner.tick(time.monotonic())  # SETTLE_BASE -> WAIT_STEP_ACK
+            w.autotuner.tick(time.monotonic())  # WAIT_STEP_ACK -> OBSERVE
+            sent.clear()
+            for k in range(12):
+                # Mis-selected CH1 jumps instantaneously to target=100 from the very first sample
+                w.sample(w.latest + 0.05, [100.0, 15.0, 69.0, 85.0])
+            w.autotuner.tick(time.monotonic())
+
+            self.assertFalse(w.autotuner.active)
+            self.assertIn("误选目标通道", w.autotune_status.text())
+            self.assertTrue(any("SPD.KP=5.0000" in c for c in sent))
+            self.assertTrue(any("SPD.KI=30.0000" in c for c in sent))
+            w.close()
+
 
 if __name__ == "__main__":
     unittest.main()

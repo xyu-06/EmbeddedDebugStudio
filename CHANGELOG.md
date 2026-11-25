@@ -1,5 +1,15 @@
 # 嵌入式综合调试助手（EmbeddedDebugStudio）更新记录
 
+## v1.7.1（2026-11-25）
+
+### Bug 修复：STM32 `pid_debug.c` 自动整定误选目标通道导致整定失灵
+- **延后并在 `WAIT_START` 按通道数创建参考线**（`autotune_ui.py`、`main.py`）：
+  - 修复下位机在收到 `@RUN` 前未上报数据（`w.count == 0`）时，自动整定误判 `w.count <= 2` 而提前插入 `"整定目标"` 参考线，进而在首帧到达（`#NAMES:target,actual,output,error`）后把 `actual_ch` 默认误选成 `CH1 (target)`、把阶跃超调/调节时间误算为 `0.0% / 0.00 s / J=0.000` 并挑出过小 `KP/KI` 的缺陷。
+  - `refresh_channels()` 与 `AutoTuneController.detect_channels()` 优先按通道名（`target/目标`、`actual/实际`、`output/pwm`）与 `>=3` 通道结构精准锁定真实反馈通道（`CH2`）与输出参考通道（`CH3`），即便用户手动添加了参考线也保持正确匹配。
+- **增加目标通道误选防呆保护**（`autotune_ui.py`）：若 `OBSERVE` 阶跃首帧至末帧全程贴合 `target`（`±2%` 内无真实响应过程），立即中止整定、将整定前原参数写回设备并明确提示修正反馈通道。
+
+---
+
 ## v1.7（2026-11-25）
 
 针对 v1.6 工程审计报告完成全部 **12 项协议一致性、控制安全性与多通道扩展加固**：

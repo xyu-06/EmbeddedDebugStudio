@@ -1218,8 +1218,13 @@ class Window(W.QMainWindow):
         self.calibrate_btn.setEnabled(not self.writer)
         ids = [*range(count),*(REF_BASE+i for i in refs)]
         speed_pwm = count==2 and not self.sim and any(tag in names[1].lower() for tag in ("pwm","占空","duty"))
+        target_tags = ("target","目标","setpoint","sp","tgt","ref")
+        actual_tags = ("actual","实际","feedback","fb","meas","pitch","rpm","speed","vel","pos")
+        ch0_is_target = count>=2 and any(tag in names[0].lower() for tag in target_tags)
+        ch1_is_actual = count>=2 and any(tag in names[1].lower() for tag in actual_tags)
+        has_target_ch = count>=3 or ch0_is_target or (count>=2 and ch1_is_actual and not speed_pwm)
         defaults = [REF_BASE+refs[0] if refs else None if speed_pwm else 0,
-                    1 if count>=2 and (self.sim or not (refs or speed_pwm)) else 0]
+                    1 if count>=2 and (self.sim or has_target_ch or not (refs or speed_pwm)) else 0]
         for role,widget in enumerate((self.target_ch,self.actual_ch)):
             with C.QSignalBlocker(widget):
                 widget.clear()
