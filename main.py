@@ -18,7 +18,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 from serial.tools import list_ports
 
-from engine import DEFAULTS, KEYS, LIMIT, LOOPS, MAX_CHANNELS, MAX_REFS, REF_BASE, Lines, Simulator, step_metrics
+from engine import DEFAULTS, KEYS, LIMIT, LOOPS, MAX_CHANNELS, MAX_REFS, REF_BASE, Lines, Simulator, disturbance_metrics, step_metrics
 from generator import SHAPES, TargetGenerator
 from imu_studio import ImuStudioPage
 from layout_ui import STYLE, build, number
@@ -26,7 +26,8 @@ from remote_studio import RemoteBtPage
 from firmware_studio import FirmwareStudioPage
 from scope import COLORS, REF_COLORS
 from serial_studio import SerialAssistantPage
-from storage import History, PARAM_COLS, csv_header, csv_row, load_csv
+from storage import History, PARAM_COLS, csv_header, csv_row, inspect_csv, load_csv
+from telemetry_schema import infer_channel_unit
 from transport import SerialLink
 from version import APP_NAME, APP_TITLE_ZH, APP_VERSION
 
@@ -79,6 +80,7 @@ class Window(W.QMainWindow):
         self.deferred_marks = deque(maxlen=100)
         self.record_file = self.writer = None
         self.frozen_params = None
+        self.last_disturb_info = None
         self.rx = self.tx = self.bad = self.count = self.frames = self.dropped = 0
         self.rate_frames = self.fps = 0
         self.epoch = self.rate_start = monotonic()
@@ -376,8 +378,8 @@ class Window(W.QMainWindow):
         self.save_draft()
         s = self.settings
         opts = {name:getattr(self,name).currentIndex() for name in
-                ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode","gen_shape","step_gear")}
-        opts.update({name:getattr(self,name).value() for name in ("rate","ymin","ymax","line","trigger_level","capture_seconds","pre_percent","x_div","y_div","gen_amp","gen_period","gen_rate")})
+                ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode","gen_shape","step_gear","capture_mode")}
+        opts.update({name:getattr(self,name).value() for name in ("rate","ymin","ymax","line","trigger_level","capture_seconds","pre_percent","x_div","y_div","gen_amp","gen_period","gen_rate","capture_pwm_limit")})
         opts.update({name:getattr(self,name).isChecked() for name in ("grid","legend","show_stats","auto","autoscroll","hex_mode","reduce_motion","dark","overlays","terminal_toggle","auto_reconnect","slider_toggle")})
         s.setValue("layoutPreset",self.preset.currentIndex())
         opts.update(window_seconds=self.window.value(),colors=self.colors)
@@ -411,7 +413,7 @@ class Window(W.QMainWindow):
             for g,rules in opts.get("rules",{}).items():
                 if g in LOOPS and isinstance(rules,dict):
                     self.rules[g].update({k:tuple(v) for k,v in rules.items() if k in KEYS and valid_rule(v)})
-            for key in ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode","gen_shape","step_gear"):
+            for key in ("bits","parity","stops","flow","time_mode","yscale","model","address","group","band","source","trigger_edge","render_mode","gen_shape","step_gear","capture_mode"):
                 w = getattr(self,key)
                 value = opts.get(key,w.currentIndex())
                 if isinstance(value,int) and 0 <= value < w.count():
@@ -423,7 +425,7 @@ class Window(W.QMainWindow):
             for i,color in enumerate(opts.get("colors",[])[:MAX_CHANNELS+MAX_REFS]):
                 if isinstance(color,str) and QtGui.QColor.isValidColorName(color):
                     self.colors[i] = QtGui.QColor(color).name()
-            for key in ("rate","ymin","ymax","line","trigger_level","capture_seconds","pre_percent","x_div","y_div","gen_amp","gen_period","gen_rate"):
+            for key in ("rate","ymin","ymax","line","trigger_level","capture_seconds","pre_percent","x_div","y_div","gen_amp","gen_period","gen_rate","capture_pwm_limit"):
                 if key in opts:
                     getattr(self,key).setValue(float(opts[key]))
             for key in ("grid","legend","show_stats","auto","autoscroll","hex_mode","reduce_motion","dark","overlays","terminal_toggle","auto_reconnect","slider_toggle"):
@@ -528,6 +530,7 @@ class Window(W.QMainWindow):
         self.save_draft()
         self.last_group = self.selected()
         self.load_fields()
+        self.address_ui()
         if self.sim:
             self.clear_plot()
             self.log("系统","仿真波形已切换到 " + self.selected())
@@ -537,6 +540,10 @@ class Window(W.QMainWindow):
         if single:
             self.group.setCurrentIndex(0)
         self.group.setEnabled(not single and not (self.sim and self.writer) and self.generator is None and not self.autotuner.active)
+        if hasattr(self, "field_labels"):
+            grp = self.selected()
+            for k, lbl in self.field_labels.items():
+                lbl.setText(f"@{k}" if single else f"{grp}.{k}")
 
     def edited(self,key,value):
         self.drafts[self.selected()][key] = value
@@ -936,8 +943,12 @@ class Window(W.QMainWindow):
                 self.stop_banner.show()
             elif kind == "names":
                 if not self.writer:
-                    for w,n in zip(self.name_edits,payload):
+                    for idx, (w, n) in enumerate(zip(self.name_edits, payload)):
                         w.setPlaceholderText(n[:32])
+                        if not w.text().strip() and not self.units[idx]:
+                            inferred = infer_channel_unit(n)
+                            if inferred:
+                                self.units[idx] = inferred
                     self.channel_names()
             elif kind == "roles":
                 if not self.writer:
@@ -1409,7 +1420,7 @@ class Window(W.QMainWindow):
                 self.scope.step_overlay(segment,target+1,actual+1,.05 if self.band.currentIndex() else .02,metrics)
             else:
                 self.scope.clear_step()
-            if self.scope.ghost:
+            if self.scope.ghost and self.scope.ghost.get("kind", "step") == "step":
                 targets = segment[:, target + 1]
                 changes = np.flatnonzero(~np.isclose(targets[1:], targets[:-1], rtol=1e-7, atol=1e-9) & np.isfinite(targets[1:])) + 1
                 if len(changes):
@@ -1420,7 +1431,7 @@ class Window(W.QMainWindow):
                         self.scope.align_ghost(float(segment[k, 0]), float(prev[-1]), float(targets[k]), actual + 1)
             vals = ["—" if x is None else f"{x:.3g}" for x in metrics]
             msg = f"超调  {vals[0]} %　 上升  {vals[1]} s\n调节  {vals[2]} s　 尾段误差  {vals[3]}\nIAE  {vals[4]}"
-            if self.scope.ghost:
+            if self.scope.ghost and self.scope.ghost.get("kind", "step") == "step":
                 gm = self.scope.ghost["metrics"]
                 g_os = f"{gm[0]:.3g}%" if gm[0] is not None else "—"
                 g_st = f"{gm[2]:.3g}s" if gm[2] is not None else "—"
@@ -1458,7 +1469,112 @@ class Window(W.QMainWindow):
         self.scope.clear_ghost()
         self.clear_ghost_btn.setEnabled(False)
         self.analyze()
+        if self.last_disturb_info is not None:
+            self._compute_disturbance(
+                t_load=self.last_disturb_info["metrics"].get("t_load"),
+                t_unload=self.last_disturb_info["metrics"].get("t_unload"),
+            )
         self.feedback("已清除对比底图")
+
+    def on_capture_complete(self, crossing, start, end):
+        if self.capture_mode.currentIndex() == 1:
+            info = self._compute_disturbance()
+            if info and self.scope.ghost and self.scope.ghost.get("kind") == "capture":
+                self.scope.align_capture_ghost(crossing)
+        else:
+            self.pin_disturb_btn.setEnabled(False)
+            self.recalc_disturb_btn.setEnabled(False)
+
+    def _compute_disturbance(self, t_load=None, t_unload=None):
+        a = self.scope.data
+        if not self.scope.frozen or not len(a):
+            return None
+        start, end = self.capture.last_range or self.scope.viewRange()[0]
+        crossing = self.capture.last_crossing if self.capture.last_crossing is not None else float(start)
+        sub = a[(a[:, 0] >= start) & (a[:, 0] <= end)]
+        if len(sub) < 3:
+            sub = a
+        actual = self.actual_ch.currentData()
+        if actual is None or actual >= MAX_CHANNELS:
+            actual = self.capture.capture_channel if self.capture.capture_channel is not None else 0
+        target = self.target_ch.currentData()
+        tgt_arg = sub[:, target + 1] if (target is not None and target != actual) else self.fields["TGT"].value()
+        _, output_col = self.autotuner.detect_channels()
+        u_arg = sub[:, output_col + 1] if output_col is not None else None
+        limit = self.capture_pwm_limit.value()
+        band = 0.05 if self.band.currentIndex() else 0.02
+        dm = disturbance_metrics(
+            sub[:, 0], tgt_arg, sub[:, actual + 1], outputs=u_arg,
+            band=band, output_limit=(limit if limit > 0 else None),
+            t_load=t_load, t_unload=t_unload,
+        )
+        if dm is None:
+            self.disturb_summary.setText("当前捕获窗口样本不足，无法统计负载扰动指标。")
+            return None
+        g = self.selected()
+        kp = self.confirmed.get(f"{g}.KP", self.fields["KP"].value())
+        ki = self.confirmed.get(f"{g}.KI", self.fields["KI"].value())
+        kd = self.confirmed.get(f"{g}.KD", self.fields["KD"].value())
+        pid_tag = f"KP={kp:.3g},KI={ki:.3g},KD={kd:.3g}"
+        rec_txt = f"{dm['recovery_s']:.2f} s" if dm["recovery_s"] is not None else "未恢复"
+        sat_txt = f"{dm['sat_time_s']:.2f} s" if dm["sat_time_s"] is not None else "—"
+        pre_txt = f"{dm['pre_pwm']:.0f}" if dm["pre_pwm"] is not None else "—"
+        lines = [
+            f"最大掉速 {dm['max_drop']:.2f}　卸载冲高 {dm['unload_overshoot']:.2f}",
+            f"恢复时间 {rec_txt}　PWM 饱和 {sat_txt}",
+            f"当前参数 ({pid_tag}) · 触发前 PWM={pre_txt}",
+        ]
+        if self.scope.ghost and self.scope.ghost.get("kind") == "capture":
+            gm = self.scope.ghost["metrics"]
+            g_rec = f"{gm['recovery_s']:.2f} s" if gm.get("recovery_s") is not None else "未恢复"
+            g_pre = f"{gm['pre_pwm']:.0f}" if gm.get("pre_pwm") is not None else "—"
+            lines.append(
+                f"对比底图 ({self.scope.ghost['tag']}): 掉速 {gm['max_drop']:.2f} · "
+                f"冲高 {gm['unload_overshoot']:.2f} · 恢复 {g_rec} · 触发前 PWM={g_pre}"
+            )
+        self.disturb_summary.setText("\n".join(lines))
+        self.pin_disturb_btn.setEnabled(True)
+        self.recalc_disturb_btn.setEnabled(True)
+        info = {
+            "metrics": dm,
+            "crossing": crossing,
+            "range": (start, end),
+            "channel_col": actual + 1,
+            "data": sub.copy(),
+            "pid_tag": pid_tag,
+        }
+        self.last_disturb_info = info
+        return info
+
+    def pin_disturb_ghost(self):
+        info = self.last_disturb_info or self._compute_disturbance()
+        if not info:
+            self.feedback("当前没有可锁定的负载扰动捕获数据", True)
+            return
+        if self.scope.pin_capture_ghost(
+            info["data"], info["channel_col"], info["crossing"], info["metrics"], info["pid_tag"]
+        ):
+            self.clear_ghost_btn.setEnabled(True)
+            self._compute_disturbance(
+                t_load=info["metrics"].get("t_load"),
+                t_unload=info["metrics"].get("t_unload"),
+            )
+            self.feedback("已锁定当前负载扰动捕获为对比底图（下次触发将按触发点自动对齐叠加）")
+
+    def recalc_disturbance_with_cursors(self):
+        cursors = sorted(float(c.value()) for c in getattr(self.scope, "cursors", []))
+        if not cursors:
+            self.feedback("请先在波形图上单击放置 A（加载时刻）或 A/B（加载与卸载时刻）游标", True)
+            return
+        t_load = cursors[0]
+        t_unload = cursors[1] if len(cursors) >= 2 else None
+        info = self._compute_disturbance(t_load=t_load, t_unload=t_unload)
+        if info:
+            self.feedback(
+                f"已按游标重算扰动指标（t_load={t_load:.2f}s"
+                + (f", t_unload={t_unload:.2f}s" if t_unload is not None else "")
+                + "）"
+            )
 
     def import_csv(self):
         if self.writer:
@@ -1470,11 +1586,58 @@ class Window(W.QMainWindow):
         )
         if not path:
             return
-        self.load_csv_file(path)
-
-    def load_csv_file(self, path):
         try:
-            loaded = load_csv(path)
+            info = inspect_csv(path)
+        except (OSError, ValueError) as exc:
+            self.feedback(f"CSV 检查失败：{exc}", True)
+            return
+        t_start = t_end = None
+        if info["total_rows"] > 20000:
+            dlg = W.QDialog(self)
+            dlg.setWindowTitle("长录制分段回放选择")
+            dlg.setMinimumWidth(380)
+            outer = W.QVBoxLayout(dlg)
+            tip = W.QLabel(
+                f"该文件共有 <b>{info['total_rows']:,}</b> 行数据（时间跨度 "
+                f"{info['t_start']:.2f} s ~ {info['t_end']:.2f} s，共 {info['duration_s']:.1f} s），"
+                "单屏最多载入 20,000 行。请选择需要重点回放的时间区间："
+            )
+            tip.setWordWrap(True)
+            outer.addWidget(tip)
+            form = W.QFormLayout()
+            start_spin = number(info["t_start"], info["t_start"], info["t_end"], 10.0, 2)
+            end_spin = number(min(info["t_end"], info["t_start"] + min(200.0, info["duration_s"])),
+                              info["t_start"], info["t_end"], 10.0, 2)
+            form.addRow("起始时间 (s)", start_spin)
+            form.addRow("结束时间 (s)", end_spin)
+            outer.addLayout(form)
+            quick = W.QHBoxLayout()
+            btn_head = W.QPushButton("选取开头前 200 s")
+            btn_tail = W.QPushButton("选取末尾最近 200 s")
+            btn_head.clicked.connect(lambda: (
+                start_spin.setValue(info["t_start"]),
+                end_spin.setValue(min(info["t_end"], info["t_start"] + 200.0)),
+            ))
+            btn_tail.clicked.connect(lambda: (
+                start_spin.setValue(max(info["t_start"], info["t_end"] - 200.0)),
+                end_spin.setValue(info["t_end"]),
+            ))
+            quick.addWidget(btn_head); quick.addWidget(btn_tail)
+            outer.addLayout(quick)
+            bb = W.QDialogButtonBox(W.QDialogButtonBox.StandardButton.Ok | W.QDialogButtonBox.StandardButton.Cancel)
+            bb.button(W.QDialogButtonBox.StandardButton.Ok).setText("载入选中区间")
+            bb.button(W.QDialogButtonBox.StandardButton.Cancel).setText("取消")
+            bb.accepted.connect(dlg.accept)
+            bb.rejected.connect(dlg.reject)
+            outer.addWidget(bb)
+            if dlg.exec() != W.QDialog.DialogCode.Accepted:
+                return
+            t_start, t_end = sorted((start_spin.value(), end_spin.value()))
+        self.load_csv_file(path, t_start=t_start, t_end=t_end)
+
+    def load_csv_file(self, path, t_start=None, t_end=None):
+        try:
+            loaded = load_csv(path, t_start=t_start, t_end=t_end)
         except (OSError, ValueError) as exc:
             self.feedback(f"CSV 导入失败：{exc}", True)
             return False
@@ -1518,7 +1681,13 @@ class Window(W.QMainWindow):
         self.toggle_freeze()
         self.scope.setXRange(float(mat[0, 0]), float(mat[-1, 0]), padding=0)
         self.analyze()
-        self.feedback(f"已载入 CSV 回放：{Path(path).name}（{len(mat)} 帧，{self.count} 通道）")
+        if loaded.get("truncated"):
+            self.feedback(
+                f"已载入 CSV 分段：{Path(path).name}（{loaded['loaded_rows']}/{loaded['total_rows']} 帧，"
+                f"区间 {loaded['window_start']:.2f}~{loaded['window_end']:.2f} s / 总 {loaded['file_t_start']:.2f}~{loaded['file_t_end']:.2f} s）"
+            )
+        else:
+            self.feedback(f"已载入 CSV 回放：{Path(path).name}（{len(mat)} 帧，{self.count} 通道）")
         return True
 
     def export_c_code(self):

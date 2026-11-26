@@ -103,5 +103,14 @@ int main(void)
     const float six[] = {1, 2, 3, 4, 5.5f, -6.25f};
     PID_ReportValues(six, 6);
     assert(!strcmp(reply,"1,2,3,4,5.5,-6.25\n"));
+
+    /* Default group routing for unprefixed @KP / @SPD.KP commands. */
+    float ang_before = pid_loops[PID_ANG].kp;
+    PID_SetDefaultGroup(PID_SPD);
+    send_line("@KP=7.5");
+    assert(!strcmp(reply,"@ACK:KP=7.5\n"));
+    assert(fabsf(pid_loops[PID_SPD].kp - 7.5f) < 1e-6f);
+    assert(fabsf(pid_loops[PID_ANG].kp - ang_before) < 1e-6f);
+    PID_SetDefaultGroup(PID_ANG);
     return 0;
 }

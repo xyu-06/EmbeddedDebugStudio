@@ -19,11 +19,12 @@ from serial.tools import list_ports
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 
 from engine import Lines
+from telemetry_schema import resolve_channel_semantics
 from transport import SerialLink
 
 
 IMU_PROTOCOLS = (
-    "平衡车四列 (target, pitch, gyro, pwm)",
+    "平衡车直立监控 (pitch_target, pitch, gyro, pwm, [wheel_speed])",
     "欧拉角三列 (pitch, roll, yaw [°])",
     "六轴物理量 (ax,ay,az [g], gx,gy,gz [°/s])",
     "MPU6050 原始计数 (16384 LSB/g, 131 LSB/°/s)",
@@ -307,8 +308,18 @@ class ImuStudioPage(W.QWidget):
         self.az = 1.0
         self.pwm = 0.0
         self.acc_norm = 1.0
+        self.wheel_speed = None
         self.fused_init = False
         self.zero_collecting = []  # samples for 1-second mechanical center calibration
+        self.zero_gyro_samples = []
+        self.reported_fields = {"pitch"}
+        self.stream_names = []
+        self.semantic_map = {}
+        self.active_time_source = "未开始"
+        self.prev_mcu_ms = None
+        self.prev_seq = None
+        self.seq_lost = 0
+        self.fixed_t = 0.0
 
         self.hist_t = deque(maxlen=800)
         self.hist_pitch = deque(maxlen=800)
@@ -353,6 +364,8 @@ class ImuStudioPage(W.QWidget):
             "port": self.port_box.currentText(),
             "baud": self.baud_box.currentText(),
             "protocol": self.proto_box.currentIndex(),
+            "time_source": self.time_source_box.currentIndex(),
+            "sample_rate_hz": self.sample_rate_spin.value(),
             "tau": self.tau_spin.value(),
             "invert_pitch": self.inv_pitch.isChecked(),
         }
@@ -371,6 +384,10 @@ class ImuStudioPage(W.QWidget):
                     self.baud_box.setCurrentText(str(st["baud"]))
                 if "protocol" in st and 0 <= int(st["protocol"]) < len(IMU_PROTOCOLS):
                     self.proto_box.setCurrentIndex(int(st["protocol"]))
+                if "time_source" in st and 0 <= int(st["time_source"]) < 3:
+                    self.time_source_box.setCurrentIndex(int(st["time_source"]))
+                if "sample_rate_hz" in st:
+                    self.sample_rate_spin.setValue(float(st["sample_rate_hz"]))
                 if "tau" in st:
                     self.tau_spin.setValue(float(st["tau"]))
                 if "invert_pitch" in st:
@@ -451,6 +468,22 @@ class ImuStudioPage(W.QWidget):
         f1.addRow("波特率", self.baud_box)
         self.proto_box = W.QComboBox(); self.proto_box.addItems(list(IMU_PROTOCOLS))
         f1.addRow("数据格式", self.proto_box)
+        self.time_source_box = W.QComboBox()
+        self.time_source_box.addItems([
+            "自动（MCU时间戳 / 固定周期）",
+            "固定采样周期 (Hz)",
+            "电脑到达时间",
+        ])
+        self.time_source_box.setToolTip(
+            "蓝牙等链路存在串口合包时，建议开启固件 seq,mcu_ms 上报，或使用固定采样周期避免陀螺仪积分失真"
+        )
+        f1.addRow("时间基准", self.time_source_box)
+        self.sample_rate_spin = W.QDoubleSpinBox()
+        self.sample_rate_spin.setRange(5.0, 1000.0)
+        self.sample_rate_spin.setDecimals(1)
+        self.sample_rate_spin.setValue(50.0)
+        self.sample_rate_spin.setSuffix(" Hz")
+        f1.addRow("预设采样率", self.sample_rate_spin)
         self.sim_mode = W.QComboBox()
         self.sim_mode.addItems(["平衡车前后微摆回正", "三轴正弦摇晃演示", "前倾超 30° 倒地保护演示"])
         f1.addRow("仿真动作", self.sim_mode)
@@ -565,6 +598,18 @@ class ImuStudioPage(W.QWidget):
         self.sim_t = 0.0
         self.fused_init = False
         self.last_sample_mono = None
+        self.wheel_speed = None
+        self.reported_fields = {"pitch"}
+        self.stream_names = []
+        self.semantic_map = {}
+        self.active_time_source = "未开始"
+        self.prev_mcu_ms = None
+        self.prev_seq = None
+        self.seq_lost = 0
+        self.fixed_t = 0.0
+        self.zero_collecting = []
+        self.zero_gyro_samples = []
+        self._capturing_zero = False
         if self.source_box.currentIndex() == 1:
             self.sim_active = self.connected = True
             self._sync_ui()
@@ -616,7 +661,9 @@ class ImuStudioPage(W.QWidget):
             self.zero_result.setText("请先连接 IMU 串口或打开姿态仿真后再采样中值角。")
             return
         self.zero_collecting = []
+        self.zero_gyro_samples = []
         self._capturing_zero = True
+        self.sync_pid_btn.setEnabled(False)
         self.zero_result.setText("正在采集 50 帧静止俯仰角均值，请扶稳车身保持平衡不动…")
 
     def sync_zero_to_pid(self):
@@ -654,18 +701,86 @@ class ImuStudioPage(W.QWidget):
             self.copy_imu_c_snippet()
 
     # ---------- Telemetry ingestion & Complementary Filter ----------
+    def _resolve_sample_timing(self, vals, stamp_mono: float):
+        """Determine (t_sec, dt_s) from MCU timestamp, fixed rate, or host arrival."""
+        proto = self.proto_box.currentIndex()
+        smap = self.semantic_map
+        mode = self.time_source_box.currentIndex() if hasattr(self, "time_source_box") else 0
+        hz = max(1.0, float(self.sample_rate_spin.value())) if hasattr(self, "sample_rate_spin") else 50.0
+        nominal_dt = 1.0 / hz
+
+        seq_val = vals[smap["seq"]] if ("seq" in smap and smap["seq"] < len(vals)) else None
+        mcu_ms_val = vals[smap["mcu_ms"]] if ("mcu_ms" in smap and smap["mcu_ms"] < len(vals)) else None
+        if not smap:
+            if proto in (2, 3) and len(vals) >= 8:
+                seq_val, mcu_ms_val = vals[6], vals[7]
+            elif proto == 1 and len(vals) >= 5:
+                seq_val, mcu_ms_val = vals[3], vals[4]
+
+        if seq_val is not None:
+            cur_seq = int(round(seq_val)) & 0xFFFFFFFF
+            if self.prev_seq is not None:
+                delta_seq = (cur_seq - self.prev_seq) & 0xFFFFFFFF
+                if 1 < delta_seq < 10000:
+                    self.seq_lost += delta_seq - 1
+            self.prev_seq = cur_seq
+
+        if mode == 0 and mcu_ms_val is not None:
+            cur_ms = float(mcu_ms_val)
+            if self.prev_mcu_ms is None:
+                dt = nominal_dt
+                self.fixed_t = 0.0
+            else:
+                d_ms = cur_ms - self.prev_mcu_ms
+                if d_ms < 0 and abs(d_ms) > 1e6:
+                    d_ms += 4294967296.0
+                dt = max(0.001, min(0.5, d_ms / 1000.0)) if d_ms > 0 else nominal_dt
+                self.fixed_t += dt
+            self.prev_mcu_ms = cur_ms
+            self.active_time_source = "MCU时间戳 (mcu_ms)"
+            return self.fixed_t, dt
+
+        if mode == 2:
+            dt = nominal_dt if self.last_sample_mono is None else max(0.001, min(0.2, stamp_mono - self.last_sample_mono))
+            self.last_sample_mono = stamp_mono
+            self.active_time_source = "电脑到达时间"
+            return max(0.0, stamp_mono - self.epoch), dt
+
+        if self.frames == 0:
+            self.fixed_t = 0.0
+        else:
+            self.fixed_t += nominal_dt
+        self.active_time_source = f"固定周期 ({hz:.0f} Hz)"
+        return self.fixed_t, nominal_dt
+
     def ingest_values(self, vals, t_sec: float, dt_s: float):
         sign = -1.0 if self.inv_pitch.isChecked() else 1.0
         proto = self.proto_box.currentIndex()
+        smap = self.semantic_map
+        has_g = all(k in smap for k in ("ax_g", "ay_g", "az_g", "gx_dps"))
+        has_raw = all(k in smap for k in ("ax_raw", "ay_raw", "az_raw", "gx_raw"))
+        is_six_axis = has_g or has_raw or (not smap and proto in (2, 3))
 
-        if len(vals) >= 6 or proto in (2, 3):
-            if len(vals) < 6:
-                return
-            if proto == 3 or max(abs(vals[0]), abs(vals[1]), abs(vals[2])) > 20.0:
-                ax, ay, az = vals[0] / 16384.0, vals[1] / 16384.0, vals[2] / 16384.0
-                gx, gy, gz = vals[3] / 131.0, vals[4] / 131.0, vals[5] / 131.0
+        if is_six_axis:
+            if has_g:
+                raw_ax, raw_ay, raw_az = vals[smap["ax_g"]], vals[smap["ay_g"]], vals[smap["az_g"]]
+                raw_gx = vals[smap["gx_dps"]]
+                raw_gy = vals[smap["gy_dps"]] if ("gy_dps" in smap and smap["gy_dps"] < len(vals)) else 0.0
+                raw_gz = vals[smap["gz_dps"]] if ("gz_dps" in smap and smap["gz_dps"] < len(vals)) else 0.0
+            elif has_raw:
+                raw_ax, raw_ay, raw_az = vals[smap["ax_raw"]], vals[smap["ay_raw"]], vals[smap["az_raw"]]
+                raw_gx = vals[smap["gx_raw"]]
+                raw_gy = vals[smap["gy_raw"]] if ("gy_raw" in smap and smap["gy_raw"] < len(vals)) else 0.0
+                raw_gz = vals[smap["gz_raw"]] if ("gz_raw" in smap and smap["gz_raw"] < len(vals)) else 0.0
             else:
-                ax, ay, az, gx, gy, gz = vals[:6]
+                if len(vals) < 6:
+                    return
+                raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz = vals[:6]
+            if proto == 3 or max(abs(raw_ax), abs(raw_ay), abs(raw_az)) > 20.0:
+                ax, ay, az = raw_ax / 16384.0, raw_ay / 16384.0, raw_az / 16384.0
+                gx, gy, gz = raw_gx / 131.0, raw_gy / 131.0, raw_gz / 131.0
+            else:
+                ax, ay, az, gx, gy, gz = raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz
             self.ax, self.ay, self.az = ax, ay, az
             self.gx, self.gy, self.gz = gx, gy, gz
             self.acc_norm = math.sqrt(ax * ax + ay * ay + az * az)
@@ -680,22 +795,92 @@ class ImuStudioPage(W.QWidget):
                 self.pitch = (1.0 - alpha_acc) * (self.pitch + gyro_pitch * dt_s) + alpha_acc * acc_pitch
                 self.roll = (1.0 - alpha_acc) * (self.roll + gy * dt_s) + alpha_acc * acc_roll
                 self.yaw = ((self.yaw + gz * dt_s + 180.0) % 360.0) - 180.0
+            self.reported_fields = {"pitch", "roll", "yaw", "gyro_pitch", "acc"}
+            if "pitch_target" in smap and smap["pitch_target"] < len(vals):
+                self.target_pitch = vals[smap["pitch_target"]]
+                self.reported_fields.add("pitch_target")
+            if "pwm" in smap and smap["pwm"] < len(vals):
+                self.pwm = vals[smap["pwm"]]
+                self.reported_fields.add("pwm")
+            if "wheel_speed" in smap and smap["wheel_speed"] < len(vals):
+                self.wheel_speed = vals[smap["wheel_speed"]]
+                self.reported_fields.add("wheel_speed")
+        elif smap:
+            reported = set()
+            if "pitch_target" in smap and smap["pitch_target"] < len(vals):
+                self.target_pitch = vals[smap["pitch_target"]]
+                reported.add("pitch_target")
+            if "pitch" in smap and smap["pitch"] < len(vals):
+                self.pitch = sign * vals[smap["pitch"]]
+                reported.add("pitch")
+            if "roll" in smap and smap["roll"] < len(vals):
+                self.roll = vals[smap["roll"]]
+                reported.add("roll")
+            else:
+                self.roll = 0.0
+            if "yaw" in smap and smap["yaw"] < len(vals):
+                self.yaw = vals[smap["yaw"]] % 360.0
+                reported.add("yaw")
+            else:
+                self.yaw = 0.0
+            if "gyro_pitch" in smap and smap["gyro_pitch"] < len(vals):
+                self.gx = sign * vals[smap["gyro_pitch"]]
+                reported.add("gyro_pitch")
+            else:
+                self.gx = 0.0
+            if "pwm" in smap and smap["pwm"] < len(vals):
+                self.pwm = vals[smap["pwm"]]
+                reported.add("pwm")
+            else:
+                self.pwm = 0.0
+            if "wheel_speed" in smap and smap["wheel_speed"] < len(vals):
+                self.wheel_speed = vals[smap["wheel_speed"]]
+                reported.add("wheel_speed")
+            else:
+                self.wheel_speed = None
+            self.reported_fields = reported
         elif proto == 1 and len(vals) >= 3:
             self.pitch = sign * vals[0]
             self.roll = vals[1]
             self.yaw = vals[2]
+            self.gx = 0.0
+            self.pwm = 0.0
+            self.wheel_speed = None
+            self.reported_fields = {"pitch", "roll", "yaw"}
         else:
-            # Balance car 4-col: target_deg, pitch_deg, gyro_dps, pwm (or 1..4 cols)
-            if len(vals) >= 4:
+            self.roll = 0.0
+            self.yaw = 0.0
+            if len(vals) >= 5:
                 self.target_pitch = vals[0]
                 self.pitch = sign * vals[1]
                 self.gx = sign * vals[2]
                 self.pwm = vals[3]
-                self.yaw = ((self.yaw + 0.0) % 360.0)
-            elif len(vals) >= 2:
+                self.wheel_speed = vals[4]
+                self.reported_fields = {"pitch_target", "pitch", "gyro_pitch", "pwm", "wheel_speed"}
+            elif len(vals) == 4:
+                self.target_pitch = vals[0]
+                self.pitch = sign * vals[1]
+                self.gx = sign * vals[2]
+                self.pwm = vals[3]
+                self.wheel_speed = None
+                self.reported_fields = {"pitch_target", "pitch", "gyro_pitch", "pwm"}
+            elif len(vals) == 3:
+                self.target_pitch, self.pitch, self.pwm = vals[0], sign * vals[1], vals[2]
+                self.gx = 0.0
+                self.wheel_speed = None
+                self.reported_fields = {"pitch_target", "pitch", "pwm"}
+            elif len(vals) == 2:
                 self.target_pitch, self.pitch = vals[0], sign * vals[1]
+                self.gx = 0.0
+                self.pwm = 0.0
+                self.wheel_speed = None
+                self.reported_fields = {"pitch_target", "pitch"}
             elif len(vals) == 1:
                 self.pitch = sign * vals[0]
+                self.gx = 0.0
+                self.pwm = 0.0
+                self.wheel_speed = None
+                self.reported_fields = {"pitch"}
 
         self.frames += 1
         self.rate_frames += 1
@@ -706,20 +891,34 @@ class ImuStudioPage(W.QWidget):
 
         if getattr(self, "_capturing_zero", False):
             self.zero_collecting.append(self.pitch)
+            if "gyro_pitch" in self.reported_fields:
+                self.zero_gyro_samples.append(abs(self.gx))
             if len(self.zero_collecting) >= 50:
                 self._capturing_zero = False
-                mean_p = float(np.mean(self.zero_collecting))
-                std_p = float(np.std(self.zero_collecting))
-                self.target_pitch = mean_p
-                self.sync_pid_btn.setEnabled(True)
-                self.zero_result.setText(
-                    f"标定完成：机械中值角 = {mean_p:+.3f}°（静止波动 σ={std_p:.3f}°）"
-                )
+                arr = np.asarray(self.zero_collecting, dtype=float)
+                mean_p = float(np.mean(arr))
+                std_p = float(np.std(arr))
+                ptp_p = float(np.ptp(arr))
+                max_gyro = max(self.zero_gyro_samples) if self.zero_gyro_samples else 0.0
+                if std_p > 0.35 or ptp_p > 1.5 or ("gyro_pitch" in self.reported_fields and max_gyro > 5.0):
+                    self.sync_pid_btn.setEnabled(False)
+                    self.zero_result.setText(
+                        f"⚠ 标定波动过大，请扶稳静止后重试（σ={std_p:.3f}°，峰峰值={ptp_p:.2f}°，最大角速度={max_gyro:.1f}°/s）"
+                    )
+                else:
+                    self.target_pitch = mean_p
+                    self.sync_pid_btn.setEnabled(True)
+                    self.zero_result.setText(
+                        f"标定完成：机械中值角 = {mean_p:+.3f}°（静止波动 σ={std_p:.3f}°，峰峰值={ptp_p:.2f}°）"
+                    )
 
     def _feed_bytes(self, data: bytes, stamp_mono: float):
         self.rx_bytes += len(data)
         for kind, payload in self.parser.feed(data):
-            if kind == "log" and payload.startswith("#BALANCE:"):
+            if kind == "names":
+                self.stream_names = list(payload)
+                self.semantic_map = resolve_channel_semantics(self.stream_names)
+            elif kind == "log" and payload.startswith("#BALANCE:"):
                 tag = payload[9:].strip()
                 if tag.startswith("CALIBRATING"):
                     self.banner.setStyleSheet("background:#8d691e;color:white;padding:5px 10px;font-weight:600;")
@@ -735,10 +934,9 @@ class ImuStudioPage(W.QWidget):
                     self.banner.setStyleSheet("background:#a83139;color:white;padding:5px 10px;font-weight:600;")
                     self.banner.setText("IMU 初始化或静止校准失败：" + tag)
                     self.banner.show()
-            elif kind == "data" and 1 <= len(payload) <= 6:
-                dt = 0.01 if self.last_sample_mono is None else max(0.001, min(0.2, stamp_mono - self.last_sample_mono))
-                self.last_sample_mono = stamp_mono
-                self.ingest_values(payload, max(0.0, stamp_mono - self.epoch), dt)
+            elif kind == "data" and 1 <= len(payload) <= 8:
+                t_sec, dt = self._resolve_sample_timing(payload, stamp_mono)
+                self.ingest_values(payload, t_sec, dt)
 
     def tick(self):
         now = monotonic()
@@ -790,8 +988,10 @@ class ImuStudioPage(W.QWidget):
                 self.ay = math.sin(math.radians(pitch)) * math.cos(math.radians(roll))
                 self.az = math.cos(math.radians(pitch)) * math.cos(math.radians(roll))
                 self.acc_norm = 1.0
+                self.active_time_source = "动态仿真 (50 Hz)"
                 self.ingest_values([0.0, pitch, gyro, pwm], t, 0.02)
                 self.roll, self.yaw = roll, yaw
+                self.reported_fields.update({"pitch_target", "pitch", "roll", "yaw", "gyro_pitch", "acc", "pwm"})
 
         if self.connected:
             self.canvas.set_attitude(self.pitch, self.roll, self.yaw, self.target_pitch, self.pwm)
@@ -810,16 +1010,36 @@ class ImuStudioPage(W.QWidget):
             self._refresh_readouts()
 
     def _refresh_readouts(self):
+        rf = self.reported_fields
+        active = self.frames > 0 or bool(self.stream_names)
+
+        def fmt(key, text):
+            return text if (not active or key in rf) else " 未上报"
+
+        tgt_txt = fmt("pitch_target", f"{self.target_pitch:+7.2f} °")
+        roll_txt = fmt("roll", f"{self.roll:+7.2f} °")
+        yaw_txt = fmt("yaw", f"{self.yaw:+7.2f} °")
+        gx_txt = fmt("gyro_pitch", f"{self.gx:+7.1f} °/s")
+        acc_txt = fmt("acc", f"{self.acc_norm:7.3f} g")
+        pwm_txt = fmt("pwm", f"{self.pwm:+7.0f}")
+        spd_txt = (
+            f"{self.wheel_speed:+7.2f}"
+            if (self.wheel_speed is not None and ("wheel_speed" in rf or not active))
+            else ("  +0.00" if not active else " 未上报")
+        )
         self.readout_lbl.setText(
             f"俯仰 Pitch : {self.pitch:+7.2f} °\n"
-            f"横滚 Roll  : {self.roll:+7.2f} °\n"
-            f"航向 Yaw   : {self.yaw:+7.2f} °\n"
-            f"目标中值角 : {self.target_pitch:+7.2f} °\n"
-            f"角速度 GX  : {self.gx:+7.1f} °/s\n"
-            f"重力模 |A| : {self.acc_norm:7.3f} g\n"
-            f"直立 PWM   : {self.pwm:+7.0f}"
+            f"横滚 Roll  : {roll_txt}\n"
+            f"航向 Yaw   : {yaw_txt}\n"
+            f"目标中值角 : {tgt_txt}\n"
+            f"角速度 GX  : {gx_txt}\n"
+            f"重力模 |A| : {acc_txt}\n"
+            f"直立 PWM   : {pwm_txt}\n"
+            f"轮速反馈   : {spd_txt}\n"
+            f"时间来源   : {self.active_time_source}"
         )
+        lost_txt = f"     丢帧 {self.seq_lost}" if self.seq_lost > 0 else ""
         self.status_bar.setText(
             f"{self.state_badge.text()}     已收  {self.rx_bytes:,} B     "
-            f"姿态帧率  {self.fps} Hz     累计帧  {self.frames:,}"
+            f"姿态帧率  {self.fps} Hz     累计帧  {self.frames:,}{lost_txt}     [{self.active_time_source}]"
         )

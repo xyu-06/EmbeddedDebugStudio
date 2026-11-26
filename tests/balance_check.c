@@ -6,10 +6,15 @@
 #include <math.h>
 #include <string.h>
 
+static char all_hdrs[256];
 static char last[128];
 static float pitch = 2, rate, applied;
 static int32_t wheels;
-void PID_Write(const char *d, unsigned n) { if (n < sizeof last) { memcpy(last, d, n); last[n] = 0; } }
+void PID_Write(const char *d, unsigned n)
+{
+    if (n < sizeof last) { memcpy(last, d, n); last[n] = 0; }
+    if (strlen(all_hdrs) + n < sizeof all_hdrs) strcat(all_hdrs, last);
+}
 void Balance_ZeroMotors(void);
 void PID_ZeroOutputs(void) { Balance_ZeroMotors(); }
 void Board_ReadImu(float *p, float *g, float *y) { *p = pitch; *g = rate; *y = 0; }
@@ -32,7 +37,8 @@ int main(void)
 {
     uint32_t ms = 0;
     Balance_Init();
-    assert(!strcmp(last, "#NAMES:pitch_tgt,pitch,pwm,speed\n"));
+    assert(strstr(all_hdrs, "#NAMES:pitch_target,pitch,gyro_pitch,pwm,wheel_speed\n") != NULL);
+    assert(strstr(all_hdrs, "#ROLES:target,actual,other,output,other\n") != NULL);
     pid_loops[PID_SPD].kp = pid_loops[PID_SPD].ki = 0;  /* upright loop only */
     PID_WatchdogTick(ms);
     feed("@RUN");

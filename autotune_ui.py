@@ -38,7 +38,26 @@ class AutoTuneController:
             "step_s": 2.0,
             "rounds": 10,
             "hold": True,
+            "output_limit": 0.0,
         }
+
+    def has_role_conflict(self):
+        """Detect mismatch between manually selected actual channel and device #ROLES:actual."""
+        w = self.ui
+        roles = list(getattr(w, "channel_roles", []))[:w.count]
+        declared_actual = next((i for i, r in enumerate(roles) if r == "actual"), None)
+        selected_actual = w.actual_ch.currentData()
+        if declared_actual is None or selected_actual is None or declared_actual >= w.count:
+            return False, ""
+        if selected_actual != declared_actual:
+            names = w.names()
+            sel_name = names[selected_actual] if selected_actual < len(names) else f"CH{selected_actual+1}"
+            dec_name = names[declared_actual] if declared_actual < len(names) else f"CH{declared_actual+1}"
+            return True, (
+                f"⚠ 当前反馈通道为 CH{selected_actual+1}({sel_name})，"
+                f"但设备 #ROLES 声明 actual=CH{declared_actual+1}({dec_name})，请核对后再整定。"
+            )
+        return False, ""
 
     @property
     def active(self):
@@ -137,6 +156,12 @@ class AutoTuneController:
         rounds_spin = W.QSpinBox()
         rounds_spin.setRange(3, 25)
         rounds_spin.setValue(int(self.cfg["rounds"]))
+        limit_val = float(self.cfg.get("output_limit", 0.0))
+        if limit_val <= 0 and hasattr(w, "capture_pwm_limit"):
+            limit_val = float(w.capture_pwm_limit.value())
+        limit_spin = number(limit_val, 0.0, LIMIT, 50.0, 1)
+        limit_spin.setSpecialValueText("自动估计")
+        limit_spin.setToolTip("填写控制器真实输出上限（如平衡车 ±1000），用于准确统计触顶饱和占比；0 为自动估计")
         hold_chk = check("整定完成后保持在目标值运行", self.cfg["hold"])
         safety_chk = check("我已确认：车轮已架空离地或已加装机械限位，且知晓随时可按 Esc 急停", False)
 
@@ -147,8 +172,19 @@ class AutoTuneController:
         form.addRow("整定策略", strat_box)
         form.addRow("单轮观察时长 s", step_spin)
         form.addRow("最大寻优轮数", rounds_spin)
+        form.addRow("输出限幅 ±", limit_spin)
         form.addRow(hold_chk)
         form.addRow(safety_chk)
+
+        conflict, conflict_msg = self.has_role_conflict()
+        conflict_chk = None
+        if conflict:
+            c_lbl = W.QLabel(conflict_msg)
+            c_lbl.setWordWrap(True)
+            c_lbl.setStyleSheet("color:#a22d38;font-size:9pt;font-weight:600;padding-top:2px;")
+            outer.addWidget(c_lbl)
+            conflict_chk = check("我已核对通道映射差异，确认仍按当前手选通道继续", False)
+            outer.addWidget(conflict_chk)
 
         if is_ang:
             ang_warn = W.QLabel("⚠ 当前选中直立环 (ANG)：已强制锁定“从当前参数局部微调”（单轮变化 ≤ ±35%），请先确保现有初始 KP/KD 能稳住车身且目标值仅设小幅阶跃（如 0°→3°）。")
@@ -168,7 +204,11 @@ class AutoTuneController:
         ok_btn = buttons.button(W.QDialogButtonBox.StandardButton.Ok)
         ok_btn.setText("开始自动整定")
         ok_btn.setEnabled(False)
-        safety_chk.toggled.connect(ok_btn.setEnabled)
+        def _refresh_ok():
+            ok_btn.setEnabled(safety_chk.isChecked() and (conflict_chk is None or conflict_chk.isChecked()))
+        safety_chk.toggled.connect(lambda _: _refresh_ok())
+        if conflict_chk is not None:
+            conflict_chk.toggled.connect(lambda _: _refresh_ok())
         buttons.button(W.QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
@@ -186,6 +226,7 @@ class AutoTuneController:
             step_s=step_spin.value(),
             rounds=rounds_spin.value(),
             hold=hold_chk.isChecked(),
+            output_limit=limit_spin.value(),
         )
         self.start(
             mode=self.cfg["mode"],
@@ -196,9 +237,11 @@ class AutoTuneController:
             step_seconds=self.cfg["step_s"],
             max_rounds=self.cfg["rounds"],
             hold_target=self.cfg["hold"],
+            output_limit=self.cfg["output_limit"],
+            confirm_role=bool(conflict_chk and conflict_chk.isChecked()),
         )
 
-    def start(self, mode, style, strategy, base, target, step_seconds=2.0, max_rounds=10, hold_target=True):
+    def start(self, mode, style, strategy, base, target, step_seconds=2.0, max_rounds=10, hold_target=True, output_limit=None, confirm_role=False):
         w = self.ui
         if not w.connected:
             w.feedback("请先连接串口或打开仿真", True)
@@ -212,10 +255,18 @@ class AutoTuneController:
             w.feedback(f"起始基准与目标值必须在 {group}.TGT 允许范围 {tgt_lo:g} 至 {tgt_hi:g} 内", True)
             return False
 
+        conflict, conflict_msg = self.has_role_conflict()
+        if conflict and not confirm_role:
+            w.feedback(conflict_msg, True)
+            return False
+
         w.save_draft()
         initial = {k: w.fields[k].value() for k in ("KP", "KI", "KD")}
         try:
-            self.engine = AutoTuner(mode, style, strategy, initial, w.rules[group], base, target, step_seconds, max_rounds)
+            self.engine = AutoTuner(
+                mode, style, strategy, initial, w.rules[group], base, target,
+                step_seconds, max_rounds, output_limit=output_limit,
+            )
         except ValueError as exc:
             w.feedback(str(exc), True)
             return False
@@ -382,7 +433,14 @@ class AutoTuneController:
         cmds = self._build_param_cmds(best["KP"], best["KI"], best["KD"], final_tgt, reset=True)
         self.state = self.IDLE
         self.sync_ui()
-        summary = self.engine.summary_text()
+        ch_names = w.names()
+        actual_desc = (
+            f"CH{self.actual_col+1}({ch_names[self.actual_col]})"
+            if self.actual_col < len(ch_names)
+            else f"CH{self.actual_col+1}"
+        )
+        time_src = "内置仿真步长" if w.sim else w.time_mode.currentText()
+        summary = f"{self.engine.summary_text()} · 反馈 {actual_desc} · 时间 {time_src}"
         self._set_status(f"✓ {reason}", summary)
         if w.connected:
             w.commands.submit(cmds, quiet=True)

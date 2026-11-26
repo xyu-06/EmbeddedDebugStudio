@@ -1390,27 +1390,33 @@ class GuiChecks(unittest.TestCase):
         self.assertIn("#NAMES:pwm,err,vel,sp", hal_bundle["pid_port_hal.c"])
         self.assertIn("#ROLES:output,error,actual,target", hal_bundle["pid_port_hal.c"])
         self.assertIn("PID_Port_Init(&huart1)", hal_bundle["main_integration_example.c"])
+        self.assertIn("PID_SetDefaultGroup(PRIMARY_PID_GROUP)", hal_bundle["pid_port_hal.c"])
 
         spl_pid = generate_interface_bundle({**pid_cfg, "platform": 1, "uart_handle": "USART1"})
         self.assertEqual(set(spl_pid), {"main_integration_spl.c", "pid_port_spl.h", "pid_port_spl.c", "pid_link.h", "pid_link.c", "README_接入说明.md"})
         self.assertIn('#include "stm32f10x.h"', spl_pid["pid_port_spl.h"])
         self.assertIn("USART_IT_RXNE", spl_pid["pid_port_spl.c"])
+        self.assertIn("GPIO_Mode_AF_PP", spl_pid["main_integration_spl.c"])
+        self.assertIn("PID_SetDefaultGroup(PRIMARY_PID_GROUP)", spl_pid["pid_port_spl.c"])
         self.assertIn("USART1_IRQHandler", spl_pid["main_integration_spl.c"])
 
         ino_pid = generate_interface_bundle({**pid_cfg, "platform": 2})
         self.assertIn("EmbeddedDebugStudio_PID.ino", ino_pid)
         self.assertIn("#ROLES:output,error,actual,target", ino_pid["EmbeddedDebugStudio_PID.ino"])
+        self.assertIn("parseStrictFloat", ino_pid["EmbeddedDebugStudio_PID.ino"])
         self.assertNotIn("Serial.printf", ino_pid["EmbeddedDebugStudio_PID.ino"])
 
-        # IMU across 4 formats & 3 platforms
+        # IMU across 4 formats & 3 platforms (including canonical 5-col balance-car format)
         for fmt_id, expected_hdr in (
             (0, "#NAMES:ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps"),
             (1, "#NAMES:ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw"),
-            (2, "#NAMES:target,pitch,gyro,pwm"),
+            (2, "#NAMES:pitch_target,pitch,gyro_pitch,pwm,wheel_speed"),
             (3, "#NAMES:pitch,roll,yaw"),
         ):
             imu_hal = generate_interface_bundle({"interface_type": 1, "platform": 0, "imu_format": fmt_id, "imu_report_ms": 20})
             self.assertIn(expected_hdr, imu_hal["imu_port_hal.c"])
+            imu_hal_ts = generate_interface_bundle({"interface_type": 1, "platform": 0, "imu_format": fmt_id, "imu_report_ms": 20, "imu_include_ts": True})
+            self.assertIn(expected_hdr + ",seq,mcu_ms", imu_hal_ts["imu_port_hal.c"])
             imu_spl = generate_interface_bundle({"interface_type": 1, "platform": 1, "imu_format": fmt_id, "uart_handle": "USART3"})
             self.assertIn("USART3_IRQHandler", imu_spl["main_imu_spl.c"])
             imu_ino = generate_interface_bundle({"interface_type": 1, "platform": 2, "imu_format": fmt_id})
@@ -1673,6 +1679,196 @@ class GuiChecks(unittest.TestCase):
                 mock_serial_cls.assert_called_once()
             rp.link = None
             rp.disconnect_port()
+            w.close()
+
+    def test_v19_safety_schema_timestamps_disturbance_and_streaming_csv(self):
+        from bluetooth_link import BluetoothRfcommLink
+        from engine import disturbance_metrics
+        from autotune import evaluate_step
+        from storage import inspect_csv, load_csv
+        from firmware_studio import generate_interface_bundle
+
+        # 1) Bluetooth RFCOMM send(urgent=True) must purge stale motion frames without TypeError
+        rf = BluetoothRfcommLink("00:26:01:02:EA:C0")
+        rf.send(b"J,30,30\n")
+        rf.send(b"J,50,50\n")
+        rf.send(b"J,70,70\n")
+        self.assertEqual(len(rf.writes), 3)
+        self.assertTrue(rf.send(b"J,0,0\nS\n", urgent=True))
+        self.assertEqual(list(rf.writes), [b"J,0,0\nS\n"])
+
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "v19.ini")
+            w.timer.stop()
+            w.serial_page.poll_timer.stop()
+            w.imu_page.timer.stop()
+            w.remote_page.timer.stop()
+
+            # 2) Full address labels in PID form update with group & addressing mode
+            w.group.setCurrentIndex(1)  # SPD
+            self.assertEqual(w.field_labels["KP"].text(), "SPD.KP")
+            w.address.setCurrentIndex(1)  # @KP
+            self.assertEqual(w.field_labels["KP"].text(), "@KP")
+            w.address.setCurrentIndex(0)
+
+            # 3) Balance-car 5-col schema parity across PID page and IMU page + "未上报" explicit indicator
+            bal_imu_code = generate_interface_bundle({"interface_type": 1, "platform": 0, "imu_format": 2})["imu_port_hal.c"]
+            self.assertIn("#NAMES:pitch_target,pitch,gyro_pitch,pwm,wheel_speed", bal_imu_code)
+
+            frame_chunk = (
+                b"#NAMES:pitch_target,pitch,gyro_pitch,pwm,wheel_speed\n"
+                b"#ROLES:target,actual,other,output,other\n"
+                b"1.50,-2.25,18.50,-340.0,120.0\n"
+            )
+            w.connected = True
+            w.receive(frame_chunk, 1.0)
+            self.assertEqual(w.count, 5)
+            self.assertEqual(w.target_ch.currentData(), 0)
+            self.assertEqual(w.actual_ch.currentData(), 1)
+            self.assertIn("°", w.units[1])
+            self.assertIn("°/s", w.units[2])
+            self.assertEqual(w.units[4], "cnt/s")
+
+            imu = w.imu_page
+            imu.connected = True
+            imu.proto_box.setCurrentIndex(0)
+            imu._feed_bytes(frame_chunk, 1.0)
+            self.assertAlmostEqual(imu.target_pitch, 1.50, places=4)
+            self.assertAlmostEqual(imu.pitch, -2.25, places=4)
+            self.assertAlmostEqual(imu.gx, 18.50, places=4)
+            self.assertAlmostEqual(imu.pwm, -340.0, places=4)
+            self.assertAlmostEqual(imu.wheel_speed, 120.0, places=4)
+
+            # Feed a 4-col stream lacking gyro_pitch -> IMU must display "未上报" for gyro_pitch, NOT PWM
+            imu.stream_names = []
+            imu.semantic_map = {}
+            imu.frames = 0
+            imu._feed_bytes(
+                b"#NAMES:pitch_target,pitch,pwm,wheel_speed\n2.00,-1.00,-280.0,95.0\n",
+                2.0,
+            )
+            imu._refresh_readouts()
+            txt_partial = imu.readout_lbl.text()
+            self.assertIn("角速度 GX  :  未上报", txt_partial)
+            self.assertIn("-280", txt_partial)
+            self.assertIn("95.00", txt_partial)
+
+            # 4) IMU burst coalescing immunity (seq,mcu_ms + fixed rate) & stationary zero guard
+            from imu_studio import ImuStudioPage
+            imu_seq = ImuStudioPage(w)
+            imu_seq.timer.stop()
+            imu_seq.proto_box.setCurrentIndex(2)  # 6-axis physical
+            imu_seq.time_source_box.setCurrentIndex(0)  # Auto (MCU timestamp / fixed rate)
+            imu_seq.sample_rate_spin.setValue(50.0)
+            lines = [b"#NAMES:ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,seq,mcu_ms\n"]
+            for idx in range(30):
+                seq = idx + (1 if idx >= 10 else 0)  # deliberate drop of 1 seq at idx==10
+                ms = idx * 20
+                lines.append(f"0.000,0.020,1.000,12.0,0.0,25.0,{seq},{ms}\n".encode())
+            imu_seq.connected = True
+            for ln in lines:
+                imu_seq._feed_bytes(ln, 10.0)  # same host stamp_mono!
+            yaw_single = imu_seq.yaw
+            pitch_single = imu_seq.pitch
+            self.assertEqual(imu_seq.seq_lost, 1)
+            self.assertIn("MCU时间戳", imu_seq.active_time_source)
+
+            # Now feed all 30 frames coalesced in ONE chunk at same stamp_mono
+            imu_burst = ImuStudioPage(w)
+            imu_burst.timer.stop()
+            imu_burst.proto_box.setCurrentIndex(2)
+            imu_burst.time_source_box.setCurrentIndex(0)
+            imu_burst.sample_rate_spin.setValue(50.0)
+            imu_burst.connected = True
+            imu_burst._feed_bytes(b"".join(lines), 10.0)
+            self.assertAlmostEqual(pitch_single, imu_burst.pitch, places=6)
+            self.assertAlmostEqual(yaw_single, imu_burst.yaw, places=6)
+
+            # Stationary calibration accepts still car, rejects shaking car
+            imu_burst.start_zero_capture()
+            for _ in range(50):
+                imu_burst._feed_bytes(b"#NAMES:pitch_target,pitch,gyro_pitch,pwm,wheel_speed\n0,1.25,0.2,0,0\n", 11.0)
+            self.assertTrue(imu_burst.sync_pid_btn.isEnabled())
+            imu_burst.start_zero_capture()
+            for k in range(50):
+                ang = 1.25 + (3.0 if k % 2 else -3.0)
+                imu_burst._feed_bytes(f"0,{ang:.2f},18.0,0,0\n".encode(), 12.0 + 0.02 * k)
+            self.assertFalse(imu_burst.sync_pid_btn.isEnabled())
+            self.assertIn("波动过大", imu_burst.zero_result.text())
+            imu_seq.close(); imu_burst.close()
+
+            # 5) Load-disturbance capture metrics + trigger-aligned ghost comparison + cursor override
+            t_d = np.linspace(0.0, 4.0, 201)
+            y_d = np.full_like(t_d, 200.0)
+            u_d = np.full_like(t_d, 350.0)
+            # Load applied at 1.0..1.6s: speed drops to 160, PWM hits 1000 limit; unload -> overshoot 218, settles by 2.4s
+            load_m = (t_d >= 1.0) & (t_d <= 1.6)
+            y_d[load_m] = 200.0 - 40.0 * np.sin(np.pi * (t_d[load_m] - 1.0) / 0.6)
+            u_d[load_m] = 1000.0
+            rec_m = (t_d > 1.6) & (t_d < 2.4)
+            y_d[rec_m] = 200.0 + 18.0 * np.exp(-2.5 * (t_d[rec_m] - 1.6)) * np.sin(np.pi * (t_d[rec_m] - 1.6) / 0.8)
+            dm = disturbance_metrics(t_d, 200.0, y_d, outputs=u_d, band=0.02, output_limit=1000.0, t_load=1.0, t_unload=1.6)
+            self.assertGreaterEqual(dm["max_drop"], 39.0)
+            self.assertGreater(dm["unload_overshoot"], 7.0)
+            self.assertIsNotNone(dm["recovery_s"])
+            self.assertGreater(dm["sat_time_s"], 0.55)
+            self.assertAlmostEqual(dm["pre_pwm"], 350.0, places=1)
+
+            # UI trigger capture in "负载扰动对比" mode + ghost align + cursor recalc
+            w.clear_plot()
+            w.channel_roles = ["target", "actual", "output", ""] + [""] * 4
+            w.count = 3
+            w.refresh_channels()
+            w.capture_mode.setCurrentIndex(1)
+            w.capture_pwm_limit.setValue(1000.0)
+            for ti, yi, ui in zip(t_d, y_d, u_d):
+                w.buffer.add(float(ti), [200.0, float(yi), float(ui)], ("",) * 16)
+            w.frames = len(t_d)
+            w.latest = float(t_d[-1])
+            w.toggle_freeze()
+            w.capture.last_crossing = 1.05
+            w.capture.last_range = (0.0, 4.0)
+            w.on_capture_complete(1.05, 0.0, 4.0)
+            self.assertTrue(w.pin_disturb_btn.isEnabled())
+            self.assertIn("最大掉速", w.disturb_summary.text())
+            w.pin_disturb_ghost()
+            self.assertIsNotNone(w.scope.ghost)
+            self.assertEqual(w.scope.ghost["kind"], "capture")
+            w.scope.place_cursor(1.0)
+            w.scope.place_cursor(1.6)
+            w.recalc_disturbance_with_cursors()
+            self.assertIn("触发前 PWM=350", w.disturb_summary.text())
+
+            # 6) AutoTune real output_limit saturation + role conflict guard
+            ev_sat = evaluate_step(t_d[:50], np.linspace(0, 120, 50), 0.0, 200.0, outputs=np.full(50, 990.0), output_limit=1000.0)
+            self.assertTrue(ev_sat.saturated)
+            self.assertAlmostEqual(ev_sat.sat_ratio, 1.0, places=2)
+            self.assertEqual(ev_sat.sample_count, 50)
+
+            w.toggle_freeze()  # unfreeze
+            w.channel_preferences[1] = 2  # deliberately mis-select CH3 (output) while #ROLES declares CH2 as actual
+            w.refresh_channels()
+            conflict, _ = w.autotuner.has_role_conflict()
+            self.assertTrue(conflict)
+            self.assertFalse(w.autotuner.start(0, 1, 1, 0.0, 200.0, confirm_role=False))
+
+            # 7) Streaming long CSV (>20,000 rows) inspect + [t_start, t_end] window replay
+            long_csv = Path(tmp) / "long_record.csv"
+            with open(long_csv, "w", encoding="utf-8-sig", newline="") as f:
+                f.write("time_s,CH1_target,CH2_actual,CH3_pwm,CH4_err\n")
+                for row_i in range(25000):
+                    ts = row_i * 0.01
+                    f.write(f"{ts:.2f},100.0,{min(100.0, ts * 5):.2f},400.0,0.0\n")
+            meta = inspect_csv(long_csv)
+            self.assertEqual(meta["total_rows"], 25000)
+            self.assertAlmostEqual(meta["t_start"], 0.0, places=2)
+            self.assertAlmostEqual(meta["t_end"], 249.99, places=2)
+            self.assertTrue(w.load_csv_file(str(long_csv), t_start=0.0, t_end=25.0))
+            self.assertEqual(w.frames, 2501)
+            self.assertAlmostEqual(w.scope.data[0, 0], 0.0, places=2)
+            self.assertAlmostEqual(w.scope.data[-1, 0], 25.0, places=2)
+            self.assertIn("已载入 CSV 分段", w.ack.text())
+
             w.close()
 
 

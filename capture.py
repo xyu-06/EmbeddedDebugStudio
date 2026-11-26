@@ -6,6 +6,8 @@ class CaptureController:
     def __init__(self, window):
         self.ui = window
         self.capture_channel = self.trigger_at = self.previous_trigger_value = None
+        self.last_crossing = None
+        self.last_range = None
 
     def arm_capture(self):
         if self.capture_channel is not None:
@@ -82,5 +84,9 @@ class CaptureController:
                 low,high = min(levels),max(levels)
                 pad = max((high-low)*.09,.1)
                 self.ui.scope.setYRange(low-pad,high+pad,padding=0)
+        self.last_crossing = crossing
+        self.last_range = (start, end)
+        if hasattr(self.ui, "on_capture_complete"):
+            self.ui.on_capture_complete(crossing, start, end)
         self.ui.measure()
 

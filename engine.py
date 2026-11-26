@@ -364,3 +364,92 @@ def match_ack(command, payload):
         return math.isclose(finite(raw), finite(value), abs_tol=0.00051, rel_tol=1e-6)
     except ValueError:
         return False
+
+
+def disturbance_metrics(times, target_val, actual, outputs=None, band=0.02, output_limit=None, t_load=None, t_unload=None):
+    """Evaluate load-disturbance rejection metrics for a triggered capture window.
+
+    Returns dict with keys:
+      target, band_tol, max_drop, t_dip, unload_overshoot, t_peak,
+      recovery_s, sat_time_s, pre_pwm, ref_time, t_load, t_unload.
+    """
+    t_arr = np.asarray(times, dtype=float)
+    y_arr = np.asarray(actual, dtype=float)
+    valid = np.isfinite(t_arr) & np.isfinite(y_arr)
+    if not np.any(valid):
+        return None
+    t_v = t_arr[valid]
+    y_v = y_arr[valid]
+    if len(t_v) < 3:
+        return None
+
+    if np.ndim(target_val) == 0:
+        tgt = float(target_val)
+    else:
+        tgt_arr = np.asarray(target_val, dtype=float)[valid]
+        fin_tgt = tgt_arr[np.isfinite(tgt_arr)]
+        tgt = float(np.median(fin_tgt)) if len(fin_tgt) else float(y_v[0])
+
+    tol = max(abs(tgt) * float(band), 0.25)
+
+    if t_load is not None:
+        dip_candidates = np.flatnonzero(t_v >= float(t_load))
+        if not len(dip_candidates):
+            dip_candidates = np.arange(len(t_v))
+    else:
+        dip_candidates = np.arange(len(t_v))
+    min_idx = int(dip_candidates[int(np.argmin(y_v[dip_candidates]))])
+    max_drop = max(0.0, float(tgt - y_v[min_idx]))
+    t_dip = float(t_v[min_idx])
+
+    unload_ref = float(t_unload) if t_unload is not None else t_dip
+    over_candidates = np.flatnonzero(t_v >= unload_ref)
+    if not len(over_candidates):
+        over_candidates = np.arange(len(t_v))
+    peak_idx = int(over_candidates[int(np.argmax(y_v[over_candidates]))])
+    unload_overshoot = max(0.0, float(y_v[peak_idx] - tgt))
+    t_peak = float(t_v[peak_idx])
+
+    ref_time = float(t_unload) if t_unload is not None else (float(t_load) if t_load is not None else t_dip)
+    sub = np.flatnonzero(t_v >= ref_time)
+    recovery_s = None
+    if len(sub) >= 2:
+        outside = sub[np.abs(y_v[sub] - tgt) > tol]
+        if len(outside) == 0:
+            recovery_s = 0.0
+        else:
+            last_out = int(outside[-1])
+            if last_out + 1 < len(t_v) and float(t_v[-1] - t_v[last_out + 1]) >= 0.4:
+                recovery_s = max(0.0, float(t_v[last_out + 1] - ref_time))
+
+    sat_time_s = None
+    pre_pwm = None
+    if outputs is not None:
+        u_arr = np.asarray(outputs, dtype=float)[valid]
+        fin_u = np.isfinite(u_arr)
+        if np.any(fin_u):
+            pre_cutoff = float(t_load) if t_load is not None else float(t_v[0] + 0.25 * (t_v[-1] - t_v[0]))
+            pre_mask = fin_u & (t_v <= pre_cutoff)
+            pre_vals = u_arr[pre_mask] if np.any(pre_mask) else u_arr[fin_u][:max(1, len(t_v) // 10)]
+            pre_pwm = float(np.median(pre_vals))
+            if output_limit is not None and float(output_limit) > 0:
+                sat_thresh = 0.95 * float(output_limit)
+                sat_flags = fin_u & (np.abs(u_arr) >= sat_thresh)
+                dt = np.diff(t_v)
+                pair_sat = 0.5 * (sat_flags[:-1].astype(float) + sat_flags[1:].astype(float))
+                sat_time_s = float(np.sum(dt * pair_sat))
+
+    return {
+        "target": tgt,
+        "band_tol": tol,
+        "max_drop": max_drop,
+        "t_dip": t_dip,
+        "unload_overshoot": unload_overshoot,
+        "t_peak": t_peak,
+        "recovery_s": recovery_s,
+        "sat_time_s": sat_time_s,
+        "pre_pwm": pre_pwm,
+        "ref_time": ref_time,
+        "t_load": float(t_load) if t_load is not None else None,
+        "t_unload": float(t_unload) if t_unload is not None else None,
+    }

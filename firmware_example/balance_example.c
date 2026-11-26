@@ -6,7 +6,7 @@
 #include "balance_example.h"
 #include "pid_link.h"
 
-static volatile float report[4];     /* written in the ISR, read in Poll */
+static volatile float report[5];     /* written in the ISR, read in Poll */
 static uint32_t report_ms;
 static unsigned speed_tick;
 static float speed_filtered, speed_out;
@@ -32,8 +32,10 @@ void Balance_Init(void)
     speed_tick = 0;
     speed_filtered = speed_out = 0;
     Balance_ZeroMotors();
-    static const char names[] = "#NAMES:pitch_tgt,pitch,pwm,speed\n";
+    static const char names[] = "#NAMES:pitch_target,pitch,gyro_pitch,pwm,wheel_speed\n";
+    static const char roles[] = "#ROLES:target,actual,other,output,other\n";
     PID_Write(names, sizeof names - 1);
+    PID_Write(roles, sizeof roles - 1);
 }
 
 void Balance_ControlISR(void)
@@ -46,16 +48,17 @@ void Balance_ControlISR(void)
     speed_filtered += 0.3f * (speed - speed_filtered);
     report[0] = pid_loops[PID_ANG].target;
     report[1] = pitch;
-    report[3] = speed_filtered;
+    report[2] = gyro;
+    report[4] = speed_filtered;
     if (!pid_running) {
         speed_tick = 0;
         speed_out = 0;
-        report[2] = 0;
+        report[3] = 0;
         return;
     }
     if (fabsf(pitch - pid_loops[PID_ANG].target) > BALANCE_FALL_DEG) {
         PID_Fault("fall");
-        report[2] = 0;
+        report[3] = 0;
         return;
     }
     if (++speed_tick >= BALANCE_SPEED_DIV) {
@@ -67,7 +70,7 @@ void Balance_ControlISR(void)
     float turn = PID_Position(&pid_loops[PID_YAW], gyro_yaw, BALANCE_DT_S, BALANCE_PWM_MAX * 0.3f);
     float pwm = BALANCE_MOTOR_SIGN * (upright + speed_out);
     float l = compensate(pwm + turn), r = compensate(pwm - turn);
-    report[2] = pwm;
+    report[3] = pwm;
     if (!pid_running) { Balance_ZeroMotors(); return; }   /* stopped meanwhile */
     Board_SetMotors((int32_t)l, (int32_t)r);
 }
@@ -77,7 +80,7 @@ void Balance_Poll(uint32_t now_ms)
     PID_WatchdogTick(now_ms);
     if ((uint32_t)(now_ms - report_ms) >= 10U) {
         report_ms = now_ms;
-        const float values[4] = {report[0], report[1], report[2], report[3]};
-        PID_ReportValues(values, 4);
+        const float values[5] = {report[0], report[1], report[2], report[3], report[4]};
+        PID_ReportValues(values, 5);
     }
 }

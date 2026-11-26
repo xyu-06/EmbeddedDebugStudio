@@ -44,6 +44,9 @@ float PID_Position(PID_Loop *p, float actual, float dt, float limit);
 float PID_PositionRate(PID_Loop *p, float actual, float rate, float dt, float limit);
 float PID_Incremental(PID_Loop *p, float actual, float dt, float limit);
 
+/* Set default group (PID_ANG/PID_SPD/PID_YAW/PID_AUX) for unprefixed @KP/... commands. */
+void PID_SetDefaultGroup(uint8_t group);
+
 /* Format v (6 decimals below 1, 4 at or above 1) into out (>= 16 bytes). */
 int PID_FormatNumber(char *out, unsigned size, float v);
 #endif

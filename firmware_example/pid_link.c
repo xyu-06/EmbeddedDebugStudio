@@ -10,7 +10,13 @@ PID_Loop pid_loops[PID_GROUPS];
 volatile uint8_t pid_running;
 
 static const char *const groups[] = {"ANG", "SPD", "YAW", "AUX"};
+static uint8_t default_group = PID_ANG;
 static char line[128];
+
+void PID_SetDefaultGroup(uint8_t group)
+{
+    default_group = (group < PID_GROUPS) ? group : PID_ANG;
+}
 static unsigned used;
 static uint8_t skip_line;
 static uint32_t now_ms, last_ping_ms;
@@ -227,7 +233,7 @@ static void command(void)
         if (pid_running) last_ping_ms = now_ms;
         return;
     }
-    int g = PID_ANG;
+    int g = (default_group < PID_GROUPS) ? (int)default_group : PID_ANG;
     /* A decimal point in the value follows '=', not the loop prefix. */
     char *dot = strchr(op, '.');
     char *eq = strchr(op, '=');

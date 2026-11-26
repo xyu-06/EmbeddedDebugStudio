@@ -66,23 +66,87 @@ def _parse_channel_header(raw_header, fallback):
     return (text or fallback)[:32], unit
 
 
-def load_csv(path, max_rows=20000):
-    """Load a PIDTuner CSV (or generic time + 1..8 channel CSV) for offline replay.
-
-    Returns dict with keys: data (Nx13 ndarray), count, aliases, units, references, params.
-    """
+def inspect_csv(path):
+    """Stream-scan a CSV file without retaining rows in RAM; returns metadata and time span."""
+    total_rows = 0
+    t_start = None
+    t_end = None
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
         try:
             header = next(reader)
         except StopIteration:
             raise ValueError("CSV 文件为空")
-        rows = [r for r in reader if any(cell.strip() for cell in r)]
-
-    if not rows:
+        for r_i, row in enumerate(reader):
+            if not any(cell.strip() for cell in row):
+                continue
+            try:
+                t_val = float(row[0]) if row[0].strip() else float(r_i) * 0.01
+            except ValueError:
+                continue
+            if not np.isfinite(t_val):
+                continue
+            total_rows += 1
+            if t_start is None:
+                t_start = t_val
+            t_end = t_val
+    if total_rows == 0:
         raise ValueError("CSV 文件没有数据行")
-    if len(rows) > max_rows:
-        rows = rows[-max_rows:]
+    return {
+        "header": header,
+        "total_rows": total_rows,
+        "t_start": t_start,
+        "t_end": t_end,
+        "duration_s": max(0.0, float(t_end - t_start)),
+    }
+
+
+def load_csv(path, max_rows=20000, t_start=None, t_end=None):
+    """Stream-load a PIDTuner CSV (or generic time + 1..8 channel CSV) for offline replay.
+
+    Supports optional time window [t_start, t_end] and bounded deque(maxlen=max_rows)
+    so arbitrarily large recordings do not blow up RAM.
+    """
+    from collections import deque
+
+    selected = deque(maxlen=max(1, int(max_rows)))
+    total_rows = 0
+    matched_rows = 0
+    file_t_start = None
+    file_t_end = None
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise ValueError("CSV 文件为空")
+        for r_i, row in enumerate(reader):
+            if not any(cell.strip() for cell in row):
+                continue
+            try:
+                t_val = float(row[0]) if row[0].strip() else float(r_i) * 0.01
+            except ValueError:
+                continue
+            if not np.isfinite(t_val):
+                continue
+            total_rows += 1
+            if file_t_start is None:
+                file_t_start = t_val
+            file_t_end = t_val
+            if t_start is not None and t_val < float(t_start) - 1e-9:
+                continue
+            if t_end is not None and t_val > float(t_end) + 1e-9:
+                continue
+            matched_rows += 1
+            selected.append((t_val, row))
+
+    if total_rows == 0:
+        raise ValueError("CSV 文件没有数据行")
+    if not selected:
+        raise ValueError(f"在时间段 [{t_start}, {t_end}] 内没有有效数据行")
+
+    rows = list(selected)
 
     # Detect PIDTuner native columns vs generic columns
     ch_cols = []
@@ -116,13 +180,7 @@ def load_csv(path, max_rows=20000):
     valid_rows = 0
     max_channel_seen = 0
 
-    for r_i, row in enumerate(rows):
-        try:
-            t = float(row[0]) if row[0].strip() else float(r_i) * 0.01
-        except ValueError:
-            continue
-        if not np.isfinite(t):
-            continue
+    for r_i, (t, row) in enumerate(rows):
         data[valid_rows, 0] = t
         for slot, col_idx in ch_cols:
             if col_idx < len(row) and row[col_idx].strip():
@@ -176,4 +234,12 @@ def load_csv(path, max_rows=20000):
         "units": units,
         "references": references,
         "params": params,
+        "total_rows": total_rows,
+        "matched_rows": matched_rows,
+        "loaded_rows": valid_rows,
+        "truncated": matched_rows > valid_rows or matched_rows < total_rows,
+        "window_start": float(data[0, 0]),
+        "window_end": float(data[-1, 0]),
+        "file_t_start": float(file_t_start),
+        "file_t_end": float(file_t_end),
     }

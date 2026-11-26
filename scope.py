@@ -237,6 +237,7 @@ class Scope(pg.PlotWidget):
         rel_t = data[k:, 0] - data[k, 0]
         norm_z = (data[k:, actual] - y0) / (goal - y0)
         self.ghost = {
+            "kind": "step",
             "rel_t": rel_t.copy(),
             "norm_z": norm_z.copy(),
             "y0": y0,
@@ -248,7 +249,7 @@ class Scope(pg.PlotWidget):
         return True
 
     def align_ghost(self, step_t0, y0, goal, actual):
-        if not self.ghost:
+        if not self.ghost or self.ghost.get("kind", "step") != "step":
             return
         view = self.secondary if actual - 1 == self.right_channel else self.getViewBox()
         if view is not self.ghost_view:
@@ -272,6 +273,48 @@ class Scope(pg.PlotWidget):
         self.ghost = None
         self.ghost_curve.hide()
         self.ghost_label.hide()
+
+    def pin_capture_ghost(self, data, channel_col, trigger_time, metrics, tag):
+        """Pin a triggered capture waveform aligned by its trigger instant for comparison."""
+        col = int(channel_col)
+        if not len(data) or col < 1 or col >= data.shape[1]:
+            return False
+        tx = data[:, 0] - float(trigger_time)
+        y = data[:, col].copy()
+        if not np.any(np.isfinite(y)):
+            return False
+        self.ghost = {
+            "kind": "capture",
+            "rel_t": tx,
+            "y": y,
+            "metrics": dict(metrics),
+            "tag": tag,
+            "channel": col,
+        }
+        self.align_capture_ghost(trigger_time)
+        return True
+
+    def align_capture_ghost(self, trigger_time):
+        if not self.ghost or self.ghost.get("kind") != "capture":
+            return
+        col = self.ghost["channel"]
+        view = self.secondary if col - 1 == self.right_channel else self.getViewBox()
+        if self.ghost_view is not view:
+            self.ghost_view.removeItem(self.ghost_curve)
+            self.ghost_view.removeItem(self.ghost_label)
+            view.addItem(self.ghost_curve, ignoreBounds=True)
+            view.addItem(self.ghost_label, ignoreBounds=True)
+            self.ghost_view = view
+        gx = float(trigger_time) + self.ghost["rel_t"]
+        gy = self.ghost["y"]
+        self.ghost_curve.setData(gx, gy, autoDownsample=False, connect="finite")
+        self.ghost_curve.show()
+        valid_idx = np.flatnonzero(np.isfinite(gy))
+        if len(valid_idx):
+            last_i = int(valid_idx[-1])
+            self.ghost_label.setText("对比捕获 · " + self.ghost["tag"])
+            self.ghost_label.setPos(float(gx[last_i]), float(gy[last_i]))
+            self.ghost_label.show()
 
     def step_overlay(self,data,target,actual,band,metrics):
         targets = data[:,target]

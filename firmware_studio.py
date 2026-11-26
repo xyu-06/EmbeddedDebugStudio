@@ -35,14 +35,14 @@ ROLE_KEYS = tuple(k for k, _ in CHANNEL_ROLES)
 IMU_FORMATS = (
     "六轴物理量：ax,ay,az,gx,gy,gz (g, °/s)",
     "MPU6050 原始计数：ax,ay,az,gx,gy,gz (LSB)",
-    "平衡车四列：target,pitch,gyro,pwm",
+    "平衡车五列：pitch_target,pitch,gyro_pitch,pwm,wheel_speed",
     "欧拉角三列：pitch,roll,yaw (°)",
 )
 
 IMU_FORMAT_NAMES = (
     ("ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps"),
     ("ax_raw", "ay_raw", "az_raw", "gx_raw", "gy_raw", "gz_raw"),
-    ("target", "pitch", "gyro", "pwm"),
+    ("pitch_target", "pitch", "gyro_pitch", "pwm", "wheel_speed"),
     ("pitch", "roll", "yaw"),
 )
 
@@ -72,12 +72,12 @@ INTERFACE_PRESETS = (
             "pwm_limit": 1000.0,
             "defaults": {"KP": 32.0, "KI": 0.0, "KD": 1.15, "TGT": 0.0},
             "channels": [
-                ("pitch_tgt", "target"),
+                ("pitch_target", "target"),
                 ("pitch", "actual"),
                 ("pwm", "output"),
-                ("gyro", "other"),
+                ("gyro_pitch", "other"),
                 ("speed_tgt", "other"),
-                ("speed", "other"),
+                ("wheel_speed", "other"),
             ],
         },
     ),
@@ -324,19 +324,23 @@ def _usart_rcc_setup(usart_name: str, baudrate: int) -> str:
     up = usart_name.upper()
     if up == "USART1":
         rcc = "RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1 | RCC_APB2Periph_GPIOA, ENABLE);"
-        pins = "/* PA9=TX (AF_PP), PA10=RX (IN_FLOATING) */"
-        irqn = "USART1_IRQn"
+        gpio_port, tx_pin, rx_pin, irqn = "GPIOA", "GPIO_Pin_9", "GPIO_Pin_10", "USART1_IRQn"
     elif up == "USART3":
         rcc = "RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART3, ENABLE);\n    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);"
-        pins = "/* PB10=TX (AF_PP), PB11=RX (IN_FLOATING) */"
-        irqn = "USART3_IRQn"
+        gpio_port, tx_pin, rx_pin, irqn = "GPIOB", "GPIO_Pin_10", "GPIO_Pin_11", "USART3_IRQn"
     else:
         rcc = "RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);\n    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);"
-        pins = "/* PA2=TX (AF_PP), PA3=RX (IN_FLOATING) */"
-        irqn = "USART2_IRQn"
+        gpio_port, tx_pin, rx_pin, irqn = "GPIOA", "GPIO_Pin_2", "GPIO_Pin_3", "USART2_IRQn"
     return (
         f"    {rcc}\n"
-        f"    {pins}\n"
+        f"    GPIO_InitTypeDef g;\n"
+        f"    g.GPIO_Speed = GPIO_Speed_50MHz;\n"
+        f"    g.GPIO_Pin = {tx_pin};\n"
+        f"    g.GPIO_Mode = GPIO_Mode_AF_PP;\n"
+        f"    GPIO_Init({gpio_port}, &g);\n"
+        f"    g.GPIO_Pin = {rx_pin};\n"
+        f"    g.GPIO_Mode = GPIO_Mode_IN_FLOATING;\n"
+        f"    GPIO_Init({gpio_port}, &g);\n"
         f"    USART_InitTypeDef u;\n"
         f"    USART_StructInit(&u);\n"
         f"    u.USART_BaudRate = {baudrate}U;\n"
@@ -633,6 +637,7 @@ void PID_Port_Init(UART_HandleTypeDef *uart)
     pid_loops[PRIMARY_PID_GROUP].ki = {_c_float(ki)};
     pid_loops[PRIMARY_PID_GROUP].kd = {_c_float(kd)};
     pid_loops[PRIMARY_PID_GROUP].target = {_c_float(tgt)};
+    PID_SetDefaultGroup(PRIMARY_PID_GROUP);
 
     PID_ZeroOutputs();
     PID_WatchdogTick(HAL_GetTick());
@@ -917,6 +922,7 @@ void PID_Port_SPL_Init(USART_TypeDef *usart)
     pid_loops[PRIMARY_PID_GROUP].ki = {_c_float(ki)};
     pid_loops[PRIMARY_PID_GROUP].kd = {_c_float(kd)};
     pid_loops[PRIMARY_PID_GROUP].target = {_c_float(tgt)};
+    PID_SetDefaultGroup(PRIMARY_PID_GROUP);
 
     PID_ZeroOutputs();
     PID_WatchdogTick(s_tick_ms);
@@ -1179,17 +1185,34 @@ void handleCommand(String line) {{
   if (eq < 0) {{ PID_SERIAL.println(F("@ERR:expected key=value")); return; }}
   String k = body.substring(0, eq);
   String v = body.substring(eq + 1);
+  auto parseStrictFloat = [](const String &s, float &out) -> bool {{
+    String t = s;
+    t.trim();
+    if (!t.length()) return false;
+    char buf[32];
+    if (t.length() >= sizeof(buf)) return false;
+    t.toCharArray(buf, sizeof(buf));
+    char *endp = nullptr;
+    double dv = strtod(buf, &endp);
+    if (endp == buf || *endp != '\\0' || !isfinite(dv) || fabs(dv) > 1000000.0) return false;
+    out = (float)dv;
+    return true;
+  }};
   if (k == "SET") {{
     int c1 = v.indexOf(','), c2 = v.indexOf(',', c1 + 1), c3 = v.indexOf(',', c2 + 1);
-    if (c1 < 0 || c2 < 0 || c3 < 0) {{ PID_SERIAL.println(F("@ERR:expected kp,ki,kd,tgt")); return; }}
-    lp.kp = v.substring(0, c1).toFloat();
-    lp.ki = v.substring(c1 + 1, c2).toFloat();
-    lp.kd = v.substring(c2 + 1, c3).toFloat();
-    lp.target = v.substring(c3 + 1).toFloat();
+    if (c1 < 0 || c2 < 0 || c3 < 0 || v.indexOf(',', c3 + 1) >= 0) {{ PID_SERIAL.println(F("@ERR:expected 4 values")); return; }}
+    float v0, v1, v2, v3;
+    if (!parseStrictFloat(v.substring(0, c1), v0) || !parseStrictFloat(v.substring(c1 + 1, c2), v1) ||
+        !parseStrictFloat(v.substring(c2 + 1, c3), v2) || !parseStrictFloat(v.substring(c3 + 1), v3)) {{
+      PID_SERIAL.println(F("@ERR:value out of range"));
+      return;
+    }}
+    lp.kp = v0; lp.ki = v1; lp.kd = v2; lp.target = v3;
     PID_SERIAL.print(F("@ACK:")); PID_SERIAL.println(line.substring(1));
     return;
   }}
-  float val = v.toFloat();
+  float val = 0.0f;
+  if (!parseStrictFloat(v, val)) {{ PID_SERIAL.println(F("@ERR:value out of range")); return; }}
   if (k == "KP") lp.kp = val;
   else if (k == "KI") lp.ki = val;
   else if (k == "KD") lp.kd = val;
@@ -1254,11 +1277,25 @@ def _generate_imu_bundle(cfg: dict) -> dict[str, str]:
     baudrate = int(cfg.get("baudrate", 115200))
     report_ms = max(5, int(cfg.get("imu_report_ms", 20)))
     emit_banners = bool(cfg.get("imu_emit_banners", True))
+    include_ts = bool(cfg.get("imu_include_ts", False))
 
-    col_names = IMU_FORMAT_NAMES[imu_fmt]
+    col_names = IMU_FORMAT_NAMES[imu_fmt] + (("seq", "mcu_ms") if include_ts else ())
     names_hdr = "#NAMES:" + ",".join(col_names)
     fmt_label = IMU_FORMATS[imu_fmt]
     plat_name = PLATFORMS[platform]
+    seq_decl = "static uint32_t s_seq = 0U;\n" if include_ts else ""
+    ts_pack_hal = (
+        "\n    ok &= (ImuAppendChar(buf, sizeof(buf), &pos, ',') == 0);\n"
+        "    ok &= (ImuAppendUInt(buf, sizeof(buf), &pos, ++s_seq) == 0);\n"
+        "    ok &= (ImuAppendChar(buf, sizeof(buf), &pos, ',') == 0);\n"
+        "    ok &= (ImuAppendUInt(buf, sizeof(buf), &pos, HAL_GetTick()) == 0);"
+    ) if include_ts else ""
+    ts_pack_spl = (
+        "\n    ok &= (ImuAppendChar(buf, sizeof(buf), &pos, ',') == 0);\n"
+        "    ok &= (ImuAppendUInt(buf, sizeof(buf), &pos, ++s_seq) == 0);\n"
+        "    ok &= (ImuAppendChar(buf, sizeof(buf), &pos, ',') == 0);\n"
+        "    ok &= (ImuAppendUInt(buf, sizeof(buf), &pos, s_tick_ms) == 0);"
+    ) if include_ts else ""
 
     if imu_fmt == 0:
         sig_args = "float ax_g, float ay_g, float az_g, float gx_dps, float gy_dps, float gz_dps"
@@ -1293,17 +1330,19 @@ def _generate_imu_bundle(cfg: dict) -> dict[str, str]:
     ok &= (ImuAppendChar(buf, sizeof(buf), &pos, ',') == 0);
     ok &= (ImuAppendInt(buf, sizeof(buf), &pos, (int32_t)gz_raw) == 0);"""
     elif imu_fmt == 2:
-        sig_args = "float target_deg, float pitch_deg, float gyro_dps, float pwm_out"
-        call_args = "target_deg, pitch_deg, gyro_dps, pwm_out"
-        demo_decl = "float target_deg = 0.0f, pitch_deg = 0.0f, gyro_dps = 0.0f, pwm_out = 0.0f;"
-        demo_vals = "target_deg, pitch_deg, gyro_dps, pwm_out"
-        c_pack_body = """    ok &= (ImuAppendFixed(buf, sizeof(buf), &pos, target_deg, 2U) == 0);
+        sig_args = "float pitch_target, float pitch_deg, float gyro_pitch, float pwm_out, float wheel_speed"
+        call_args = "pitch_target, pitch_deg, gyro_pitch, pwm_out, wheel_speed"
+        demo_decl = "float pitch_target = 0.0f, pitch_deg = 0.0f, gyro_pitch = 0.0f, pwm_out = 0.0f, wheel_speed = 0.0f;"
+        demo_vals = "pitch_target, pitch_deg, gyro_pitch, pwm_out, wheel_speed"
+        c_pack_body = """    ok &= (ImuAppendFixed(buf, sizeof(buf), &pos, pitch_target, 2U) == 0);
     ok &= (ImuAppendChar(buf, sizeof(buf), &pos, ',') == 0);
     ok &= (ImuAppendFixed(buf, sizeof(buf), &pos, pitch_deg, 2U) == 0);
     ok &= (ImuAppendChar(buf, sizeof(buf), &pos, ',') == 0);
-    ok &= (ImuAppendFixed(buf, sizeof(buf), &pos, gyro_dps, 2U) == 0);
+    ok &= (ImuAppendFixed(buf, sizeof(buf), &pos, gyro_pitch, 2U) == 0);
     ok &= (ImuAppendChar(buf, sizeof(buf), &pos, ',') == 0);
-    ok &= (ImuAppendFixed(buf, sizeof(buf), &pos, pwm_out, 1U) == 0);"""
+    ok &= (ImuAppendFixed(buf, sizeof(buf), &pos, pwm_out, 1U) == 0);
+    ok &= (ImuAppendChar(buf, sizeof(buf), &pos, ',') == 0);
+    ok &= (ImuAppendFixed(buf, sizeof(buf), &pos, wheel_speed, 2U) == 0);"""
     else:
         sig_args = "float pitch_deg, float roll_deg, float yaw_deg"
         call_args = "pitch_deg, roll_deg, yaw_deg"
@@ -1366,6 +1405,7 @@ static UART_HandleTypeDef *s_uart;
 static ImuTxFrame s_banner;
 static ImuTxFrame s_sample;
 static ImuTxFrame s_in_flight;
+{seq_decl}
 
 {_build_imu_helpers_c(imu_fmt, emit_banners)}
 
@@ -1441,7 +1481,7 @@ void IMU_Port_ReportSample({sig_args})
     char buf[IMU_TX_FRAME_LEN];
     unsigned pos = 0U;
     int ok = 1;
-{c_pack_body}
+{c_pack_body}{ts_pack_hal}
     ok &= (ImuAppendChar(buf, sizeof(buf), &pos, '\\n') == 0);
     if (ok) {{
         QueueTextFrame(&s_sample, buf, pos);
@@ -1528,6 +1568,7 @@ static ImuSplFrame s_sample;
 static ImuSplFrame s_in_flight;
 static volatile uint16_t s_tx_pos;
 static volatile uint8_t s_tx_active;
+{seq_decl}
 
 {_build_imu_helpers_c(imu_fmt, emit_banners)}
 
@@ -1624,7 +1665,7 @@ void IMU_Port_SPL_ReportSample({sig_args})
     char buf[IMU_TX_FRAME_LEN];
     unsigned pos = 0U;
     int ok = 1;
-{c_pack_body}
+{c_pack_body}{ts_pack_spl}
     ok &= (ImuAppendChar(buf, sizeof(buf), &pos, '\\n') == 0);
     if (ok) {{
         QueueTextFrame(&s_sample, buf, pos);
@@ -1689,16 +1730,27 @@ void App_ImuSplDemo(void)
   IMU_SERIAL.print(gy); IMU_SERIAL.print(',');
   IMU_SERIAL.println(gz);"""
     elif imu_fmt == 2:
-        ino_report = """  // 平衡车四列：target, pitch, gyro, pwm
+        ino_report = """  // 平衡车五列：pitch_target, pitch, gyro_pitch, pwm, wheel_speed
   IMU_SERIAL.print(0.00f, 2);     IMU_SERIAL.print(',');
   IMU_SERIAL.print(pitch_deg, 2); IMU_SERIAL.print(',');
   IMU_SERIAL.print(gy_dps, 2);    IMU_SERIAL.print(',');
-  IMU_SERIAL.println(0);"""
+  IMU_SERIAL.print(0.0f, 1);      IMU_SERIAL.print(',');
+  IMU_SERIAL.println(0.00f, 2);"""
     else:
         ino_report = """  // 欧拉角三列：pitch, roll, yaw
   IMU_SERIAL.print(pitch_deg, 2); IMU_SERIAL.print(',');
   IMU_SERIAL.print(roll_deg, 2);  IMU_SERIAL.print(',');
   IMU_SERIAL.println(yaw_deg, 2);"""
+
+    if include_ts:
+        ino_report = ino_report.replace("IMU_SERIAL.println(", "IMU_SERIAL.print(")
+        ts_pack_ino = (
+            "\n  static unsigned long imu_seq = 0;\n"
+            "  IMU_SERIAL.print(','); IMU_SERIAL.print(++imu_seq);\n"
+            "  IMU_SERIAL.print(','); IMU_SERIAL.println(now);"
+        )
+    else:
+        ts_pack_ino = ""
 
     banner_code = (
         f'  IMU_SERIAL.println(F("#BALANCE:CALIBRATING"));\n'
@@ -1788,7 +1840,7 @@ void loop() {{
   yaw_deg  += gz_dps * dt;
   (void)pitch_deg; (void)roll_deg; (void)yaw_deg; (void)ax_g; (void)gy_dps;
 
-{ino_report}
+{ino_report}{ts_pack_ino}
 }}
 """
     return {
@@ -2696,9 +2748,13 @@ class FirmwareStudioPage(W.QWidget):
         self.imu_rep_ms.setSuffix(" ms")
         self.imu_banners_chk = W.QCheckBox("上电发送 #BALANCE:CALIBRATING / READY 状态横幅")
         self.imu_banners_chk.setChecked(True)
+        self.imu_ts_chk = W.QCheckBox("附带采样序号与 MCU 时间戳 (seq, mcu_ms)")
+        self.imu_ts_chk.setChecked(False)
+        self.imu_ts_chk.setToolTip("消除蓝牙/USB 串口攒包导致的时间轴畸变与陀螺仪积分误差")
         icf.addRow("输出格式", self.imu_format_box)
         icf.addRow("上报周期", self.imu_rep_ms)
         icf.addRow(self.imu_banners_chk)
+        icf.addRow(self.imu_ts_chk)
         left_layout.addWidget(self.imu_cfg_card)
 
         # ---------- Remote Cards (iface == 2) ----------
@@ -2822,6 +2878,7 @@ class FirmwareStudioPage(W.QWidget):
             self.imu_format_box.currentIndexChanged,
             self.imu_rep_ms.valueChanged,
             self.imu_banners_chk.toggled,
+            self.imu_ts_chk.toggled,
             self.remote_fmt_edit.textChanged,
             self.remote_pwm_lim.valueChanged,
             self.remote_failsafe_ms.valueChanged,
@@ -3052,6 +3109,7 @@ class FirmwareStudioPage(W.QWidget):
             "imu_format": self.imu_format_box.currentIndex(),
             "imu_report_ms": self.imu_rep_ms.value(),
             "imu_emit_banners": self.imu_banners_chk.isChecked(),
+            "imu_include_ts": self.imu_ts_chk.isChecked(),
             "remote_cmd_fmt": self.remote_fmt_edit.text(),
             "remote_pwm_limit": self.remote_pwm_lim.value(),
             "remote_failsafe_ms": self.remote_failsafe_ms.value(),
@@ -3071,7 +3129,8 @@ class FirmwareStudioPage(W.QWidget):
             names_hdr, roles_hdr = build_protocol_headers(cfg["channels"], emit_roles=cfg["emit_roles"])
             badge_txt = f"{names_hdr}" + (f"   |   {roles_hdr}" if roles_hdr else "")
         elif iface == 1:
-            names_hdr = "#NAMES:" + ",".join(IMU_FORMAT_NAMES[cfg["imu_format"]])
+            cols = IMU_FORMAT_NAMES[cfg["imu_format"]] + (("seq", "mcu_ms") if cfg["imu_include_ts"] else ())
+            names_hdr = "#NAMES:" + ",".join(cols)
             badge_txt = f"IMU 格式: {names_hdr}  ·  {cfg['imu_report_ms']} ms"
         else:
             badge_txt = f"遥控协议: {cfg['remote_cmd_fmt']}  ·  ±{cfg['remote_pwm_limit']}  ·  失联 {cfg['remote_failsafe_ms']} ms"
@@ -3188,6 +3247,8 @@ class FirmwareStudioPage(W.QWidget):
                 self.imu_rep_ms.setValue(cfg["imu_report_ms"])
             if "imu_emit_banners" in cfg:
                 self.imu_banners_chk.setChecked(bool(cfg["imu_emit_banners"]))
+            if "imu_include_ts" in cfg:
+                self.imu_ts_chk.setChecked(bool(cfg["imu_include_ts"]))
             if cfg.get("remote_cmd_fmt"):
                 self.remote_fmt_edit.setText(str(cfg["remote_cmd_fmt"]))
             if isinstance(cfg.get("remote_pwm_limit"), (int, float)):

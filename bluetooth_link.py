@@ -252,8 +252,9 @@ class BluetoothRfcommLink(Thread):
         self.device_name = name or address
         self.timeout = float(timeout)
         self.closed = Event()
-        self.closing_after_flush = Event()
-        self.out: Queue[bytes] = Queue()
+        self.writes: deque[bytes] = deque()
+        self._final_tx: bytes | None = None
+        self._final_done = Event()
         self.events: deque = deque(maxlen=1500)
         self.dropped = 0
         self.lock = Lock()
@@ -264,9 +265,15 @@ class BluetoothRfcommLink(Thread):
                 self.dropped += 1
             self.events.append((kind, monotonic(), data))
 
-    def send(self, data: bytes):
-        if data:
-            self.out.put(bytes(data))
+    def send(self, data: bytes, urgent: bool = False) -> bool:
+        with self.lock:
+            if urgent:
+                self.writes.clear()
+            if len(self.writes) >= 64:
+                return False
+            if data:
+                self.writes.append(bytes(data))
+            return True
 
     def take(self):
         with self.lock:
@@ -277,18 +284,18 @@ class BluetoothRfcommLink(Thread):
         return items, dropped
 
     def flush_and_close(self, final_data: bytes = b"", timeout: float = 0.25):
-        if final_data:
-            self.out.put(bytes(final_data))
-        self.closing_after_flush.set()
-        deadline = monotonic() + max(0.05, float(timeout))
-        while monotonic() < deadline and not self.out.empty() and self.is_alive():
-            self.join(0.02)
+        with self.lock:
+            self.writes.clear()
+            if final_data:
+                self._final_tx = bytes(final_data)
         self.closed.set()
-        self.join(max(0.05, min(0.25, float(timeout))))
+        if final_data and self.is_alive():
+            self._final_done.wait(max(0.05, float(timeout)))
 
     def run(self):
         if not hasattr(socket, "AF_BLUETOOTH") or not hasattr(socket, "BTPROTO_RFCOMM"):
             self.event("error", "当前 Python 运行环境不支持 AF_BLUETOOTH RFCOMM 直连")
+            self._final_done.set()
             self.event("closed", None)
             return
         sock = None
@@ -300,15 +307,14 @@ class BluetoothRfcommLink(Thread):
             label = f"{self.device_name} ({self.address})"
             self.event("open", f"蓝牙 {label}")
             while not self.closed.is_set():
-                try:
-                    while True:
-                        chunk = self.out.get_nowait()
-                        if chunk:
-                            sock.sendall(chunk)
-                            self.event("tx", chunk)
-                except Empty:
-                    pass
-                if self.closing_after_flush.is_set() and self.out.empty():
+                while not self.closed.is_set():
+                    with self.lock:
+                        chunk = self.writes.popleft() if self.writes else None
+                    if not chunk:
+                        break
+                    sock.sendall(chunk)
+                    self.event("tx", chunk)
+                if self.closed.is_set():
                     break
                 try:
                     data = sock.recv(1024)
@@ -322,9 +328,20 @@ class BluetoothRfcommLink(Thread):
                     if not self.closed.is_set():
                         self.event("error", f"蓝牙接收中断：{exc}")
                     break
+            with self.lock:
+                final_tx, self._final_tx = self._final_tx, None
+            if final_tx:
+                try:
+                    sock.sendall(final_tx)
+                    self.event("tx", final_tx)
+                except OSError:
+                    pass
+                finally:
+                    self._final_done.set()
         except OSError as exc:
             self.event("error", f"蓝牙连接失败 ({self.address})：{exc}")
         finally:
+            self._final_done.set()
             if sock is not None:
                 try:
                     sock.close()

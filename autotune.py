@@ -37,9 +37,11 @@ class StepEvaluation:
     saturated: bool = False
     reversed_sign: bool = False
     note: str = ""
+    sat_ratio: float = 0.0
+    sample_count: int = 0
 
 
-def evaluate_step(times, actual, base_y, goal_y, outputs=None, style=1):
+def evaluate_step(times, actual, base_y, goal_y, outputs=None, style=1, output_limit=None):
     """Score a step trajectory from base_y to goal_y. Lower score is better."""
     times = np.asarray(times, dtype=float)
     actual = np.asarray(actual, dtype=float)
@@ -94,6 +96,7 @@ def evaluate_step(times, actual, base_y, goal_y, outputs=None, style=1):
 
     u_chatter = 0.
     saturated = False
+    sat_ratio = 0.0
     if outputs is not None:
         u = np.asarray(outputs, dtype=float)
         u = u[np.isfinite(u)]
@@ -103,11 +106,17 @@ def evaluate_step(times, actual, base_y, goal_y, outputs=None, style=1):
             # Allow one initial kick + smooth decay (~2*u_span total variation); penalize excess buzz.
             excess_tv = max(0., float(np.sum(du)) / u_span - 2.5)
             u_chatter = excess_tv / max(1., len(u) / 25.)
-            u_max = float(np.max(np.abs(u)))
-            if u_max > 1e-3:
-                near_rail = np.mean(np.abs(u) >= 0.985 * u_max)
-                if near_rail > 0.82 and float(np.std(u[len(u) // 3:])) < 0.02 * u_max and tail_err > 0.03:
+            if output_limit is not None and float(output_limit) > 0:
+                sat_ratio = float(np.mean(np.abs(u) >= 0.95 * float(output_limit)))
+                if (sat_ratio > 0.25 and tail_err > 0.03) or sat_ratio >= 0.65:
                     saturated = True
+            else:
+                u_max = float(np.max(np.abs(u)))
+                if u_max > 1e-3:
+                    near_rail = float(np.mean(np.abs(u) >= 0.985 * u_max))
+                    if near_rail > 0.82 and float(np.std(u[len(u) // 3:])) < 0.02 * u_max and tail_err > 0.03:
+                        saturated = True
+                        sat_ratio = near_rail
 
     chatter = y_chatter + 0.7 * u_chatter
     w_iae, w_itae, w_tail, w_os, os_free, w_chat, *_ = STYLE_PROFILES[style]
@@ -122,7 +131,7 @@ def evaluate_step(times, actual, base_y, goal_y, outputs=None, style=1):
     )
     if reversed_sign:
         score += 50.
-    note = "反向响应" if reversed_sign else "输出疑似饱和" if saturated else ""
+    note = "反向响应" if reversed_sign else f"输出饱和({sat_ratio*100:.0f}%)" if saturated else ""
     return StepEvaluation(
         score=float(score),
         overshoot_pct=overshoot * 100.,
@@ -133,6 +142,8 @@ def evaluate_step(times, actual, base_y, goal_y, outputs=None, style=1):
         saturated=saturated,
         reversed_sign=reversed_sign,
         note=note,
+        sat_ratio=sat_ratio,
+        sample_count=int(len(times)),
     )
 
 
@@ -246,7 +257,7 @@ class AutoTuner:
     """Stateful round-by-round optimizer producing candidate {KP, KI, KD} dicts."""
 
     def __init__(self, mode, style, strategy, initial, rules, base, target,
-                 step_seconds=2.0, max_rounds=12, max_ratio=None):
+                 step_seconds=2.0, max_rounds=12, max_ratio=None, output_limit=None):
         if mode not in range(len(MODES)):
             raise ValueError("未知整定模式")
         if style not in range(len(STYLES)):
@@ -264,6 +275,7 @@ class AutoTuner:
         self.step_seconds = float(step_seconds)
         self.max_rounds = int(max_rounds)
         self.max_ratio = float(max_ratio if max_ratio is not None else (1.35 if strategy == 1 else 2.5))
+        self.output_limit = float(output_limit) if (output_limit is not None and float(output_limit) > 0) else None
         self.initial = {k: float(initial.get(k, 0.)) for k in ("KP", "KI", "KD")}
 
         # Respect user's parameter limits and keep gain signs consistent (default >= 0).
@@ -500,7 +512,7 @@ class AutoTuner:
             return ev
 
         y0 = float(actual[0]) if base_y is None and len(actual) else float(self.base if base_y is None else base_y)
-        ev = evaluate_step(times, actual, y0, self.target, outputs=outputs, style=self.style)
+        ev = evaluate_step(times, actual, y0, self.target, outputs=outputs, style=self.style, output_limit=self.output_limit)
         self.history.append((self.round, dict(params), ev, tag))
 
         if self.baseline_eval is None and tag in ("初始基准", "当前基准"):
@@ -548,4 +560,6 @@ class AutoTuner:
             parts[-1] += "）"
         if self.baseline_eval and self.baseline_eval.score < 1e5:
             parts.append(f"整定前 J={self.baseline_eval.score:.3f}")
+        parts.append(f"触顶占比 {ev.sat_ratio * 100:.0f}%")
+        parts.append(f"有效采样 {ev.sample_count}")
         return " · ".join(parts)

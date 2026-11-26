@@ -334,6 +334,7 @@ def build(w):
     w.step_gear = combo(["步长 0.001", "步长 0.01", "步长 0.1", "步长 1", "步长 10"], 2)
     f.addRow(row(w.slider_toggle, w.step_gear))
     w.fields = {}
+    w.field_labels = {}
     w.sliders = {}
     w.pid_form = f
     for key in KEYS:
@@ -351,7 +352,9 @@ def build(w):
         action = field.lineEdit().addAction(QtGui.QIcon(tile),W.QLineEdit.ActionPosition.TrailingPosition)
         action.setToolTip("下发此参数（回车）")
         action.triggered.connect(lambda _,k=key: w.send_field(k))
-        f.addRow(key,field)
+        lbl = W.QLabel(f"ANG.{key}")
+        w.field_labels[key] = lbl
+        f.addRow(lbl,field)
         slider = W.QSlider(C.Qt.Orientation.Horizontal)
         slider.setRange(0, 1000)
         slider.setValue(500)
@@ -420,6 +423,12 @@ def build(w):
     w.trigger_edge = combo(["上升沿","下降沿","任意边沿"])
     w.capture_seconds = number(2,.001,86400,.5,3)
     w.pre_percent = number(30,0,100,5,0)
+    w.capture_mode = combo(["常规边沿捕获", "负载扰动对比"])
+    w.capture_pwm_limit = number(1000, 0, LIMIT, 50, 1)
+    w.capture_pwm_limit.setSpecialValueText("自动")
+    w.capture_pwm_limit.setToolTip("填写控制器真实输出限幅（如平衡车 ±1000），用于统计 PWM 饱和持续时间；0 为不限制")
+    f.addRow("捕获模式", w.capture_mode)
+    f.addRow("输出限幅 ±", w.capture_pwm_limit)
     for label,widget in [("通道",w.trigger_ch),("电平",w.trigger_level),("边沿",w.trigger_edge),
                          ("捕获时间 s",w.capture_seconds),("预触发 %",w.pre_percent)]:
         f.addRow(label,widget)
@@ -427,6 +436,14 @@ def build(w):
     w.trigger_status = W.QLabel("等待设置")
     w.trigger_status.setWordWrap(True)
     f.addRow(w.arm_btn,w.trigger_status)
+    w.pin_disturb_btn = button("锁定对比捕获", w.pin_disturb_ghost)
+    w.pin_disturb_btn.setEnabled(False)
+    w.recalc_disturb_btn = button("按游标重算 A/B", w.recalc_disturbance_with_cursors)
+    w.recalc_disturb_btn.setEnabled(False)
+    f.addRow(row(w.pin_disturb_btn, w.recalc_disturb_btn))
+    w.disturb_summary = W.QLabel("选“负载扰动对比”触发后，自动统计最大掉速、卸载冲高、恢复时间与 PWM 饱和时长。")
+    w.disturb_summary.setWordWrap(True)
+    f.addRow(w.disturb_summary)
     side.addStretch()
 
     w.vertical = W.QSplitter(C.Qt.Orientation.Vertical)

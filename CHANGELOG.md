@@ -1,5 +1,27 @@
 # 嵌入式综合调试助手（EmbeddedDebugStudio）更新记录
 
+## v1.9（2026-11-26）
+
+### 统一通道语义、MCU 时间基准、蓝牙急停加固与负载扰动对比
+- **1. 平衡车示例与 IMU 通道统一语义**（`telemetry_schema.py`、`firmware_example/balance_example.c`、`imu_studio.py`、`firmware_studio.py`、`main.py`）：
+  - 新建规范通道语义表 `telemetry_schema.py`，统一区分 `pitch_target`、`pitch`、`gyro_pitch`、`pwm`、`wheel_speed` 等字段与工程单位（`°`、`°/s`、`PWM`、`cnt/s`）；
+  - 平衡车示例 `balance_example.c` 与【接口构建】`IMU` 平衡车监控格式同步升级为 5 列（`pitch_target,pitch,gyro_pitch,pwm,wheel_speed`），下发 `#NAMES:` + `#ROLES:` 声明，确保 PID 页与 IMU 页读数完全一致；若下位机未上报某些字段（如缺省角速度），IMU 面板明确显示 `未上报` 而不误将 PWM 当角速度。
+- **2. IMU MCU 时间戳、合包免疫与静止标定判稳**（`imu_studio.py`、`firmware_studio.py`）：
+  - 【接口构建】IMU 模板新增可选 `seq,mcu_ms` 采样序号与单片机毫秒时间戳上报，【IMU 姿态】页新增【时间基准】（`自动（MCU时间戳 / 固定周期）`、`固定采样周期 (Hz)`、`电脑到达时间`）与【预设采样率】，并统计 `seq` 丢帧数，彻底解决蓝牙/串口多帧合包导致陀螺仪积分失真问题；
+  - 50 帧机械中值角标定新增静止稳定性检查（`σ > 0.35°`、峰峰值 `> 1.5°` 或最大角速度 `> 5.0 °/s`），车体仍在晃动时自动拒绝同步 `ANG.TGT` 并提示重试。
+- **3. 蓝牙 RFCOMM 急停队列冲洗、PID 默认组统一与模板完善**（`bluetooth_link.py`、`pid_link.c/.h`、`layout_ui.py`、`firmware_studio.py`）：
+  - 修复 `BluetoothRfcommLink.send(data, urgent=True)` 兼容，使蓝牙 SPP 无线遥控急停先清空积压运动指令并优先下发 `J,0,0\nS\n`；
+  - `pid_link` 新增 `PID_SetDefaultGroup(PRIMARY_PID_GROUP)`，使 HAL/SPL 模板下无前缀命令 `@KP` 与默认主闭环组一致，PID 参数框旁实时展示完整参数地址（如 `SPD.KP` / `@KP`）；
+  - SPL 示例补齐真实 `GPIO_InitTypeDef` 串口复用/浮空引脚初始化，Arduino PID 示例新增 `parseStrictFloat` 拒绝非法参数并返回 `@ERR`。
+- **4. 【负载扰动对比】触发分析与 A/B 游标复算**（`engine.py`、`scope.py`、`capture.py`、`layout_ui.py`、`main.py`）：
+  - 在现有单次触发捕获卡片新增 `负载扰动对比` 模式与 `输出限幅 ±` 配置，一次自动统计 **最大掉速、卸载冲高、恢复时间、PWM 饱和时长** 与触发前 PWM；
+  - 支持用示波器 A/B 游标指定手动加载/卸载时刻（【按游标重算 A/B】），并支持【锁定对比捕获】按触发点同起点叠加对比两次实车扰动波形与已确认 PID 参数。
+- **5. 自动整定真实限幅/角色冲突防护与长录制流式分段回放**（`autotune.py`、`autotune_ui.py`、`storage.py`、`main.py`）：
+  - 自动整定支持填写控制器真实 `输出限幅 ±` 并在总结中展示 `触顶占比 / 有效采样 / 反馈通道 / 时间来源`，手选反馈通道与 `#ROLES:actual` 冲突时提前告警阻断并要求二次核对；
+  - `storage.py` 新增流式扫描 `inspect_csv()` 与 `[t_start, t_end]` 时间窗口流式读取 `load_csv()`，导入超过 `20,000` 行的长录制时弹出起止时间选择窗（含一键选取开头前 200 s / 末尾最近 200 s）。
+
+---
+
 ## v1.8（2026-11-25）
 
 ### 新增第 5 工作台【🧩 接口构建】（`firmware_studio.py`，快捷键 `Ctrl+5`）与任意列顺序 `#ROLES:`

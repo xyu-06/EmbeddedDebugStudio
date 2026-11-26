@@ -1103,9 +1103,10 @@ class RemoteBtPage(W.QWidget):
     def emergency_stop(self):
         self.stop_all_motion(send_stop=False)
         if self.connected and self.link:
-            pkt = format_drive_command(self.fmt_edit.text(), 0, 0) + self._suffix_str()
+            suf = self._suffix_str()
+            pkt = format_drive_command(self.fmt_edit.text(), 0, 0) + suf + "S" + suf
             self.link.send(pkt.encode("utf-8"), urgent=True)
-            self.link.send(("S" + self._suffix_str()).encode("utf-8"))
+            self.last_sent_xy = (0, 0)
             self._log("急停", "已清空队列并下发 J,0,0 与停车指令 S")
 
     def send_car_text(self, cmd: str):

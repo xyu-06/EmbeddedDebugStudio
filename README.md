@@ -11,9 +11,9 @@
 
 👉 **[前往 GitHub Releases 下载最新 Windows 免安装版 EXE 与 PDF/Word 图文使用手册](https://github.com/xyu-06/EmbeddedDebugStudio/releases/latest)**
 
-- **Windows 免安装单文件**：下载 `PIDTuner.exe`（或 `EmbeddedDebugStudio-v1.8-win64.exe`）双击即用，无需安装 Python 环境。
+- **Windows 免安装单文件**：下载 `PIDTuner.exe`（或 `EmbeddedDebugStudio-v1.9-win64.exe`）双击即用，无需安装 Python 环境。
 - **在线阅读完整图文操作手册**：[点击在线查看完整图文使用手册 (docs/MANUAL.md)](docs/MANUAL.md)（Releases 中亦提供打包好的 `.pdf` 与 `.docx` 离线文档）
-- **历史版本归档**：`v1.1` → `v1.8` 各历史版本的安装包、源码快照与配套操作手册均完整归档于 [Releases 页面](https://github.com/xyu-06/EmbeddedDebugStudio/releases)。
+- **历史版本归档**：`v1.1` → `v1.9` 各历史版本的安装包、源码快照与配套操作手册均完整归档于 [Releases 页面](https://github.com/xyu-06/EmbeddedDebugStudio/releases)。
 
 ---
 
@@ -82,7 +82,8 @@ self.register_module("📷 摄像头调试", CameraDebugPage(self))
 | `autotune.py` / `autotune_ui.py` | 闭环阶跃辨识（SIMC / 极点配置）+ Hooke–Jeeves 自动整定引擎 |
 | `diagnostics.py` / `scope.py` / `engine.py` | FFT 信号体检、C 代码导出、高刷示波器（含 Ghost 底图）、协议解析与仿真器 |
 | `firmware_example/` | STM32 C99 零 `printf_float` 依赖协议栈 `pid_link.c/.h`、HAL 队列与平衡车三环串级模板 |
-| `tests/` & `test_tuner.py` | STM32 C99 协议/平衡车闭环测试与 36 项 Python 自动化回归测试 |
+| `telemetry_schema.py` & `storage.py` | 统一通道语义单位映射、流式长录制分段扫描与 CSV 回放引擎 |
+| `tests/` & `test_tuner.py` | STM32 C99 协议/平衡车闭环测试与 39 项 Python 自动化回归测试 |
 | `.github/workflows/build-windows.yml` | GitHub Actions 自动运行 C + Python 全套测试并构建单文件 `PIDTuner.exe` |
 
 ---
