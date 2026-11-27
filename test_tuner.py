@@ -1929,6 +1929,174 @@ class GuiChecks(unittest.TestCase):
         self.assertIn("readSensorFeedback()", ino)
         self.assertIn("@ERR:implement readSensorFeedback()", ino)
 
+    def test_v19_autotune_safety_and_identification_fixes(self):
+        from autotune import AutoTuner, evaluate_step, identify_from_p_step
+        from configuration import DEFAULT_RULES
+
+        rules = dict(DEFAULT_RULES)
+        t_v = np.linspace(0.0, 2.0, 50)
+
+        # 1a) Saturated stall (actual==0, output==1000): must stop immediately without escalating KP
+        tuner_stall = AutoTuner(0, 1, 0, {"KP": 0.0, "KI": 0.0, "KD": 0.0}, rules, base=0.0, target=100.0, output_limit=1000.0)
+        rnd, cand, _ = tuner_stall.next_candidate()
+        self.assertEqual(rnd, 1)
+        ev_stall = tuner_stall.record_result(t_v, np.zeros_like(t_v), base_y=0.0, outputs=np.full_like(t_v, 1000.0))
+        self.assertTrue(ev_stall.stalled)
+        self.assertFalse(ev_stall.valid)
+        self.assertTrue(tuner_stall.finished)
+        self.assertIsNone(tuner_stall.next_candidate())
+        self.assertIsNone(tuner_stall.best_params)
+
+        # 1b) Without output channel, zero response may boost probe AT MOST ONCE then stop cleanly
+        tuner_nfb = AutoTuner(0, 1, 0, {"KP": 0.0, "KI": 0.0, "KD": 0.0}, rules, base=0.0, target=100.0)
+        kps_seen = []
+        for _ in range(5):
+            nxt = tuner_nfb.next_candidate()
+            if nxt is None:
+                break
+            _, c, _ = nxt
+            kps_seen.append(c["KP"])
+            tuner_nfb.record_result(t_v, np.zeros_like(t_v), base_y=0.0, outputs=None)
+        self.assertEqual(len(kps_seen), 2)
+        self.assertAlmostEqual(kps_seen[0], 1.0, places=3)
+        self.assertAlmostEqual(kps_seen[1], 3.0, places=3)
+        self.assertTrue(tuner_nfb.finished)
+        self.assertIsNone(tuner_nfb.best_params)
+
+        # 4) ANG local tuning preserves Round 1 baseline verbatim (e.g. KP=25, KI=0, KD=1.0 even in PI mode)
+        tuner_ang = AutoTuner(0, 1, 1, {"KP": 25.0, "KI": 0.0, "KD": 1.0}, rules, base=0.0, target=3.0)
+        _, b_ang, b_tag = tuner_ang.next_candidate()
+        self.assertEqual(b_tag, "当前基准")
+        self.assertEqual(b_ang, {"KP": 25.0, "KI": 0.0, "KD": 1.0})
+
+        # 6) All-NaN feedback round produces sample_count=0, valid=False, and NEVER enters best_params
+        ev_nan = evaluate_step(t_v, np.full_like(t_v, np.nan), 0.0, 100.0)
+        self.assertFalse(ev_nan.valid)
+        self.assertEqual(ev_nan.sample_count, 0)
+        tuner_nan = AutoTuner(0, 1, 0, {"KP": 1.0, "KI": 0.0, "KD": 0.0}, rules, base=0.0, target=100.0)
+        tuner_nan.next_candidate()
+        ev_r = tuner_nan.record_result(t_v, np.full_like(t_v, np.nan), base_y=0.0)
+        self.assertFalse(ev_r.valid)
+        self.assertIsNone(tuner_nan.best_params)
+
+        # 7a) Non-zero baseline identification uses delta_y / delta_r (r:100->150, y:80->120 => alpha=0.8)
+        y_nz = 80.0 + 40.0 * (1.0 - np.exp(-t_v / 0.25))
+        cands_nz = identify_from_p_step(t_v, y_nz, base_y=80.0, goal_y=150.0, kp_probe=2.0, mode=0, style=1, base_cmd=100.0)
+        cands_old = identify_from_p_step(t_v, y_nz, base_y=80.0, goal_y=150.0, kp_probe=2.0, mode=0, style=1)
+        self.assertTrue(cands_nz and cands_old)
+        # True K_plant is (0.8/(0.2*2))=2.0 (smaller KP needed than biased alpha=0.57 => K=0.66)
+        self.assertLess(abs(cands_nz[0]["KP"]), abs(cands_old[0]["KP"]))
+
+        with TemporaryDirectory() as tmp:
+            # 2 & 3) Command failure clears old queue BEFORE enqueuing restore; partial @STOP ACK reported clearly
+            w = Window(Path(tmp) / "fail_order.ini")
+            w.timer.stop()
+            w.connected = True
+            w.sim = None
+            w.group.setCurrentIndex(1)  # SPD
+            for k, v in (("KP", 5.0), ("KI", 30.0), ("KD", 0.05), ("TGT", 100.0)):
+                w.fields[k].setValue(v)
+                w.confirmed[f"SPD.{k}"] = v
+            sent_bytes = []
+            class FakeAsyncLink:
+                def send(self, data, urgent=False):
+                    sent_bytes.append((bytes(data), urgent))
+                    return True
+            w.link = FakeAsyncLink()
+            self.assertTrue(w.autotuner.start(0, 1, 0, base=0.0, target=100.0, step_seconds=2.0, max_rounds=4))
+            # Enqueue extra command behind pending, then fail mid-run
+            w.commands.waiting.append(("@SPD.KP=99.0000", "SPD", False, 999))
+            w.commands.failed("应答超时")
+            # Stale @SPD.KP=99 must be gone; FINALIZING must still be active with @STOP + restore queued!
+            queued_cmds = [cmd for cmd, _, _, _ in w.commands.waiting]
+            pending_cmd = w.commands.pending[0] if w.commands.pending else ""
+            all_active_cmds = [pending_cmd, *queued_cmds]
+            self.assertNotIn("@SPD.KP=99.0000", all_active_cmds)
+            self.assertEqual(pending_cmd, "@STOP")
+            self.assertTrue(any("5.0000" in c for c in queued_cmds))
+            self.assertEqual(w.autotuner.state, w.autotuner.FINALIZING)
+
+            # @STOP gets ACKed, then link fails while restoring KI -> clear partial status!
+            w.commands.reply("ACK", "STOP")
+            self.assertTrue(w.autotuner.finalize_stop_acked)
+            w.commands.failed("串口断开")
+            self.assertEqual(w.autotuner.state, w.autotuner.IDLE)
+            self.assertIn("设备已停机，参数恢复未确认", w.autotune_status.text())
+            w.link = None
+            w.close()
+
+            # 5) Reversed-sign Round 1 exits GUI cleanly with ZERO TypeError and sends @STOP + restore
+            w2 = Window(Path(tmp) / "rev.ini")
+            w2.timer.stop()
+            w2.connected = True
+            w2.sim = None
+            w2.group.setCurrentIndex(1)
+            for k, v in (("KP", 5.0), ("KI", 30.0), ("KD", 0.05), ("TGT", 100.0)):
+                w2.fields[k].setValue(v)
+                w2.confirmed[f"SPD.{k}"] = v
+            sent_rev = []
+            w2.commands.submit = lambda cmds, quiet=False: (sent_rev.extend(cmds) or True)
+            w2.commands.busy = lambda: False
+            w2.receive(b"#NAMES:target,actual,pwm,err\n#ROLES:target,actual,output,error\n0,0,0,0\n", 1.0)
+            self.assertTrue(w2.autotuner.start(0, 1, 0, base=0.0, target=100.0, step_seconds=0.6, max_rounds=5))
+            w2.autotuner.tick(1.02)  # WAIT_START -> PREPARE
+            w2.autotuner.tick(1.03)  # PREPARE -> WAIT_BASE_ACK
+            w2.autotuner.tick(1.04)  # WAIT_BASE_ACK -> SETTLE_BASE
+            for i in range(10):
+                w2.sample(1.05 + i * 0.04, [0.0, 0.0, 0.0, 0.0])
+            w2.autotuner.tick(1.45)  # SETTLE_BASE -> WAIT_STEP_ACK
+            w2.autotuner.tick(1.46)  # WAIT_STEP_ACK -> OBSERVE
+            sent_rev.clear()
+            for i in range(16):
+                w2.sample(1.50 + i * 0.05, [100.0, -35.0, -500.0, 135.0])
+            w2.autotuner.tick(2.30)
+            self.assertFalse(w2.autotuner.active)
+            self.assertIn("反向响应", w2.autotune_status.text())
+            self.assertIn("@STOP", sent_rev)
+            self.assertTrue(any("SPD.KP=5.0000" in c for c in sent_rev))
+            w2.close()
+
+            # 7b) Mid-round online stall abort (< step_seconds) + target-jump vs 2-col ACK fallback
+            w3 = Window(Path(tmp) / "stall_and_t0.ini")
+            w3.timer.stop()
+            w3.connected = True
+            w3.sim = None
+            w3.group.setCurrentIndex(1)
+            for k, v in (("KP", 2.0), ("KI", 5.0), ("KD", 0.0), ("TGT", 100.0)):
+                w3.fields[k].setValue(v)
+                w3.confirmed[f"SPD.{k}"] = v
+            sent_s = []
+            w3.commands.submit = lambda cmds, quiet=False: (sent_s.extend(cmds) or True)
+            w3.commands.busy = lambda: False
+            w3.receive(b"#NAMES:target,actual,pwm\n#ROLES:target,actual,output\n0,0,0\n", 1.0)
+            self.assertTrue(w3.autotuner.start(0, 1, 0, base=0.0, target=100.0, step_seconds=5.0, max_rounds=4, output_limit=1000.0))
+            w3.autotuner.tick(1.01); w3.autotuner.tick(1.02); w3.autotuner.tick(1.03)
+            for i in range(8):
+                w3.sample(1.05 + i * 0.04, [0.0, 0.0, 0.0])
+            w3.autotuner.tick(1.40)  # WAIT_STEP_ACK
+            w3.autotuner.tick(1.41)  # OBSERVE starts
+            # Feed target jump at exact frame t=1.60 while feedback stays 0 and PWM=1000 for 1.8s (<5.0s!)
+            w3.sample(1.50, [0.0, 0.0, 0.0])
+            for i in range(36):
+                w3.sample(1.60 + i * 0.05, [100.0, 0.0, 1000.0])
+            w3.autotuner.tick(3.40)
+            self.assertFalse(w3.autotuner.active)
+            self.assertEqual(w3.autotuner.step_t0_source, "目标列跳变起点")
+            self.assertAlmostEqual(w3.autotuner.step_t0, 1.60, places=3)
+            self.assertIn("输出触顶且反馈无响应", w3.autotune_status.text())
+            self.assertIn("@STOP", sent_s)
+
+            # Two-column mode (actual, pwm) without target channel falls back cleanly to ACK timing
+            w3.clear_plot()
+            w3.receive(b"#NAMES:actual,pwm\n#ROLES:actual,output\n0,0\n", 4.0)
+            self.assertTrue(w3.autotuner.start(0, 1, 0, base=0.0, target=100.0, step_seconds=2.0, max_rounds=4))
+            w3.autotuner.tick(4.01); w3.autotuner.tick(4.02); w3.autotuner.tick(4.03)
+            for i in range(8):
+                w3.sample(4.05 + i * 0.04, [0.0, 0.0])
+            w3.autotuner.tick(4.40); w3.autotuner.tick(4.41)
+            self.assertEqual(w3.autotuner.step_t0_source, "估计起点(ACK)")
+            w3.close()
+
 
 if __name__ == "__main__":
     unittest.main()

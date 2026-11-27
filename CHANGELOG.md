@@ -24,6 +24,10 @@
   - 收窄 `telemetry_schema.py` 默认单位推断，通用 `target / actual / output` 通道不再被误判成角度 `°` 或 `PWM`；
   - `disturbance_metrics()` 无卸载冲高时 `t_peak` 返回 `None`（不再误取窗口末时刻），Arduino PID 草图新增 `PID_SENSOR_HOOK_READY 0` 防呆钩子避免未接反馈盲目 `@RUN`；
   - 新增 `tests/verify_generators.py` 并在 CI 自动编译全部 30 组配置、SPL 5 路串口模板及 `arduino-cli`（`esp32:esp32:esp32`）全部 `.ino` 草图，源码压缩包统一使用 POSIX `/` 路径规范。
+- **7. 自动整定全链路安全与精确辨识加固**（`autotune.py`、`autotune_ui.py`、`device_session.py`）：
+  - **堵转 / 无反馈双锁急停**：输出触顶且反馈无变化（以及无输出列时）最多只允许 1 次有限幅探针重试，并在采样观察期 `OBSERVE` 中途提前检测到持续触顶无响应或强烈反向时立即 `@STOP` 停机并回滚；新增 `StepEvaluation.valid/stalled`，严禁全 `NaN`、采样不足、触顶堵转或反向轮次入选最优；
+  - **恢复队列与分步确认修复**：`DeviceSession.failed()` 改为先清空失败队列再触发自动整定回滚，新增 `FINALIZING` 确认阶段分别追踪 `@STOP` 与参数恢复 `@ACK`（例如已停机但恢复中途断线会明确报告“设备已停机，参数恢复未确认”），并在无已确认参数时启动前自动 `@GET` 读回真实基准；
+  - **基准保留、`Δy/Δr` 辨识修正与目标帧起点对齐**：`ANG` 整定默认 `PD`、第 1 轮“当前基准”原样保留全部设备增益（不再改写 `KD`）；`identify_from_p_step()` 改用指令变化量 $\Delta y / \Delta r$ 计算闭环增益（修正非零基准静差偏置）；上报目标列时按目标跳变帧精确对齐 `step_t0`（两列模式回退至 `估计起点(ACK)`），`SETTLE_BASE` 在基准回稳且平缓后正常起跑。
 
 ---
 

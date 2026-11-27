@@ -97,10 +97,11 @@ class DeviceSession(CommandQueue):
     def failed(self,msg):
         if getattr(self.ui,"generator",None):
             self.ui.stop_generator("命令失败，发生器已停止",restore=False)
-        if getattr(self.ui,"autotuner",None) and self.ui.autotuner.active:
-            self.ui.autotuner.on_device_stopped(msg)
+        was_pending = self.pending
+        at = getattr(self.ui,"autotuner",None)
+        at_engaged = bool(at and at.state != at.IDLE)
         self.ui.rollback = None
-        self.ui.retry_command = self.pending[0] if self.pending else None
+        self.ui.retry_command = was_pending[0] if was_pending else None
         if self.ui.retry_command and "=" in self.ui.retry_command:
             addr = self.ui.retry_command[1:].split("=",1)[0]
             if "." not in addr:
@@ -111,6 +112,8 @@ class DeviceSession(CommandQueue):
         if self.ui.retry_command == "@STOP":
             self.ui.stop_banner.setText("急停未获确认 · 请检查设备输出")
         self.clear()
+        if at_engaged:
+            at.on_command_failed(msg)
         self.ui.feedback(msg,True)
 
 
@@ -198,6 +201,9 @@ class DeviceSession(CommandQueue):
                 self.pending = None
                 self.ui.ack.setText("发生器  " + payload)
                 self.ui.workbench.fields()
+                at = getattr(self.ui, "autotuner", None)
+                if at and at.state != at.IDLE:
+                    at.on_command_acked(cmd)
                 return
             for addr in updates:
                 self.ui.workbench.field_event(addr)
@@ -207,6 +213,9 @@ class DeviceSession(CommandQueue):
         elif not quiet:
             self.ui.mark(payload)
         self.pending = None
+        at = getattr(self.ui, "autotuner", None)
+        if at and at.state != at.IDLE:
+            at.on_command_acked(cmd)
         if not quiet:
             self.ui.feedback("已确认  " + payload)
 

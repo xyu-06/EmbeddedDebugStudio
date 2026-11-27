@@ -3,7 +3,7 @@ from time import monotonic
 import numpy as np
 from PySide6 import QtCore as C, QtWidgets as W
 
-from autotune import MODES, STYLES, STRATEGIES, AutoTuner
+from autotune import MODE_KEYS, MODES, STYLES, STRATEGIES, AutoTuner
 from engine import KEYS, LIMIT, MAX_CHANNELS
 from layout_ui import combo, number, check
 
@@ -11,7 +11,7 @@ from layout_ui import combo, number, check
 class AutoTuneController:
     """Drives AutoTuner over live serial or simulated telemetry inside Window.tick()."""
 
-    IDLE, WAIT_START, PREPARE, WAIT_BASE_ACK, SETTLE_BASE, WAIT_STEP_ACK, OBSERVE, APPLY_BEST = range(8)
+    IDLE, READ_BASELINE, WAIT_START, PREPARE, WAIT_BASE_ACK, SETTLE_BASE, WAIT_STEP_ACK, OBSERVE, FINALIZING = range(9)
 
     def __init__(self, window):
         self.ui = window
@@ -20,6 +20,7 @@ class AutoTuneController:
         self.group = "ANG"
         self.actual_col = 1
         self.output_col = None
+        self.target_col = None
         self.hold_target = True
         self.saved_before = None
         self.current_cand = None
@@ -27,7 +28,18 @@ class AutoTuneController:
         self.phase_t0 = 0.
         self.wall_deadline = 0.
         self.base_y = 0.
+        self.step_pre_t = 0.
         self.step_t0 = 0.
+        self.step_t0_source = ""
+        self.step_t0_resolved = False
+        self._pending_start = None
+        self.finalize_mode = ""
+        self.finalize_need_stop = False
+        self.finalize_stop_acked = False
+        self.finalize_target = None
+        self.finalize_reason = ""
+        self.finalize_summary = ""
+        self.finalize_deadline = 0.
         # Remember dialog defaults across opens in the same session
         self.cfg = {
             "target": 50.0,
@@ -61,7 +73,17 @@ class AutoTuneController:
 
     @property
     def active(self):
-        return self.state != self.IDLE
+        return self.state not in (self.IDLE, self.FINALIZING)
+
+    def _find_target_col(self):
+        w = self.ui
+        target_tags = ("target", "目标", "setpoint", "sp", "tgt", "ref")
+        roles = list(getattr(w, "channel_roles", []))[:w.count]
+        names = [n.lower() for n in w.names()[:w.count]]
+        col = next((i for i, r in enumerate(roles) if i != self.actual_col and r == "target"), None)
+        if col is None:
+            col = next((i for i, n in enumerate(names) if i != self.actual_col and any(t in n for t in target_tags)), None)
+        return col if (col is not None and col < w.count and col != self.actual_col) else None
 
     def detect_channels(self):
         """Return (actual_channel_index, optional_output_channel_index)."""
@@ -142,8 +164,8 @@ class AutoTuneController:
         if abs(default_tgt - base_spin.value()) < 1e-3:
             base_spin.setValue(0.0 if abs(default_tgt) > 1e-3 else -10.0)
 
-        default_mode = 2 if (w.sim and w.sim.pendulum) else 1 if w.sim and w.sim.model == 1 else self.cfg["mode"]
         is_ang = group == "ANG"
+        default_mode = 2 if (is_ang or (w.sim and w.sim.pendulum)) else 1 if w.sim and w.sim.model == 1 else self.cfg["mode"]
         default_strategy = 1 if (is_ang or (w.sim and w.sim.pendulum)) else self.cfg["strategy"]
         mode_box = combo(list(MODES), default_mode)
         style_box = combo(list(STYLES), self.cfg["style"])
@@ -175,6 +197,26 @@ class AutoTuneController:
         form.addRow("输出限幅 ±", limit_spin)
         form.addRow(hold_chk)
         form.addRow(safety_chk)
+
+        mode_hint = W.QLabel()
+        mode_hint.setWordWrap(True)
+        mode_hint.setStyleSheet("color:#486075;font-size:9pt;padding-top:2px;")
+        outer.addWidget(mode_hint)
+
+        def _update_mode_hint():
+            m_idx = mode_box.currentIndex()
+            active_k = MODE_KEYS[m_idx]
+            dropped = [k for k in ("KP", "KI", "KD") if k not in active_k and abs(w.fields[k].value()) > 1e-4]
+            extra = f"（注意：第 1 轮按设备当前原参数运行，后续寻优候选将清零 {', '.join(dropped)}）" if dropped else ""
+            readback_note = (
+                " 启动前将自动 @GET 读回设备已确认参数作回滚基准。"
+                if (not w.sim and any(f"{group}.{k}" not in w.confirmed for k in KEYS))
+                else ""
+            )
+            mode_hint.setText(f"当前寻优调节项：{', '.join(active_k)}{extra}。{readback_note}")
+
+        _update_mode_hint()
+        mode_box.currentIndexChanged.connect(lambda _: _update_mode_hint())
 
         conflict, conflict_msg = self.has_role_conflict()
         conflict_chk = None
@@ -261,13 +303,58 @@ class AutoTuneController:
             return False
 
         w.save_draft()
-        initial = {k: w.fields[k].value() for k in ("KP", "KI", "KD")}
+        self.group = group
+        self.hold_target = hold_target
+        self.finalize_mode = ""
+        self.finalize_need_stop = False
+        self.finalize_stop_acked = False
+        self.finalize_target = None
+        self.finalize_reason = ""
+        self.finalize_summary = ""
+
+        need_readback = (not w.sim) and (
+            any(f"{group}.{k}" not in w.confirmed for k in KEYS)
+            or any(abs(w.fields[k].value() - w.confirmed[f"{group}.{k}"]) > 1e-4 for k in KEYS)
+        )
+        if need_readback:
+            self._pending_start = {
+                "mode": mode, "style": style, "strategy": strategy,
+                "base": base, "target": target, "step_seconds": step_seconds,
+                "max_rounds": max_rounds, "output_limit": output_limit,
+            }
+            self.engine = None
+            self.saved_before = None
+            self.state = self.READ_BASELINE
+            self.wall_deadline = monotonic() + 3.0
+            self.sync_ui()
+            self._set_status("正在启动前读回设备当前参数 (@GET)…")
+            if not w.commands.submit([self._cmd("GET")], quiet=True):
+                self._pending_start = None
+                self.state = self.IDLE
+                self.sync_ui()
+                w.feedback("命令队列繁忙，无法在启动前读回设备参数", True)
+                return False
+            return True
+
+        initial = {
+            k: float(w.confirmed[f"{group}.{k}"]) if (not w.sim and f"{group}.{k}" in w.confirmed) else float(w.fields[k].value())
+            for k in KEYS
+        }
+        return self._launch_with_baseline(
+            initial, mode, style, strategy, base, target, step_seconds, max_rounds, output_limit,
+        )
+
+    def _launch_with_baseline(self, baseline, mode, style, strategy, base, target, step_seconds, max_rounds, output_limit):
+        w = self.ui
+        group = self.group
         try:
             self.engine = AutoTuner(
-                mode, style, strategy, initial, w.rules[group], base, target,
+                mode, style, strategy, baseline, w.rules[group], base, target,
                 step_seconds, max_rounds, output_limit=output_limit,
             )
         except ValueError as exc:
+            self.state = self.IDLE
+            self.sync_ui()
             w.feedback(str(exc), True)
             return False
 
@@ -277,12 +364,9 @@ class AutoTuneController:
         if w.scope.frozen:
             w.toggle_freeze()
 
-        self.group = group
-        self.hold_target = hold_target
         self.actual_col, self.output_col = self.detect_channels()
-        self.saved_before = {
-            k: w.confirmed.get(f"{group}.{k}", w.fields[k].value()) for k in KEYS
-        }
+        self.target_col = self._find_target_col()
+        self.saved_before = {k: float(baseline[k]) for k in KEYS}
 
         self.state = self.WAIT_START
         self.wall_deadline = monotonic() + 3.0
@@ -316,32 +400,139 @@ class AutoTuneController:
         cmds.append(self._cmd("TGT", tgt))
         return cmds
 
-    def _restore_original(self, reason, send_to_device=True):
-        """Always roll back UI and device to saved_before when no verified winner exists."""
+    def _begin_finalize(self, mode, params_dict, reason, stop_motor=False, already_stopped=False, summary=""):
         w = self.ui
-        self.state = self.IDLE
-        if self.saved_before:
-            for k in KEYS:
-                w.drafts[self.group][k] = self.saved_before[k]
-            w.load_fields()
-            if send_to_device and w.connected:
-                p = self.saved_before
-                cmds = self._build_param_cmds(p["KP"], p["KI"], p["KD"], p["TGT"], reset=True)
-                w.commands.submit(cmds, quiet=True)
+        self.finalize_mode = mode
+        self.finalize_need_stop = bool(stop_motor and not already_stopped)
+        self.finalize_stop_acked = bool(already_stopped)
+        self.finalize_target = dict(params_dict) if params_dict is not None else None
+        self.finalize_reason = reason or ""
+        self.finalize_summary = summary
+
+        if not w.connected or params_dict is None:
+            self.state = self.IDLE
+            self.sync_ui()
+            if self.finalize_need_stop:
+                msg = f"⚠ {self.finalize_reason} · 连接已断开，停机与设备参数均未确认（请立即检查实车并重连后点【读取】）"
+            else:
+                msg = f"⚠ {self.finalize_reason} · 设备参数未确认（请重连后点【读取】核对）"
+            self._set_status(msg, summary)
+            w.log("系统", "自动整定  " + msg)
+            w.feedback(msg, True)
+            return
+
+        cmds = (["@STOP"] if self.finalize_need_stop else []) + self._build_param_cmds(
+            params_dict["KP"], params_dict["KI"], params_dict["KD"], params_dict["TGT"], reset=True,
+        )
+        self.state = self.FINALIZING
+        self.finalize_deadline = monotonic() + 3.5
         self.sync_ui()
-        msg = reason or "已中止整定并恢复整定前参数"
+        self._set_status("正在等待设备确认停机与参数写回…" if self.finalize_need_stop else "正在等待设备确认参数写回…")
+        if not w.commands.submit(cmds, quiet=True):
+            self.on_command_failed("写回指令未能入队")
+            return
+        if not w.commands.busy():
+            self._finish_finalize()
+
+    def _finish_finalize(self):
+        w = self.ui
+        if self.state != self.FINALIZING:
+            return
+        mode = self.finalize_mode
+        reason = self.finalize_reason
+        summary = self.finalize_summary
+        p = self.finalize_target
+        self.state = self.IDLE
+        self.sync_ui()
+        if mode == "winner" and p is not None:
+            status = f"✓ {reason}"
+            self._set_status(status, summary)
+            w.mark(f"整定完成 KP={p['KP']:.4g},KI={p['KI']:.4g},KD={p['KD']:.4g}")
+            w.feedback(f"自动整定完成 · {summary}")
+        else:
+            if self.finalize_stop_acked or not self.finalize_need_stop:
+                status = f"{reason}（设备已确认停机，原参数已恢复）"
+            else:
+                status = f"⚠ {reason}（设备停机未获确认，参数恢复未确认）"
+            self._set_status(status, summary)
+            w.log("系统", "自动整定  " + status)
+            w.feedback(status, True)
+
+    def _abort_finalize_disconnected(self):
+        w = self.ui
+        if self.finalize_need_stop and self.finalize_stop_acked:
+            msg = f"⚠ {self.finalize_reason} · 设备已停机，参数恢复未确认（请重连后点【读取】核对）"
+        elif self.finalize_need_stop:
+            msg = f"⚠ {self.finalize_reason} · 连接已断开，停机与设备参数均未确认（请检查实车）"
+        else:
+            msg = f"⚠ {self.finalize_reason} · 连接已断开，设备参数未确认（请重连后点【读取】核对）"
+        self.state = self.IDLE
+        self.sync_ui()
         self._set_status(msg)
         w.log("系统", "自动整定  " + msg)
         w.feedback(msg, True)
 
+    def on_command_acked(self, cmd):
+        if self.state == self.FINALIZING:
+            if cmd == "@STOP":
+                self.finalize_stop_acked = True
+            if not self.ui.commands.busy():
+                self._finish_finalize()
+
+    def on_command_failed(self, msg):
+        w = self.ui
+        if self.state == self.READ_BASELINE:
+            self._pending_start = None
+            self.state = self.IDLE
+            self.sync_ui()
+            err = f"启动前未能读回设备参数（{msg}），整定已取消"
+            self._set_status("⚠ " + err)
+            w.feedback(err, True)
+            return
+        if self.state == self.FINALIZING:
+            if self.finalize_need_stop and self.finalize_stop_acked:
+                status = f"⚠ 设备已停机，参数恢复未确认（{msg}；请重连后点【读取】核对）"
+            elif self.finalize_need_stop:
+                status = f"⚠ 命令失败，停机与设备参数均未确认（{msg}；请检查实车）"
+            elif self.finalize_mode == "winner":
+                status = f"⚠ 最优参数写回未确认（{msg}；请点【读取】核对设备参数）"
+            else:
+                status = f"⚠ 原参数恢复未确认（{msg}；请重连后点【读取】核对）"
+            self.state = self.IDLE
+            self.sync_ui()
+            self._set_status(status)
+            w.log("系统", "自动整定  " + status)
+            w.feedback(status, True)
+            return
+        if self.active:
+            self._restore_original(f"命令失败（{msg}）", send_to_device=w.connected, stop_motor=True, already_stopped=False)
+
+    def _restore_original(self, reason, send_to_device=True, stop_motor=True, already_stopped=False):
+        """Always roll back UI and device to saved_before when no verified winner exists."""
+        w = self.ui
+        if self.saved_before:
+            for k in KEYS:
+                w.drafts[self.group][k] = self.saved_before[k]
+            w.load_fields()
+        msg = reason or "已中止整定"
+        if send_to_device and w.connected and self.saved_before:
+            self._begin_finalize("restore", self.saved_before, msg, stop_motor=stop_motor, already_stopped=already_stopped)
+            return
+        self.state = self.IDLE
+        self.sync_ui()
+        note = msg + (" · 未连机或无设备基准，设备参数未确认" if self.saved_before is None or not w.connected else "")
+        self._set_status(note)
+        w.log("系统", "自动整定  " + note)
+        w.feedback(note, True)
+
     def sync_ui(self):
         w = self.ui
-        running = self.active
-        w.autotune_btn.setText("停止整定（采用最优）" if running else "⚡ 自动整定 PID…")
+        running = self.state != self.IDLE
+        w.autotune_btn.setText("停止整定（采用最优）" if self.active else "等待设备确认…" if running else "⚡ 自动整定 PID…")
         w.autotune_btn.setObjectName("danger" if running else "accent")
         w.autotune_btn.style().unpolish(w.autotune_btn)
         w.autotune_btn.style().polish(w.autotune_btn)
-        w.autotune_btn.setEnabled(w.connected or running)
+        w.autotune_btn.setEnabled((w.connected or self.active) and self.state != self.FINALIZING)
         for k in KEYS:
             w.fields[k].setEnabled(not running and (k != "TGT" or w.generator is None))
         w.group.setEnabled(not running and w.generator is None and w.address.currentIndex() != 1 and not (w.sim and w.writer))
@@ -355,7 +546,7 @@ class AutoTuneController:
         self.ui.autotune_status.show()
 
     def _best_brief(self):
-        if not self.engine or not self.engine.best_params:
+        if not self.engine or not self.engine.best_params or not (self.engine.best_eval and self.engine.best_eval.valid):
             return "尚未产生有效基准"
         p = self.engine.best_params
         ev = self.engine.best_eval
@@ -363,15 +554,15 @@ class AutoTuneController:
 
     def on_device_stopped(self, reason):
         """Called when device reports #STOP:fall / #STOP:heartbeat or user hits emergency stop."""
-        if not self.active:
+        if self.state == self.IDLE:
             return
         w = self.ui
         if reason == "急停":
-            self._restore_original("已响应急停 · 已恢复整定前参数至设备", send_to_device=w.connected)
+            self._restore_original("已响应急停", send_to_device=w.connected, stop_motor=False, already_stopped=True)
             return
-        if self.state in (self.OBSERVE, self.SETTLE_BASE, self.WAIT_STEP_ACK, self.WAIT_BASE_ACK) and self.current_cand:
+        if self.state in (self.OBSERVE, self.SETTLE_BASE, self.WAIT_STEP_ACK, self.WAIT_BASE_ACK) and self.current_cand and self.engine:
             self.engine.record_result([], [], aborted_reason=reason)
-        if self.engine and self.engine.best_params:
+        if self.engine and self.engine.best_params and self.engine.best_eval and self.engine.best_eval.valid:
             p = self.engine.best_params
             base_tgt = self.engine.base
             if self.saved_before:
@@ -389,24 +580,39 @@ class AutoTuneController:
                 w.drafts[self.group][k] = p[k]
             w.drafts[self.group]["TGT"] = base_tgt
             w.load_fields()
-            self.state = self.IDLE
-            self.sync_ui()
-            if w.connected:
-                w.commands.submit(self._build_param_cmds(p["KP"], p["KI"], p["KD"], base_tgt, reset=True), quiet=True)
-            self._set_status(f"因“{reason}”中止 · 已将安全最优组同步写回设备", self._best_brief())
-            w.log("系统", f"自动整定因“{reason}”中止，已将安全最优组写回设备（未启动电机）")
+            target_dict = {"KP": p["KP"], "KI": p["KI"], "KD": p["KD"], "TGT": base_tgt}
+            self._begin_finalize(
+                "winner", target_dict,
+                f"因“{reason}”中止 · 已将安全最优组同步写回设备（目标保持 {base_tgt:g}）",
+                stop_motor=False, already_stopped=True, summary=self._best_brief(),
+            )
         else:
-            self._restore_original(f"因“{reason}”中止（无可用最优组）· 已恢复整定前参数", send_to_device=w.connected)
+            self._restore_original(f"因“{reason}”中止（无可用最优组）", send_to_device=w.connected, stop_motor=False, already_stopped=True)
 
     def stop(self, message="", apply_best=True):
         w = self.ui
-        if not self.active:
+        if self.state == self.IDLE:
             return
-        has_best = apply_best and self.engine is not None and self.engine.best_params is not None and w.connected
+        if self.state == self.READ_BASELINE:
+            self._pending_start = None
+            self.state = self.IDLE
+            self.sync_ui()
+            self._set_status(message or "整定已取消")
+            return
+        if self.state == self.FINALIZING:
+            return
+        has_best = (
+            apply_best
+            and self.engine is not None
+            and self.engine.best_params is not None
+            and self.engine.best_eval is not None
+            and self.engine.best_eval.valid
+            and w.connected
+        )
         if has_best:
             self._apply_winner(message or "已停止并应用最优参数")
             return
-        self._restore_original(message or "自动整定已停止，已恢复整定前参数", send_to_device=w.connected)
+        self._restore_original(message or "自动整定已停止", send_to_device=w.connected, stop_motor=True, already_stopped=False)
 
     def _apply_winner(self, reason):
         w = self.ui
@@ -430,9 +636,6 @@ class AutoTuneController:
         w.drafts[self.group]["TGT"] = final_tgt
         w.load_fields()
 
-        cmds = self._build_param_cmds(best["KP"], best["KI"], best["KD"], final_tgt, reset=True)
-        self.state = self.IDLE
-        self.sync_ui()
         ch_names = w.names()
         actual_desc = (
             f"CH{self.actual_col+1}({ch_names[self.actual_col]})"
@@ -441,18 +644,46 @@ class AutoTuneController:
         )
         time_src = "内置仿真步长" if w.sim else w.time_mode.currentText()
         summary = f"{self.engine.summary_text()} · 反馈 {actual_desc} · 时间 {time_src}"
-        self._set_status(f"✓ {reason}", summary)
-        if w.connected:
-            w.commands.submit(cmds, quiet=True)
-            w.mark(f"整定完成 KP={best['KP']:.4g},KI={best['KI']:.4g},KD={best['KD']:.4g}")
-        w.feedback(f"自动整定完成 · {summary}")
+        winner_full = {"KP": best["KP"], "KI": best["KI"], "KD": best["KD"], "TGT": final_tgt}
+        self._begin_finalize("winner", winner_full, reason, stop_motor=False, already_stopped=True, summary=summary)
 
     def tick(self, now):
-        if not self.active:
+        if self.state == self.IDLE:
             return
         w = self.ui
+        if self.state == self.FINALIZING:
+            if not w.connected:
+                self._abort_finalize_disconnected()
+                return
+            if w.commands.busy():
+                if now > self.finalize_deadline:
+                    self.on_command_failed("写回确认超时")
+                return
+            self._finish_finalize()
+            return
+
         if not w.connected:
-            self.stop("连接已断开，整定停止", apply_best=False)
+            self.stop("连接已断开", apply_best=False)
+            return
+
+        if self.state == self.READ_BASELINE:
+            if w.commands.busy():
+                if now > self.wall_deadline:
+                    self.on_command_failed("读取超时")
+                return
+            if not all(f"{self.group}.{k}" in w.confirmed for k in KEYS):
+                self.on_command_failed("未返回完整 4 项参数")
+                return
+            baseline = {k: float(w.confirmed[f"{self.group}.{k}"]) for k in KEYS}
+            for k in KEYS:
+                w.drafts[self.group][k] = baseline[k]
+            w.load_fields()
+            ps = self._pending_start
+            self._pending_start = None
+            self._launch_with_baseline(
+                baseline, ps["mode"], ps["style"], ps["strategy"],
+                ps["base"], ps["target"], ps["step_seconds"], ps["max_rounds"], ps["output_limit"],
+            )
             return
 
         if self.state == self.WAIT_START:
@@ -471,16 +702,24 @@ class AutoTuneController:
                     w.follow[0] = self.group
                     w.set_reference(0, "整定目标", self.engine.target)
             self.actual_col, self.output_col = self.detect_channels()
+            self.target_col = self._find_target_col()
             ch_names = w.names()
             actual_desc = ch_names[self.actual_col] if self.actual_col < len(ch_names) else f"CH{self.actual_col+1}"
             out_desc = f"CH{self.output_col+1}({ch_names[self.output_col]})" if self.output_col is not None and self.output_col < len(ch_names) else "无"
-            w.log("整定", f"检测通道：实际反馈=CH{self.actual_col+1}({actual_desc}) · 输出参考={out_desc}")
+            self.step_t0_source = f"目标列 CH{self.target_col+1} 跳变" if self.target_col is not None else "估计起点(ACK)"
+            w.log("整定", f"检测通道：实际反馈=CH{self.actual_col+1}({actual_desc}) · 输出参考={out_desc} · 起点={self.step_t0_source}")
             self.state = self.PREPARE
 
         if self.state == self.PREPARE:
             nxt = self.engine.next_candidate()
             if nxt is None:
-                self._apply_winner(self.engine.finish_reason or "整定完成")
+                if self.engine.best_params is not None and self.engine.best_eval is not None and self.engine.best_eval.valid:
+                    self._apply_winner(self.engine.finish_reason or "整定完成")
+                else:
+                    self._restore_original(
+                        self.engine.finish_reason or "未获得有效整定结果",
+                        send_to_device=w.connected, stop_motor=True, already_stopped=False,
+                    )
                 return
             rnd, cand, tag = nxt
             self.current_cand, self.current_tag = cand, tag
@@ -502,28 +741,37 @@ class AutoTuneController:
             if w.commands.busy():
                 return
             self.phase_t0 = w.latest
-            self.wall_deadline = now + max(4.0, self.engine.step_seconds * 2.5)
+            self.wall_deadline = now + max(4.5, self.engine.step_seconds * 2.5)
             self.state = self.SETTLE_BASE
             return
 
         if self.state == self.SETTLE_BASE:
-            if now > self.wall_deadline:
-                self.stop("等待通道采样超时", apply_best=True)
-                return
             elapsed = w.latest - self.phase_t0
-            settle_cap = min(2.0, max(0.55, self.engine.step_seconds * 0.65))
-            ready = elapsed >= settle_cap
+            settle_cap = min(2.5, max(0.70, self.engine.step_seconds * 0.70))
+            max_settle_wait = min(4.0, max(1.4, self.engine.step_seconds * 1.25))
             a = w.buffer.view()
-            if not ready and elapsed >= 0.18 and len(a) >= 6:
+            near_base = flat = False
+            if elapsed >= 0.18 and len(a) >= 6:
                 recent = a[a[:, 0] >= w.latest - 0.15, self.actual_col + 1]
                 recent = recent[np.isfinite(recent)]
                 amp = abs(self.engine.target - self.engine.base)
                 if len(recent) >= 3:
                     near_base = abs(float(np.mean(recent)) - self.engine.base) <= max(0.06 * amp, 1e-3)
-                    flat = float(np.ptp(recent)) <= max(0.025 * amp, 1e-3)
-                    ready = near_base and flat
+                    flat = float(np.ptp(recent)) <= max(0.03 * amp, 1e-3)
+
+            ready = (near_base and flat) or (elapsed >= settle_cap and flat)
             if not ready:
-                return
+                if elapsed >= max_settle_wait or now > self.wall_deadline:
+                    if self.engine.round == 1:
+                        # Round 1 may start even if sample cadence is coarse; warn if still moving
+                        ready = len(a) > 0
+                    else:
+                        self.engine.record_result([], [], aborted_reason="基准段未平稳，本轮不可比较")
+                        w.log("整定", f"R{self.engine.round:02d} 跳过：上一轮结束后尚未平稳")
+                        self.state = self.PREPARE
+                        return
+                if not ready:
+                    return
 
             if len(a):
                 tail = a[a[:, 0] >= w.latest - 0.12, self.actual_col + 1]
@@ -532,6 +780,7 @@ class AutoTuneController:
             else:
                 self.base_y = self.engine.base
 
+            self.step_pre_t = w.latest
             if not w.commands.submit([self._cmd("RST"), self._cmd("TGT", self.engine.target)], quiet=True):
                 self.stop("下发阶跃目标失败", apply_best=True)
                 return
@@ -542,25 +791,84 @@ class AutoTuneController:
             if w.commands.busy():
                 return
             self.step_t0 = w.latest
+            self.step_t0_resolved = self.target_col is None
+            self.step_t0_source = "目标列待跳变" if self.target_col is not None else "估计起点(ACK)"
+            if self.target_col is not None:
+                a = w.buffer.view()
+                sub = a[a[:, 0] >= self.step_pre_t]
+                if len(sub):
+                    step_amp = self.engine.target - self.engine.base
+                    tgt_vals = sub[:, self.target_col + 1]
+                    hits = np.flatnonzero(
+                        np.isfinite(tgt_vals) & ((tgt_vals - self.engine.base) * np.sign(step_amp) >= 0.4 * abs(step_amp))
+                    )
+                    if len(hits):
+                        self.step_t0 = float(sub[int(hits[0]), 0])
+                        self.step_t0_resolved = True
+                        self.step_t0_source = "目标列跳变起点"
             self.wall_deadline = now + max(5.0, self.engine.step_seconds * 3.0)
             self.state = self.OBSERVE
             return
 
         if self.state == self.OBSERVE:
             if now > self.wall_deadline:
-                self.stop("阶跃采样中断，已采用已测最优参数", apply_best=True)
+                self.stop("阶跃采样中断", apply_best=True)
                 return
+            a = w.buffer.view()
+            if not self.step_t0_resolved and self.target_col is not None and len(a):
+                sub = a[a[:, 0] >= self.step_pre_t]
+                if len(sub):
+                    step_amp = self.engine.target - self.engine.base
+                    tgt_vals = sub[:, self.target_col + 1]
+                    hits = np.flatnonzero(
+                        np.isfinite(tgt_vals) & ((tgt_vals - self.engine.base) * np.sign(step_amp) >= 0.4 * abs(step_amp))
+                    )
+                    if len(hits):
+                        self.step_t0 = float(sub[int(hits[0]), 0])
+                        self.step_t0_resolved = True
+                        self.step_t0_source = "目标列跳变起点"
+
             elapsed = max(0., w.latest - self.step_t0)
             rnd = self.engine.round
             self._set_status(
                 f"第 {rnd}/{self.engine.max_rounds} 轮 · {self.current_tag} · 阶跃评估 {min(elapsed, self.engine.step_seconds):.1f}/{self.engine.step_seconds:.1f} s",
                 self._best_brief(),
             )
+
+            # Mid-round safety guard against sustained motor stall or strong reversed feedback
+            seg_live = a[a[:, 0] >= self.step_t0] if len(a) else a
+            grace_s = min(max(0.45, self.engine.step_seconds * 0.25), 1.5)
+            step_delta = self.engine.target - self.base_y
+            if len(seg_live) >= 8 and abs(step_delta) > 1e-3 and elapsed >= grace_s:
+                t_live = seg_live[:, 0]
+                y_live = seg_live[:, self.actual_col + 1]
+                after_mask = (t_live - self.step_t0) >= grace_s * 0.6
+                fin_mask = after_mask & np.isfinite(y_live)
+                if np.sum(fin_mask) >= 6:
+                    z_pg = (y_live[fin_mask] - self.base_y) / step_delta
+                    if float(np.mean(z_pg)) < -0.20 and self.engine.round <= 2 and self.engine.best_params is None:
+                        self.engine.record_result(t_live, y_live, base_y=self.base_y, outputs=(seg_live[:, self.output_col + 1] if self.output_col is not None else None))
+                        self.stop("检测到反向响应（已停机，请检查反馈方向或参数正负号）", apply_best=False)
+                        return
+                    if self.output_col is not None and elapsed >= grace_s + 0.40:
+                        u_live = seg_live[:, self.output_col + 1]
+                        u_fin = u_live[fin_mask & np.isfinite(u_live)]
+                        if len(u_fin) >= 6:
+                            lim = self.engine.output_limit
+                            if lim is not None and lim > 0:
+                                sat_r = float(np.mean(np.abs(u_fin) >= 0.95 * lim))
+                            else:
+                                u_max = float(np.max(np.abs(u_fin)))
+                                sat_r = float(np.mean(np.abs(u_fin) >= 0.985 * u_max)) if (u_max > 1e-3 and float(np.std(u_fin)) < 0.02 * u_max) else 0.0
+                            if sat_r >= 0.85 and abs(float(np.mean(z_pg))) < 0.04:
+                                self.engine.record_result(t_live, y_live, base_y=self.base_y, outputs=u_live)
+                                self.stop("输出触顶且反馈无响应（已停机，请检查轮子受阻或编码器反馈）", apply_best=False)
+                                return
+
             if elapsed < self.engine.step_seconds:
                 return
 
-            a = w.buffer.view()
-            seg = a[a[:, 0] >= self.step_t0]
+            seg = seg_live
             if len(seg) < 6:
                 if now <= self.wall_deadline - 1.0:
                     return
@@ -580,7 +888,7 @@ class AutoTuneController:
                         apply_best=False,
                     )
                     return
-            prev_best = self.engine.best_eval.score if self.engine.best_eval else float("inf")
+            prev_best = self.engine.best_eval.score if (self.engine.best_eval and self.engine.best_eval.valid) else float("inf")
             ev = self.engine.record_result(times, actual, base_y=self.base_y, outputs=outputs)
 
             cand = self.current_cand
@@ -588,11 +896,20 @@ class AutoTuneController:
             note_txt = f" [{ev.note}]" if ev.note else ""
             w.log(
                 "整定",
-                f"R{rnd:02d} {self.current_tag}  KP={cand['KP']:.4g} KI={cand['KI']:.4g} KD={cand['KD']:.4g} → "
+                f"R{rnd:02d} {self.current_tag} ({self.step_t0_source})  KP={cand['KP']:.4g} KI={cand['KI']:.4g} KD={cand['KD']:.4g} → "
                 f"J={ev.score:.3f}  超调 {ev.overshoot_pct:.1f}%  调节 {settle_txt}{note_txt}",
             )
-            if ev.score < prev_best:
+            if ev.valid and ev.score < prev_best:
                 w.mark(f"最优#{rnd} J={ev.score:.2f}")
+            if ev.stalled or (ev.reversed_sign and self.engine.finished and self.engine.best_params is None):
+                self.stop(self.engine.finish_reason, apply_best=False)
+                return
+            if self.engine.finished:
+                if self.engine.best_params is not None and self.engine.best_eval is not None and self.engine.best_eval.valid:
+                    self._apply_winner(self.engine.finish_reason)
+                else:
+                    self.stop(self.engine.finish_reason, apply_best=False)
+                return
             if ev.saturated and rnd <= 2:
                 w.log("整定", "提示：输出通道接近满幅饱和，若始终达不到目标请适当降低目标值或检查输出限幅")
             self.state = self.PREPARE

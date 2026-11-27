@@ -39,18 +39,23 @@ class StepEvaluation:
     note: str = ""
     sat_ratio: float = 0.0
     sample_count: int = 0
+    valid: bool = True
+    stalled: bool = False
 
 
 def evaluate_step(times, actual, base_y, goal_y, outputs=None, style=1, output_limit=None):
     """Score a step trajectory from base_y to goal_y. Lower score is better."""
     times = np.asarray(times, dtype=float)
     actual = np.asarray(actual, dtype=float)
-    valid = np.isfinite(times) & np.isfinite(actual)
-    times, actual = times[valid], actual[valid]
+    valid_mask = np.isfinite(times) & np.isfinite(actual)
+    times, actual = times[valid_mask], actual[valid_mask]
     amp = goal_y - base_y
     scale = abs(amp)
     if len(times) < 6 or scale < 1e-6 or times[-1] - times[0] < 0.15:
-        return StepEvaluation(1e6, 0., None, None, float("nan"), 0., note="采样不足")
+        return StepEvaluation(
+            1e6, 0., None, None, float("nan"), 0.,
+            note="采样不足", sample_count=int(len(times)), valid=False,
+        )
 
     t = times - times[0]
     duration = float(t[-1])
@@ -131,7 +136,17 @@ def evaluate_step(times, actual, base_y, goal_y, outputs=None, style=1, output_l
     )
     if reversed_sign:
         score += 50.
-    note = "反向响应" if reversed_sign else f"输出饱和({sat_ratio*100:.0f}%)" if saturated else ""
+    tail_z = abs(float(np.mean(z[tail_mask])))
+    no_response = bool((not reversed_sign) and tail_z < 0.03 and float(np.max(np.abs(z))) < 0.05)
+    stalled = bool((saturated or sat_ratio >= 0.50) and not reversed_sign and tail_z < 0.05)
+    is_valid = not reversed_sign and not stalled and not no_response
+    note = (
+        "反向响应" if reversed_sign
+        else "输出触顶且反馈无响应" if stalled
+        else "反馈无明显响应" if no_response
+        else f"输出饱和({sat_ratio*100:.0f}%)" if saturated
+        else ""
+    )
     return StepEvaluation(
         score=float(score),
         overshoot_pct=overshoot * 100.,
@@ -144,20 +159,25 @@ def evaluate_step(times, actual, base_y, goal_y, outputs=None, style=1, output_l
         note=note,
         sat_ratio=sat_ratio,
         sample_count=int(len(times)),
+        valid=is_valid,
+        stalled=stalled,
     )
 
 
-def identify_from_p_step(times, actual, base_y, goal_y, kp_probe, mode=0, style=1):
+def identify_from_p_step(times, actual, base_y, goal_y, kp_probe, mode=0, style=1, base_cmd=None):
     """Estimate gains from a closed-loop P-only step (KI=0, KD=0, KP=kp_probe).
 
-    Returns up to two candidate dicts (nominal, conservative) or [] if data is unsuitable.
+    Uses command delta (goal_y - base_cmd) for closed-loop DC gain estimation so
+    steady-state droop at a non-zero baseline (e.g. r:100->150, y:80->120) yields
+    alpha = 40/50 = 0.8 instead of 40/(150-80) = 0.57.
     """
     times = np.asarray(times, dtype=float)
     actual = np.asarray(actual, dtype=float)
     valid = np.isfinite(times) & np.isfinite(actual)
     times, actual = times[valid], actual[valid]
-    amp = goal_y - base_y
-    if len(times) < 8 or abs(amp) < 1e-6 or abs(kp_probe) < 1e-6:
+    cmd_base = float(base_y if base_cmd is None else base_cmd)
+    cmd_amp = goal_y - cmd_base
+    if len(times) < 8 or abs(cmd_amp) < 1e-6 or abs(kp_probe) < 1e-6:
         return []
     t = times - times[0]
     duration = float(t[-1])
@@ -168,7 +188,7 @@ def identify_from_p_step(times, actual, base_y, goal_y, kp_probe, mode=0, style=
     if not len(tail):
         tail = actual[-3:]
     dy_inf = float(np.mean(tail) - base_y)
-    alpha = dy_inf / amp
+    alpha = dy_inf / cmd_amp
     if alpha <= 0.03:
         return []  # No forward response or wrong sign
     alpha_clamped = min(max(alpha, 0.05), 0.94)
@@ -288,8 +308,8 @@ class AutoTuner:
                 lo = 0.
             elif sign < 0 and lo <= 0 < hi:
                 hi = 0.
-            # In local fine-tuning mode, also constrain total excursion relative to safe baseline.
-            if strategy == 1 and abs(self.initial[k]) >= 1e-3:
+            # In local fine-tuning mode, also constrain total excursion of active keys relative to baseline.
+            if strategy == 1 and k in self.active_keys and abs(self.initial[k]) >= 1e-3:
                 v0 = self.initial[k]
                 env = sorted((v0 * 0.4, v0 * 2.5))
                 lo = max(lo, env[0])
@@ -309,6 +329,7 @@ class AutoTuner:
         self._queue = []
         self._tried = set()
         self._probe_params = None
+        self._probe_boost_used = False
         self._coord_anchor = None
         self._coord_index = 0
         self._coord_dir = 0
@@ -356,23 +377,28 @@ class AutoTuner:
         return False
 
     def _setup_initial_queue(self):
-        start = self._clamp_params(self.initial)
-        has_initial = abs(start["KP"]) > 1e-4 or abs(start["KI"]) > 1e-4
+        # Round 1 baseline preserves all original confirmed device gains verbatim
+        # (only bounded by hard safety rules) rather than truncating inactive gains.
+        raw_base = {
+            k: round(min(self.bounds[k][1], max(self.bounds[k][0], float(self.initial[k]))), 4)
+            for k in ("KP", "KI", "KD")
+        }
+        has_initial = abs(raw_base["KP"]) > 1e-4 or abs(raw_base["KI"]) > 1e-4
         if self.strategy == 1:
             if not has_initial:
                 raise ValueError("局部微调模式要求先设定可基本稳定运行的非零初始 KP/KI 参数")
-            self._enqueue(start, "当前基准")
+            self._queue.append((raw_base, "当前基准"))
             return
 
         # Strategy 0: evaluate initial gains first (if non-zero) so we never regress,
         # then run a clean P-only probe (unless initial was already P-only!).
         if has_initial:
-            self._enqueue(start, "初始基准")
-            is_p_only = abs(start["KI"]) < 1e-6 and abs(start["KD"]) < 1e-6 and abs(start["KP"]) > 1e-4
+            self._queue.append((raw_base, "初始基准"))
+            is_p_only = abs(raw_base["KI"]) < 1e-6 and abs(raw_base["KD"]) < 1e-6 and abs(raw_base["KP"]) > 1e-4
             if is_p_only:
-                self._probe_params = self._signature(start)
+                self._probe_params = self._signature(raw_base)
             else:
-                probe_kp = max(0.5, min(abs(start["KP"]) * 0.65, 5.0)) * self.sign
+                probe_kp = max(0.5, min(abs(raw_base["KP"]) * 0.65, 5.0)) * self.sign
                 probe = self._clamp_params({"KP": probe_kp, "KI": 0., "KD": 0.})
                 if self._enqueue(probe, "阶跃辨识"):
                     self._probe_params = self._signature(probe)
@@ -503,22 +529,33 @@ class AutoTuner:
         """Feed back the step trajectory for the candidate returned by next_candidate()."""
         params, tag = self._current
         if aborted_reason:
-            ev = StepEvaluation(1e6, 0., None, None, float("nan"), 0., note=aborted_reason)
+            ev = StepEvaluation(1e6, 0., None, None, float("nan"), 0., note=aborted_reason, valid=False)
             self.history.append((self.round, dict(params), ev, tag))
             self._step_scale *= 0.5
-            if self.best_params is None:
+            if self.best_params is None and not self._queue:
                 self.finished = True
                 self.finish_reason = aborted_reason
             return ev
 
-        y0 = float(actual[0]) if base_y is None and len(actual) else float(self.base if base_y is None else base_y)
+        actual_arr = np.asarray(actual, dtype=float)
+        fin_a = actual_arr[np.isfinite(actual_arr)]
+        y0 = float(fin_a[0]) if base_y is None and len(fin_a) else float(self.base if base_y is None else base_y)
         ev = evaluate_step(times, actual, y0, self.target, outputs=outputs, style=self.style, output_limit=self.output_limit)
         self.history.append((self.round, dict(params), ev, tag))
 
-        if self.baseline_eval is None and tag in ("初始基准", "当前基准"):
+        if ev.valid and self.baseline_eval is None and tag in ("初始基准", "当前基准"):
             self.baseline_eval = ev
 
+        if ev.stalled:
+            self._probe_params = None
+            self._queue.clear()
+            self.finished = True
+            self.finish_reason = "输出触顶且反馈无响应（已停机，请检查轮子受阻、供电或编码器反馈）"
+            return ev
+
         if ev.reversed_sign and self.round <= 2 and self.best_params is None:
+            self._probe_params = None
+            self._queue.clear()
             self.finished = True
             self.finish_reason = "检测到反向响应，请检查反馈通道或参数正负号"
             return ev
@@ -526,16 +563,34 @@ class AutoTuner:
         # If this was the P-only identification probe, synthesize SIMC / pole-placement candidates!
         if self._probe_params is not None and self._signature(params) == self._probe_params:
             self._probe_params = None
-            identified = identify_from_p_step(times, actual, y0, self.target, params["KP"], self.mode, self.style)
-            if not identified and ev.tail_error * (self.target - y0) > 0:
-                # Response was too tiny (<3%): try a 4x stronger probe once.
-                boosted = self._clamp_params({"KP": params["KP"] * 4.0, "KI": 0., "KD": 0.})
-                if self._enqueue(boosted, "放大辨识"):
-                    self._probe_params = self._signature(boosted)
+            identified = (
+                identify_from_p_step(
+                    times, actual, y0, self.target, params["KP"],
+                    self.mode, self.style, base_cmd=self.base,
+                )
+                if ev.valid
+                else []
+            )
+            if not identified:
+                can_boost = (
+                    (ev.valid or (not ev.stalled and not ev.reversed_sign and ev.sample_count >= 6))
+                    and not self._probe_boost_used
+                    and not ev.saturated
+                    and ev.sat_ratio < 0.30
+                    and ev.tail_error * (self.target - y0) > 0
+                )
+                if can_boost:
+                    self._probe_boost_used = True
+                    boosted = self._clamp_params({"KP": params["KP"] * 3.0, "KI": 0., "KD": 0.})
+                    if self._enqueue(boosted, "放大辨识"):
+                        self._probe_params = self._signature(boosted)
+                elif self.best_params is None and not self._queue:
+                    self.finished = True
+                    self.finish_reason = ev.note or "输出无明显响应，已停止继续放大 KP"
             for idx, cand in enumerate(identified):
                 self._enqueue(cand, "模型整定" if idx == 0 else "稳健候选")
 
-        if self.best_eval is None or ev.score < self.best_eval.score - 1e-6:
+        if ev.valid and (self.best_eval is None or ev.score < self.best_eval.score - 1e-6):
             first_or_better = self.best_eval is not None and ev.score < self.best_eval.score * 0.995
             self.best_eval = ev
             self.best_params = dict(params)
