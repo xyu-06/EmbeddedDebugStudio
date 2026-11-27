@@ -287,20 +287,49 @@ def _c_float(v: float) -> str:
     return s + ("f" if ("." in s or "e" in s or "E" in s) else ".0f")
 
 
-def _safe_uart_handle(raw: str, platform: int) -> str:
+def _resolve_uart_handle(raw: str, platform: int) -> tuple[str, str | None]:
+    """Sanitize and adapt UART handle for target platform, returning (handle, mapping_note)."""
     default = PLATFORM_DEFAULT_HANDLES[platform if platform in (0, 1, 2) else 0]
     cleaned = re.sub(r"[^A-Za-z0-9_]", "", str(raw or "").strip())
     if not cleaned:
-        return default
+        return default, None
+    mapped = cleaned
     if platform == 0 and cleaned.upper().startswith("USART"):
-        return "huart" + cleaned[5:] if len(cleaned) > 5 else default
-    if platform == 1 and cleaned.lower().startswith("huart"):
+        mapped = "huart" + cleaned[5:] if len(cleaned) > 5 else default
+    elif platform == 0 and cleaned.upper() in ("UART4", "UART5"):
+        mapped = "huart" + cleaned[4:]
+    elif platform == 1 and cleaned.lower().startswith("huart"):
         if cleaned.lower() in ("huart4", "huart5"):
-            return "UART" + cleaned[5:]
-        return "USART" + cleaned[5:] if len(cleaned) > 5 else default
-    if platform == 2 and (cleaned.lower().startswith("huart") or cleaned.upper().startswith("USART")):
-        return default
-    return cleaned
+            mapped = "UART" + cleaned[5:]
+        else:
+            mapped = "USART" + cleaned[5:] if len(cleaned) > 5 else default
+    elif platform == 2 and (cleaned.lower().startswith("huart") or cleaned.upper().startswith(("USART", "UART"))):
+        mapped = default
+    note = f"已自动映射：{cleaned} → {mapped}" if mapped != cleaned else None
+    return mapped, note
+
+
+def _safe_uart_handle(raw: str, platform: int) -> str:
+    return _resolve_uart_handle(raw, platform)[0]
+
+
+def _spl_uart_capacity_note(platform: int, uart_handle: str) -> str:
+    up = uart_handle.upper()
+    if platform == 1 and up in ("UART4", "UART5"):
+        return (
+            f"⚠ 芯片容量提示：`{up}` 仅存在于 STM32F103 大容量型号（如 RET6 / ZET6 等 xE/xG 系列），"
+            "STM32F103C8T6 / RBT6 中容量芯片无此外设，烧录后将无输出。"
+        )
+    return ""
+
+
+def _extra_readme_notes(mapping_note: str | None, cap_note: str) -> str:
+    lines = []
+    if mapping_note:
+        lines.append(f"- 串口句柄自适应：**{mapping_note}**")
+    if cap_note:
+        lines.append(f"- {cap_note}")
+    return ("\n" + "\n".join(lines)) if lines else ""
 
 
 def _channel_expr(role: str, idx: int) -> str:
@@ -485,7 +514,9 @@ def _generate_pid_bundle(cfg: dict) -> dict[str, str]:
     platform = int(cfg.get("platform", 0))
     if platform not in (0, 1, 2):
         platform = 0
-    uart_handle = _safe_uart_handle(cfg.get("uart_handle", ""), platform)
+    uart_handle, map_note = _resolve_uart_handle(cfg.get("uart_handle", ""), platform)
+    cap_note = _spl_uart_capacity_note(platform, uart_handle)
+    extra_notes = _extra_readme_notes(map_note, cap_note)
     baudrate = int(cfg.get("baudrate", 115200))
     control_ms = max(1, int(cfg.get("control_ms", 10)))
     report_ms = max(1, int(cfg.get("report_ms", 20)))
@@ -517,7 +548,7 @@ def _generate_pid_bundle(cfg: dict) -> dict[str, str]:
     readme = f"""# EmbeddedDebugStudio · PID 闭环调参接口接入说明
 
 - 目标平台：**{plat_name}**
-- 接口句柄 / 外设：**`{uart_handle}`** · 波特率：**`{baudrate}`**
+- 接口句柄 / 外设：**`{uart_handle}`** · 波特率：**`{baudrate}`**{extra_notes}
 - 通道与参数：共 **{n_ch} 通道** · 主调环路 **`{primary_loop}`** · 控制 **`{control_ms} ms`** · 上报 **`{report_ms} ms`** · PWM 限幅 **`{pwm_limit:g}`**
 - 协议声明：
   - `{names_hdr}`
@@ -1090,6 +1121,7 @@ void App_PidSplDemo(void)
  */
 #include <Arduino.h>
 #include <math.h>
+#include <stdlib.h>
 
 #define PID_SERIAL {uart_handle}
 // 实机接入传感器反馈（编码器转速 / 倾角）后：修改 readSensorFeedback() 并将其改为 1，否则 @RUN 拒绝空反馈运行
@@ -1303,7 +1335,9 @@ def _generate_imu_bundle(cfg: dict) -> dict[str, str]:
     imu_fmt = int(cfg.get("imu_format", 0))
     if imu_fmt not in (0, 1, 2, 3):
         imu_fmt = 0
-    uart_handle = _safe_uart_handle(cfg.get("uart_handle", ""), platform)
+    uart_handle, map_note = _resolve_uart_handle(cfg.get("uart_handle", ""), platform)
+    cap_note = _spl_uart_capacity_note(platform, uart_handle)
+    extra_notes = _extra_readme_notes(map_note, cap_note)
     baudrate = int(cfg.get("baudrate", 115200))
     report_ms = max(5, int(cfg.get("imu_report_ms", 20)))
     emit_banners = bool(cfg.get("imu_emit_banners", True))
@@ -1387,7 +1421,7 @@ def _generate_imu_bundle(cfg: dict) -> dict[str, str]:
     readme = f"""# EmbeddedDebugStudio · IMU / MPU6050 姿态接口接入说明
 
 - 目标平台：**{plat_name}**
-- 接口句柄 / 外设：**`{uart_handle}`** · 波特率：**`{baudrate}`**
+- 接口句柄 / 外设：**`{uart_handle}`** · 波特率：**`{baudrate}`**{extra_notes}
 - 数据格式：**{fmt_label}**
 - 上报周期：**`{report_ms} ms`**（建议 20 ms = 50 Hz） · 状态横幅：`{"开启 (#BALANCE:)" if emit_banners else "关闭"}`
 - 协议声明行：`{names_hdr}`
@@ -1896,7 +1930,9 @@ def _generate_remote_bundle(cfg: dict) -> dict[str, str]:
     platform = int(cfg.get("platform", 0))
     if platform not in (0, 1, 2):
         platform = 0
-    uart_handle = _safe_uart_handle(cfg.get("uart_handle", ""), platform)
+    uart_handle, map_note = _resolve_uart_handle(cfg.get("uart_handle", ""), platform)
+    cap_note = _spl_uart_capacity_note(platform, uart_handle)
+    extra_notes = _extra_readme_notes(map_note, cap_note)
     baudrate = int(cfg.get("baudrate", 9600))
     cmd_fmt = str(cfg.get("remote_cmd_fmt", "J,{x},{y}")).strip() or "J,{x},{y}"
     drive_prefix = _extract_drive_prefix(cmd_fmt)
@@ -1909,7 +1945,7 @@ def _generate_remote_bundle(cfg: dict) -> dict[str, str]:
     readme = f"""# EmbeddedDebugStudio · 小车差速遥控接口 (BlueSerialStudio) 接入说明
 
 - 目标平台：**{plat_name}**
-- 接口句柄 / 外设：**`{uart_handle}`** · 波特率：**`{baudrate}`**
+- 接口句柄 / 外设：**`{uart_handle}`** · 波特率：**`{baudrate}`**{extra_notes}
 - 指令模板：**`{cmd_fmt}`** · 左右轮 PWM 限幅：**`±{pwm_limit}`**
 - 失联保护看门狗：**`{failsafe_ms} ms`**（超时未收到遥控报文自动停车清零 PWM） · 辅助指令（灯/蜂鸣/舵机）：`{"开启" if aux_cmds else "关闭"}`
 
@@ -3165,6 +3201,12 @@ class FirmwareStudioPage(W.QWidget):
             badge_txt = f"IMU 格式: {names_hdr}  ·  {cfg['imu_report_ms']} ms"
         else:
             badge_txt = f"遥控协议: {cfg['remote_cmd_fmt']}  ·  ±{cfg['remote_pwm_limit']}  ·  失联 {cfg['remote_failsafe_ms']} ms"
+        resolved_uart, map_note = _resolve_uart_handle(cfg["uart_handle"], plat)
+        cap_note = _spl_uart_capacity_note(plat, resolved_uart)
+        if map_note:
+            badge_txt += f"  |  {map_note}"
+        if cap_note:
+            badge_txt += f"  |  ⚠ 仅 F103 大容量(xE/xG)具备，C8T6/RB 无 {resolved_uart}"
         self.proto_badge.setText(badge_txt)
         self.proto_badge.setToolTip(badge_txt)
         try:

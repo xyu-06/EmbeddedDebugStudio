@@ -1,4 +1,5 @@
 """Generate and C99-compile all 30 firmware interface configurations (HAL / SPL / Arduino) plus SPL UART1~5 coverage."""
+import argparse
 import os
 from pathlib import Path
 import subprocess
@@ -110,7 +111,25 @@ def compile_c99_dir(src_dir: Path, inc_dir: Path) -> int:
     return len(c_files)
 
 
+def compile_arduino_sketch(ino_name: str, code: str, sketch_root: Path, fqbn: str, build_cache: Path) -> None:
+    stem = Path(ino_name).stem
+    sketch_dir = sketch_root / stem
+    sketch_dir.mkdir(parents=True, exist_ok=True)
+    (sketch_dir / ino_name).write_text(code, encoding="utf-8")
+    build_dir = build_cache / stem
+    build_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["arduino-cli", "compile", "--fqbn", fqbn, "--build-path", str(build_dir), str(sketch_dir)],
+        check=True,
+    )
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Verify generated HAL, SPL, and Arduino firmware bundles.")
+    parser.add_argument("--arduino-cli", action="store_true", help="Compile all generated .ino sketches via arduino-cli")
+    parser.add_argument("--arduino-fqbn", default="esp32:esp32:esp32", help="Target board FQBN for arduino-cli")
+    args = parser.parse_args()
+
     configs: list[tuple[str, dict]] = []
     for plat in (0, 1, 2):
         configs.append((f"pid_p{plat}", {"interface_type": 0, "platform": plat}))
@@ -136,12 +155,15 @@ def main() -> int:
 
     total_c_compiled = 0
     total_ino_checked = 0
+    total_ino_compiled = 0
     with TemporaryDirectory(prefix="eds_gen30_") as tmp:
         tmp_path = Path(tmp)
         hal_inc = tmp_path / "hal_inc"
         spl_inc = tmp_path / "spl_inc"
+        ino_build_cache = tmp_path / "ino_cache"
         hal_inc.mkdir()
         spl_inc.mkdir()
+        ino_build_cache.mkdir()
         (hal_inc / "main.h").write_text(HAL_MAIN_H, encoding="utf-8")
         (spl_inc / "stm32f10x.h").write_text(SPL_STM32_H, encoding="utf-8")
 
@@ -169,6 +191,9 @@ def main() -> int:
                 else:
                     assert "mixWheels" in code
                 total_ino_checked += 1
+                if args.arduino_cli:
+                    compile_arduino_sketch(ino_files[0], code, out_dir / "sketch", args.arduino_fqbn, ino_build_cache)
+                    total_ino_compiled += 1
 
         # Verify all 5 supported SPL UARTs (including UART4 & UART5 pins/RCC/IRQn) compile cleanly
         for uart in SPL_SUPPORTED_USARTS:
@@ -183,7 +208,7 @@ def main() -> int:
     print(
         f"GENERATOR VERIFICATION OK: configs={len(configs)}, "
         f"c99_files={total_c_compiled}, ino_checked={total_ino_checked}, "
-        f"spl_uarts={','.join(SPL_SUPPORTED_USARTS)}"
+        f"ino_compiled={total_ino_compiled}, spl_uarts={','.join(SPL_SUPPORTED_USARTS)}"
     )
     return 0
 

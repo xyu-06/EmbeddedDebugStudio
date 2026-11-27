@@ -44,6 +44,18 @@ jobs:
           }
           python tests/verify_generators.py
 
+      - name: Install Arduino CLI & compile generated ESP32 sketches
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Compile all generated Arduino / ESP32 sketches
+        shell: pwsh
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config set board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+          python tests/verify_generators.py --arduino-cli --arduino-fqbn esp32:esp32:esp32
+
       - name: Run Python GUI & protocol regression suite
         shell: pwsh
         env:

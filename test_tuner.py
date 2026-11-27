@@ -1881,11 +1881,25 @@ class GuiChecks(unittest.TestCase):
         self.assertIn("RCC_APB1Periph_UART4", u4["main_integration_spl.c"])
         self.assertIn("GPIOC", u4["main_integration_spl.c"])
         self.assertIn("UART4_IRQn", u4["main_integration_spl.c"])
+        self.assertIn("STM32F103C8T6", u4["README_接入说明.md"])
+        self.assertIn("xE/xG", u4["README_接入说明.md"])
         u5 = generate_interface_bundle({"interface_type": 1, "platform": 1, "uart_handle": "UART5"})
         self.assertIn("RCC_APB1Periph_UART5", u5["main_imu_spl.c"])
         self.assertIn("GPIO_Pin_12", u5["main_imu_spl.c"])
         self.assertIn("GPIOD", u5["main_imu_spl.c"])
         self.assertIn("UART5_IRQn", u5["main_imu_spl.c"])
+        self.assertIn("STM32F103C8T6", u5["README_接入说明.md"])
+        u2 = generate_interface_bundle({"interface_type": 0, "platform": 1, "uart_handle": "USART2"})
+        self.assertNotIn("STM32F103C8T6", u2["README_接入说明.md"])
+
+        # Explicit UART auto-mapping notice when handle format is adapted across platforms
+        mapped_spl = generate_interface_bundle({"interface_type": 0, "platform": 1, "uart_handle": "huart2"})
+        self.assertIn("USART2_IRQHandler", mapped_spl["main_integration_spl.c"])
+        self.assertIn("已自动映射：huart2 → USART2", mapped_spl["README_接入说明.md"])
+        mapped_hal = generate_interface_bundle({"interface_type": 0, "platform": 0, "uart_handle": "USART2"})
+        self.assertIn("huart2", mapped_hal["main_integration_example.c"])
+        self.assertIn("已自动映射：USART2 → huart2", mapped_hal["README_接入说明.md"])
+
         with self.assertRaises(ValueError):
             generate_interface_bundle({"interface_type": 0, "platform": 1, "uart_handle": "USART6"})
 
@@ -1910,6 +1924,7 @@ class GuiChecks(unittest.TestCase):
 
         # 4) Arduino PID sketch enforces PID_SENSOR_HOOK_READY guard so unmodified 0.0f stub cannot @RUN
         ino = generate_interface_bundle({"interface_type": 0, "platform": 2})["EmbeddedDebugStudio_PID.ino"]
+        self.assertIn("#include <stdlib.h>", ino)
         self.assertIn("#define PID_SENSOR_HOOK_READY 0", ino)
         self.assertIn("readSensorFeedback()", ino)
         self.assertIn("@ERR:implement readSensorFeedback()", ino)
