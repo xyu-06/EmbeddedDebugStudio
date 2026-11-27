@@ -4,7 +4,7 @@ import numpy as np
 from PySide6 import QtCore as C, QtWidgets as W
 
 from autotune import MODE_KEYS, MODES, STYLES, STRATEGIES, AutoTuner
-from engine import KEYS, LIMIT, MAX_CHANNELS
+from engine import KEYS, LIMIT, LOOPS, MAX_CHANNELS
 from layout_ui import combo, number, check
 
 
@@ -34,6 +34,9 @@ class AutoTuneController:
         self.step_t0_resolved = False
         self.last_valid_actual_t = None
         self.last_valid_actual_wall = None
+        self.last_best_ref = None
+        self.last_history = []
+        self.last_history_group = "SPD"
         self._pending_start = None
         self.finalize_mode = ""
         self.finalize_need_stop = False
@@ -87,7 +90,7 @@ class AutoTuneController:
             col = next((i for i, n in enumerate(names) if i != self.actual_col and any(t in n for t in target_tags)), None)
         return col if (col is not None and col < w.count and col != self.actual_col) else None
 
-    def detect_channels(self):
+    def detect_channels(self, sync_ui=True):
         """Return (actual_channel_index, optional_output_channel_index)."""
         w = self.ui
         target_tags = ("target", "目标", "setpoint", "sp", "tgt", "ref")
@@ -114,7 +117,7 @@ class AutoTuneController:
                     else:
                         actual = 0
 
-        if actual is not None and actual != w.actual_ch.currentData():
+        if sync_ui and actual is not None and actual != w.actual_ch.currentData():
             idx = w.actual_ch.findData(actual)
             if idx >= 0:
                 with C.QSignalBlocker(w.actual_ch):
@@ -369,6 +372,9 @@ class AutoTuneController:
         self.actual_col, self.output_col = self.detect_channels()
         self.target_col = self._find_target_col()
         self.saved_before = {k: float(baseline[k]) for k in KEYS}
+        self.last_best_ref = None
+        self.last_history = []
+        self.last_history_group = group
 
         self.state = self.WAIT_START
         self.wall_deadline = monotonic() + 3.0
@@ -534,6 +540,13 @@ class AutoTuneController:
         if self.engine and self.engine.best_params and self.engine.best_eval and self.engine.best_eval.valid:
             p = self.engine.best_params
             ev = self.engine.best_eval
+            self.last_best_ref = {
+                "group": self.group,
+                "KP": float(p["KP"]),
+                "KI": float(p["KI"]),
+                "KD": float(p["KD"]),
+                "score": float(ev.score),
+            }
             best_ref = (
                 f"此前已测最优参考（未自动下发）：KP={p['KP']:.4g}  KI={p['KI']:.4g}  KD={p['KD']:.4g}"
                 f"（J={ev.score:.3f}，超调 {ev.overshoot_pct:.1f}%）"
@@ -546,6 +559,9 @@ class AutoTuneController:
     def sync_ui(self):
         w = self.ui
         running = self.state != self.IDLE
+        if not running and self.engine and self.engine.history:
+            self.last_history = list(self.engine.history)
+            self.last_history_group = self.group
         w.autotune_btn.setText("停止整定（采用最优）" if self.active else "等待设备确认…" if running else "⚡ 自动整定 PID…")
         w.autotune_btn.setObjectName("danger" if running else "accent")
         w.autotune_btn.style().unpolish(w.autotune_btn)
@@ -557,6 +573,128 @@ class AutoTuneController:
         w.gen_btn.setEnabled((w.connected or w.generator is not None) and not running)
         w.undo_btn.setEnabled(bool(w.undo_history) and w.connected and not running)
         w.autotune_status.setVisible(running or bool(w.autotune_status.text()))
+        if hasattr(w, "autotune_draft_btn"):
+            show_draft = (not running) and (self.last_best_ref is not None)
+            w.autotune_draft_btn.setVisible(show_draft)
+            w.autotune_draft_btn.setEnabled(show_draft)
+        if hasattr(w, "autotune_history_btn"):
+            show_hist = (not running) and bool(self.last_history)
+            w.autotune_history_btn.setVisible(show_hist)
+            w.autotune_history_btn.setEnabled(show_hist)
+        if hasattr(w, "update_module_badges"):
+            w.update_module_badges()
+
+    def apply_best_ref_to_draft(self, params=None, group=None):
+        """Copy candidate or preserved best-so-far parameters into UI drafts ONLY (never sends to device)."""
+        ref = params if params is not None else self.last_best_ref
+        if not ref:
+            return False
+        w = self.ui
+        grp = group or ref.get("group") or self.group
+        if grp in LOOPS and w.selected() != grp and w.address.currentIndex() != 1:
+            w.group.setCurrentIndex(LOOPS.index(grp))
+        active_grp = w.selected()
+        for k in ("KP", "KI", "KD"):
+            if k in ref:
+                w.drafts[active_grp][k] = float(ref[k])
+        w.load_fields()
+        w.feedback(f"已将参考参数填入 {active_grp} 草稿（未下发），核对后请点【发送本组】")
+        return True
+
+    def history_rows(self):
+        """Return structured per-round records from the latest Auto-Tune session."""
+        hist = list(self.engine.history) if (self.engine and self.engine.history) else list(self.last_history)
+        if not hist:
+            return []
+        best_idx = None
+        best_score = float("inf")
+        for idx, (_rnd, _p, ev, _tag) in enumerate(hist):
+            if ev.valid and ev.score < best_score:
+                best_score = ev.score
+                best_idx = idx
+        rows = []
+        for idx, (rnd, p, ev, tag) in enumerate(hist):
+            rows.append({
+                "round": int(rnd),
+                "tag": str(tag),
+                "KP": float(p.get("KP", 0.0)),
+                "KI": float(p.get("KI", 0.0)),
+                "KD": float(p.get("KD", 0.0)),
+                "score": float(ev.score),
+                "overshoot_pct": float(ev.overshoot_pct),
+                "settle_s": ev.settle_s,
+                "sat_pct": float(ev.sat_ratio * 100.0),
+                "note": str(ev.note or ("有效" if ev.valid else "无效")),
+                "valid": bool(ev.valid),
+                "is_best": idx == best_idx,
+            })
+        return rows
+
+    def show_history_dialog(self):
+        """Open round-by-round Auto-Tune scores dialog with double-click fill-to-draft."""
+        rows = self.history_rows()
+        if not rows:
+            self.ui.feedback("暂无自动整定打分记录", True)
+            return
+        w = self.ui
+        dlg = W.QDialog(w)
+        dlg.setWindowTitle(f"自动整定各轮打分明细 · {self.last_history_group}")
+        dlg.resize(780, 380)
+        lay = W.QVBoxLayout(dlg)
+        tip = W.QLabel("绿色高亮为本次最佳有效轮次；选中某轮并点击下方按钮（或双击该行）可将其参数回填至右侧草稿（不自动下发）。")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        headers = ["轮次", "阶段", "KP", "KI", "KD", "评分 J", "超调 %", "调节 s", "饱和 %", "说明"]
+        tbl = W.QTableWidget(len(rows), len(headers))
+        tbl.setHorizontalHeaderLabels(headers)
+        tbl.setEditTriggers(W.QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.setSelectionBehavior(W.QAbstractItemView.SelectionBehavior.SelectRows)
+        tbl.setSelectionMode(W.QAbstractItemView.SelectionMode.SingleSelection)
+        tbl.verticalHeader().setVisible(False)
+        for r_i, item in enumerate(rows):
+            vals = [
+                f"R{item['round']:02d}" + (" ★" if item["is_best"] else ""),
+                item["tag"],
+                f"{item['KP']:.4g}",
+                f"{item['KI']:.4g}",
+                f"{item['KD']:.4g}",
+                f"{item['score']:.3f}" if item["valid"] else "无效",
+                f"{item['overshoot_pct']:.1f}",
+                f"{item['settle_s']:.2f}" if item["settle_s"] is not None else "未稳",
+                f"{item['sat_pct']:.0f}",
+                item["note"],
+            ]
+            for c_i, txt in enumerate(vals):
+                cell = W.QTableWidgetItem(txt)
+                if item["is_best"]:
+                    cell.setBackground(QtGui.QColor("#d9f3ea" if not w.dark.isChecked() else "#1c4b3d"))
+                tbl.setItem(r_i, c_i, cell)
+        tbl.resizeColumnsToContents()
+        tbl.horizontalHeader().setStretchLastSection(True)
+        best_row = next((i for i, r in enumerate(rows) if r["is_best"]), 0)
+        tbl.selectRow(best_row)
+        lay.addWidget(tbl, 1)
+
+        btn_row = W.QHBoxLayout()
+        fill_btn = W.QPushButton("填入选中轮次到草稿（不下发）")
+        fill_btn.setObjectName("primary")
+        close_btn = W.QPushButton("关闭")
+        btn_row.addStretch()
+        btn_row.addWidget(fill_btn)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+
+        def _fill_selected():
+            cur = tbl.currentRow()
+            if 0 <= cur < len(rows):
+                self.apply_best_ref_to_draft(rows[cur], group=self.last_history_group)
+                dlg.accept()
+
+        fill_btn.clicked.connect(_fill_selected)
+        tbl.itemDoubleClicked.connect(lambda _: _fill_selected())
+        close_btn.clicked.connect(dlg.reject)
+        dlg.exec()
 
     def _set_status(self, line1, line2=""):
         text = line1 if not line2 else f"{line1}\n{line2}"
@@ -669,6 +807,10 @@ class AutoTuneController:
         time_src = "内置仿真步长" if w.sim else w.time_mode.currentText()
         summary = f"{self.engine.summary_text()} · 反馈 {actual_desc} · 时间 {time_src}"
         winner_full = {"KP": best["KP"], "KI": best["KI"], "KD": best["KD"], "TGT": final_tgt}
+        self.last_best_ref = None
+        if self.engine and self.engine.history:
+            self.last_history = list(self.engine.history)
+            self.last_history_group = self.group
         self._begin_finalize("winner", winner_full, reason, stop_motor=False, already_stopped=True, summary=summary)
 
     def _check_missing_feedback(self, rows, phase_start, now):
@@ -967,6 +1109,8 @@ class AutoTuneController:
                     return
             prev_best = self.engine.best_eval.score if (self.engine.best_eval and self.engine.best_eval.valid) else float("inf")
             ev = self.engine.record_result(times, actual, base_y=self.base_y, outputs=outputs)
+            self.last_history = list(self.engine.history)
+            self.last_history_group = self.group
 
             cand = self.current_cand
             settle_txt = f"{ev.settle_s:.2f} s" if ev.settle_s is not None else "未稳"

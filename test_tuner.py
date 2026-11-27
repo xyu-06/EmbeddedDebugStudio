@@ -2340,6 +2340,108 @@ class GuiChecks(unittest.TestCase):
             self.assertIn("反馈通道", w_pre.autotune_status.text())
             w_pre.close()
 
+    def test_v19_close_safety_ui_ergonomics_and_history(self):
+        from threading import Event
+        with TemporaryDirectory() as tmp:
+            # 1) Window.closeEvent() flushes @STOP + autotune restore params on close
+            w = Window(Path(tmp) / "close_safety.ini")
+            w.timer.stop()
+            w.serial_page.poll_timer.stop()
+            w.imu_page.timer.stop()
+            w.remote_page.timer.stop()
+            w.group.setCurrentIndex(1)  # SPD
+            w.fields["KP"].setValue(6.0)
+            w.fields["KI"].setValue(18.0)
+            w.fields["KD"].setValue(0.0)
+            w.fields["TGT"].setValue(15.0)
+
+            class DummyCloseLink:
+                def __init__(self):
+                    self.closed = Event()
+                    self.flushed = []
+                def flush_and_close(self, data=b"", timeout=0.25):
+                    self.flushed.append(bytes(data))
+                    self.closed.set()
+                def join(self, timeout=None):
+                    return None
+                def take(self):
+                    return [], 0
+                def keepalive(self, enabled):
+                    return None
+                def send(self, data, urgent=False):
+                    return True
+
+            dlink = DummyCloseLink()
+            w.link = dlink
+            w.connected = True
+            w.autotuner.state = w.autotuner.FINALIZING
+            w.autotuner.group = "SPD"
+            w.autotuner.saved_before = {"KP": 6.0, "KI": 18.0, "KD": 0.0, "TGT": 15.0}
+
+            # Verify detect_channels(sync_ui=False) does NOT clobber manual actual_ch
+            w.count = 3
+            w.channel_roles = ["target", "actual", "output", ""] + [""] * 4
+            w.channel_preferences[1] = 2  # user deliberately chose CH3
+            w.refresh_channels()
+            self.assertEqual(w.actual_ch.currentData(), 2)
+            det_act, _ = w.autotuner.detect_channels(sync_ui=False)
+            self.assertEqual(det_act, 2)
+            self.assertEqual(w.actual_ch.currentData(), 2)
+
+            # Verify remote_page.shutdown() flushes J,0,0 and S when connected
+            rlink = DummyCloseLink()
+            w.remote_page.link = rlink
+            w.remote_page.connected = True
+
+            # Verify firmware_studio copy feedback & dark theme guide CSS
+            fw = w.firmware_page
+            fw.copy_current_file()
+            self.assertEqual(fw.copy_file_btn.text(), "✓ 已复制")
+            fw.apply_theme(True)
+            self.assertIn("#1e262f", fw.guide_view.toHtml())
+
+            # Verify autotuner.apply_best_ref_to_draft() fills draft without emitting commands + history_rows()
+            from autotune import StepEvaluation
+            sent_draft = []
+            w.commands.submit = lambda cmds, quiet=False: (sent_draft.extend(cmds) or True)
+            w.autotuner.last_best_ref = {"group": "SPD", "KP": 3.45, "KI": 11.2, "KD": 0.0, "score": 0.14}
+            w.autotuner.last_history_group = "SPD"
+            w.autotuner.last_history = [
+                (1, {"KP": 2.0, "KI": 5.0, "KD": 0.0}, StepEvaluation(0.45, 2.0, 0.2, 0.8, 0.01, 0.02, sample_count=20), "当前基准"),
+                (2, {"KP": 3.45, "KI": 11.2, "KD": 0.0}, StepEvaluation(0.14, 1.0, 0.12, 0.45, 0.005, 0.01, sample_count=20), "精调最优"),
+            ]
+            w.autotuner.state = w.autotuner.IDLE
+            w.autotuner.sync_ui()
+            self.assertFalse(w.autotune_draft_btn.isHidden())
+            self.assertFalse(w.autotune_history_btn.isHidden())
+            self.assertIsNotNone(w.pid_panel.findChild(W.QScrollArea))
+            self.assertTrue(w.autotuner.apply_best_ref_to_draft())
+            self.assertAlmostEqual(w.fields["KP"].value(), 3.45, places=2)
+            self.assertAlmostEqual(w.fields["KI"].value(), 11.2, places=1)
+            self.assertEqual(sent_draft, [])
+            hrows = w.autotuner.history_rows()
+            self.assertEqual(len(hrows), 2)
+            self.assertFalse(hrows[0]["is_best"])
+            self.assertTrue(hrows[1]["is_best"])
+
+            # Verify imu_page.sync_zero_to_pid(switch_to_pid=True) updates ANG.TGT and switches to tab 0
+            w.switch_module(2)
+            w.imu_page.target_pitch = -1.75
+            w.imu_page.sync_zero_to_pid(switch_to_pid=True)
+            self.assertEqual(w.module_stack.currentIndex(), 0)
+            self.assertEqual(w.selected(), "ANG")
+            self.assertAlmostEqual(w.fields["TGT"].value(), -1.75, places=2)
+
+            # Now close window and verify both PID and Remote links received flush stop payloads
+            w.autotuner.state = w.autotuner.FINALIZING
+            w.autotuner.saved_before = {"KP": 6.0, "KI": 18.0, "KD": 0.0, "TGT": 15.0}
+            w.close()
+            self.assertTrue(dlink.flushed)
+            self.assertIn(b"@STOP\n", dlink.flushed[0])
+            self.assertIn(b"6.0000", dlink.flushed[0])
+            self.assertTrue(rlink.flushed)
+            self.assertIn(b"J,0,0\nS\n", rlink.flushed[0])
+
 
 if __name__ == "__main__":
     unittest.main()

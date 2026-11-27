@@ -517,9 +517,17 @@ class ImuStudioPage(W.QWidget):
         self.zero_result.setWordWrap(True)
         self.zero_result.setStyleSheet("color:#52687b;font-size:9pt;")
         f3.addWidget(self.zero_result)
-        self.sync_pid_btn = self._btn("将中值角同步至 PID 页 ANG.TGT", self.sync_zero_to_pid)
+        self.sync_pid_btn = self._btn("同步至 PID 页 ANG.TGT", lambda: self.sync_zero_to_pid(False))
         self.sync_pid_btn.setEnabled(False)
-        f3.addWidget(self.sync_pid_btn)
+        self.sync_jump_btn = self._btn("同步并去 PID 页", lambda: self.sync_zero_to_pid(True), "primary")
+        self.sync_jump_btn.setToolTip("将标定出的机械中值角写入 ANG.TGT 草稿、复制 C 宏并自动切换至【📈 PID 调参】工作台")
+        self.sync_jump_btn.setEnabled(False)
+        sync_row = W.QHBoxLayout()
+        sync_row.setContentsMargins(0, 0, 0, 0)
+        sync_row.setSpacing(6)
+        sync_row.addWidget(self.sync_pid_btn, 1)
+        sync_row.addWidget(self.sync_jump_btn, 1)
+        f3.addLayout(sync_row)
         lv.addWidget(c3)
         lv.addStretch()
         hsplit.addWidget(left)
@@ -664,16 +672,23 @@ class ImuStudioPage(W.QWidget):
         self.zero_gyro_samples = []
         self._capturing_zero = True
         self.sync_pid_btn.setEnabled(False)
+        self.sync_jump_btn.setEnabled(False)
         self.zero_result.setText("正在采集 50 帧静止俯仰角均值，请扶稳车身保持平衡不动…")
 
-    def sync_zero_to_pid(self):
+    def sync_zero_to_pid(self, switch_to_pid: bool = False):
         if self.host is not None and hasattr(self.host, "drafts"):
             val = round(self.target_pitch, 4)
             self.host.drafts["ANG"]["TGT"] = val
+            if switch_to_pid and hasattr(self.host, "group") and self.host.address.currentIndex() != 1:
+                self.host.group.setCurrentIndex(0)
             if self.host.selected() == "ANG":
                 self.host.load_fields()
             W.QApplication.clipboard().setText(f"#define BALANCE_TARGET_PITCH_DEG  {val:.4f}f\n")
             self.zero_result.setText(f"✓ 已将机械中值角 {val:+.3f}° 同步至 PID 页 ANG.TGT 并复制 C 宏定义！")
+            if switch_to_pid and hasattr(self.host, "switch_module"):
+                self.host.switch_module(0)
+                if hasattr(self.host, "feedback"):
+                    self.host.feedback(f"已从 IMU 同步机械中值角至 ANG.TGT={val:+.3f}°（未下发，核对后可点【发送本组】）")
 
     def copy_imu_c_snippet(self):
         snippet = (
@@ -902,12 +917,14 @@ class ImuStudioPage(W.QWidget):
                 max_gyro = max(self.zero_gyro_samples) if self.zero_gyro_samples else 0.0
                 if std_p > 0.35 or ptp_p > 1.5 or ("gyro_pitch" in self.reported_fields and max_gyro > 5.0):
                     self.sync_pid_btn.setEnabled(False)
+                    self.sync_jump_btn.setEnabled(False)
                     self.zero_result.setText(
                         f"⚠ 标定波动过大，请扶稳静止后重试（σ={std_p:.3f}°，峰峰值={ptp_p:.2f}°，最大角速度={max_gyro:.1f}°/s）"
                     )
                 else:
                     self.target_pitch = mean_p
                     self.sync_pid_btn.setEnabled(True)
+                    self.sync_jump_btn.setEnabled(True)
                     self.zero_result.setText(
                         f"标定完成：机械中值角 = {mean_p:+.3f}°（静止波动 σ={std_p:.3f}°，峰峰值={ptp_p:.2f}°）"
                     )

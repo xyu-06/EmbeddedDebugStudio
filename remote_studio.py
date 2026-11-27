@@ -374,6 +374,13 @@ class RemoteBtPage(W.QWidget):
             f"QTableWidget {{background:{bg};color:{fg};border:1px solid {bd};gridline-color:{bd};}}"
             f"QHeaderView::section {{background:{hdr_bg};color:{fg};padding:4px 6px;border:none;border-bottom:1px solid {bd};}}"
         )
+        prev_color = "#6ed4b4" if dark else "#1c5f4e"
+        for prev in (self.at_name_prev, self.at_uart_prev, self.at_pin_prev, self.at_role_prev):
+            prev.setStyleSheet(f"font:9.5pt 'Consolas';color:{prev_color};")
+        mix_bg = "#202b36" if dark else "#eef3f7"
+        self.mix_label.setStyleSheet(
+            f"font:10pt 'Consolas','Microsoft YaHei UI';padding:4px 6px;border-radius:4px;background:{mix_bg};color:{fg};"
+        )
 
     def save_state(self, settings: C.QSettings):
         st = {
@@ -431,10 +438,15 @@ class RemoteBtPage(W.QWidget):
 
     def shutdown(self):
         self.timer.stop()
-        self.stop_all_motion(send_stop=False)
+        if self.connected and self.link and hasattr(self.link, "flush_and_close"):
+            self.disconnect_port()
+        else:
+            self.stop_all_motion(send_stop=False)
+            if self.link and hasattr(self.link, "closed"):
+                self.link.closed.set()
         if self.link:
-            self.link.closed.set()
-            self.link.join(0.6)
+            if hasattr(self.link, "join"):
+                self.link.join(0.6)
             self.link = None
 
     # ---------- UI construction ----------

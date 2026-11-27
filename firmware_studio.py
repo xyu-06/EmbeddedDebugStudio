@@ -139,6 +139,18 @@ code { font-family: Consolas, "Cascadia Mono", monospace; background: rgba(120,1
 .warn { padding: 8px 10px; border-left: 4px solid #d47b12; background: rgba(212,123,18,0.10); margin: 8px 0; }
 </style>"""
 
+_GUIDE_STYLE_DARK = """<style>
+body { font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; font-size: 10pt; line-height: 1.58; color: #e4eaf1; background: #1e262f; }
+h2 { color: #6ed4b4; margin-top: 14px; margin-bottom: 6px; font-size: 12pt; }
+h3 { color: #7cb7ff; margin-top: 10px; margin-bottom: 4px; font-size: 10.5pt; }
+table { border-collapse: collapse; width: 100%; margin: 6px 0 12px 0; }
+th, td { border: 1px solid #4a5c70; padding: 5px 8px; text-align: left; }
+th { background: rgba(124, 183, 255, 0.16); font-weight: 600; color: #f0f5fa; }
+code { font-family: Consolas, "Cascadia Mono", monospace; background: rgba(255,255,255,0.11); color: #eef4fa; padding: 1px 4px; border-radius: 3px; }
+.tip { padding: 8px 10px; border-left: 4px solid #6ed4b4; background: rgba(110,212,180,0.13); margin: 8px 0; }
+.warn { padding: 8px 10px; border-left: 4px solid #f0ad4e; background: rgba(240,173,78,0.14); margin: 8px 0; }
+</style>"""
+
 _OVERVIEW_MATRIX_HTML = """
 <h2>五、全软件三大串口接口速查总览</h2>
 <table>
@@ -150,7 +162,7 @@ _OVERVIEW_MATRIX_HTML = """
 """
 
 
-def build_interface_guide_html(interface_type: int = 0, platform: int = 0) -> str:
+def build_interface_guide_html(interface_type: int = 0, platform: int = 0, dark: bool = False) -> str:
     """Return dynamic usage, wiring, protocol, and troubleshooting HTML for any (interface, platform)."""
     iface = interface_type if interface_type in (0, 1, 2) else 0
     plat = platform if platform in (0, 1, 2) else 0
@@ -251,7 +263,8 @@ def build_interface_guide_html(interface_type: int = 0, platform: int = 0) -> st
   <li>电脑连接蓝牙串口后点击<b>【打开串口】</b>，拖动 360° 单摇杆、双摇杆或按住 <code>W/A/S/D</code> 即可遥控；按 <code>Space</code> 或全局 <code>Esc</code> 立即停车。</li>
 </ol>"""
 
-    return f"<html><head><meta charset='utf-8'>{_GUIDE_STYLE}</head><body>{iface_section}{_OVERVIEW_MATRIX_HTML}</body></html>"
+    style_block = _GUIDE_STYLE_DARK if dark else _GUIDE_STYLE
+    return f"<html><head><meta charset='utf-8'>{style_block}</head><body>{iface_section}{_OVERVIEW_MATRIX_HTML}</body></html>"
 
 
 PROTOCOL_GUIDE_HTML = build_interface_guide_html(0, 0)
@@ -2599,6 +2612,10 @@ class FirmwareStudioPage(W.QWidget):
         self._selected_row = 0
         self._iface_type = 0
         self._last_platform = 0
+        self._dark = False
+        self._copy_reset_timer = C.QTimer(self)
+        self._copy_reset_timer.setSingleShot(True)
+        self._copy_reset_timer.timeout.connect(self._reset_copy_btn)
         self._build_ui()
         self.apply_preset(0)
         self.set_interface_type(0)
@@ -3219,7 +3236,7 @@ class FirmwareStudioPage(W.QWidget):
                     f"STM32 标准库 SPL (stm32f10x.h) 支持外设：{', '.join(SPL_SUPPORTED_USARTS)}。\n"
                 )
             }
-        self.guide_view.setHtml(build_interface_guide_html(iface, plat))
+        self.guide_view.setHtml(build_interface_guide_html(iface, plat, dark=self._dark))
 
         prev_file = self.file_combo.currentText()
         with C.QSignalBlocker(self.file_combo):
@@ -3233,12 +3250,17 @@ class FirmwareStudioPage(W.QWidget):
         name = self.file_combo.currentText()
         self.code_edit.setPlainText(self._bundle.get(name, ""))
 
+    def _reset_copy_btn(self):
+        self.copy_file_btn.setText("📋 复制当前文件")
+
     def copy_current_file(self):
         text = self.code_edit.toPlainText()
         if not text:
             return
         W.QApplication.clipboard().setText(text)
         fname = self.file_combo.currentText()
+        self.copy_file_btn.setText("✓ 已复制")
+        self._copy_reset_timer.start(1800)
         if self.host is not None and hasattr(self.host, "feedback"):
             self.host.feedback(f"已复制接口文件 {fname} 到剪贴板")
 
@@ -3281,12 +3303,18 @@ class FirmwareStudioPage(W.QWidget):
         return None
 
     def apply_theme(self, dark: bool):
+        self._dark = bool(dark)
         if dark:
             self.code_edit.setStyleSheet("background:#182028;color:#dbe7f3;border:1px solid #445566;")
             self.guide_view.setStyleSheet("background:#1e262f;color:#e4eaf1;border:1px solid #445566;")
+            self.proto_badge.setStyleSheet("font-weight:600;color:#6ed4b4;")
         else:
             self.code_edit.setStyleSheet("")
             self.guide_view.setStyleSheet("")
+            self.proto_badge.setStyleSheet("font-weight:600;color:#176a57;")
+        self.guide_view.setHtml(
+            build_interface_guide_html(self._iface_type, self.platform_box.currentIndex(), dark=self._dark)
+        )
 
     def save_state(self, settings: C.QSettings):
         settings.setValue("firmware_studio/config", json.dumps(self.config_dict(), ensure_ascii=False))

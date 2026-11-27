@@ -240,11 +240,22 @@ class Window(W.QMainWindow):
                 if self.confirm_handoff is not None:
                     ok = bool(self.confirm_handoff(title, req_title, port_name))
                 else:
+                    risk_notes = []
+                    mod_at = getattr(mod, "autotuner", None)
+                    if mod_at is not None and mod_at.state != mod_at.IDLE:
+                        risk_notes.append("PID 自动整定")
+                    if getattr(mod, "writer", None):
+                        risk_notes.append("CSV 录制")
+                    risk_line = (
+                        f"\n\n⚠ 警告：【{title}】当前正在进行{' 与 '.join(risk_notes)}，切换串口将立即中止并发送停机指令！"
+                        if risk_notes
+                        else ""
+                    )
                     ans = W.QMessageBox.question(
                         self,
                         "串口占用切换确认",
                         f"串口 {port_name} 当前正被【{title}】占用。\n\n"
-                        f"是否自动断开【{title}】的连接，并将该串口切换给【{req_title}】使用？",
+                        f"是否自动断开【{title}】的连接，并将该串口切换给【{req_title}】使用？{risk_line}",
                         W.QMessageBox.StandardButton.Yes | W.QMessageBox.StandardButton.No,
                         W.QMessageBox.StandardButton.Yes,
                     )
@@ -266,10 +277,19 @@ class Window(W.QMainWindow):
             busy = bool(port or sim_on or getattr(mod, "connected", False) or getattr(mod, "link", None) is not None)
             tab.setText(f"{title} ●" if busy else title)
             clean_name = title.split(" ", 1)[-1]
+            extras = []
+            mod_at = getattr(mod, "autotuner", None)
+            if mod_at is not None and mod_at.state != mod_at.IDLE:
+                extras.append("⚡整定中")
+            if getattr(mod, "writer", None):
+                extras.append("⏺录制中")
+            suffix = f" ({', '.join(extras)})" if extras else ""
             if port:
-                active_notes.append(f"{clean_name}: {port}")
+                active_notes.append(f"{clean_name}: {port}{suffix}")
             elif sim_on:
-                active_notes.append(f"{clean_name}: 仿真")
+                active_notes.append(f"{clean_name}: 仿真{suffix}")
+            elif extras:
+                active_notes.append(f"{clean_name}{suffix}")
         if active_notes:
             self.global_ports_label.setText("活动连接：" + "  |  ".join(active_notes) + "  ·  Ctrl+1~5 切换模块")
         else:
@@ -690,7 +710,7 @@ class Window(W.QMainWindow):
         final_cmds = []
         if self.connected and self.link:
             final_cmds.append("@STOP")
-            if self.autotuner.active and self.autotuner.saved_before:
+            if self.autotuner.state != self.autotuner.IDLE and self.autotuner.saved_before:
                 p = self.autotuner.saved_before
                 final_cmds.extend(self.autotuner._build_param_cmds(p["KP"],p["KI"],p["KD"],p["TGT"],reset=True))
         if self.sim and self.connected:
@@ -1129,7 +1149,7 @@ class Window(W.QMainWindow):
             self.last_metrics = now
             self.analyze()
             if self.connected and not self.autotuner.active:
-                act_col, out_col = self.autotuner.detect_channels()
+                act_col, out_col = self.autotuner.detect_channels(sync_ui=False)
                 running_now = bool(self.sim.running) if self.sim else self.send_heartbeat
                 alert = self.monitor.check(now, self.buffer.view(), act_col, out_col, running_now)
                 if alert and hasattr(self, "workbench"):
@@ -1819,6 +1839,7 @@ class Window(W.QMainWindow):
             field.setEnabled(False)
         self.address.setEnabled(not self.sim)
         self.address_ui()
+        self.update_module_badges()
         self.log("系统","录制至 " + path)
 
     def end_record(self):
@@ -1834,6 +1855,7 @@ class Window(W.QMainWindow):
                 field.setEnabled(True)
             self.address.setEnabled(True)
             self.address_ui()
+            self.update_module_badges()
             self.log("系统","录制结束")
 
     def presets(self):
@@ -1866,10 +1888,14 @@ class Window(W.QMainWindow):
     def closeEvent(self,event):
         W.QApplication.instance().removeEventFilter(self.workbench)
         self.timer.stop()
+        if self.connected or (self.link and hasattr(self.link, "flush_and_close")):
+            self.disconnect()
         self.end_record()
         if self.link:
-            self.link.closed.set()
-            self.link.join(.6)
+            if hasattr(self.link, "closed"):
+                self.link.closed.set()
+            if hasattr(self.link, "join"):
+                self.link.join(.6)
         self.persist()
         for mod in getattr(self, "extra_modules", ()):
             mod.shutdown()
