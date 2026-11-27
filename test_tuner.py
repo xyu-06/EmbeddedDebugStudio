@@ -2400,29 +2400,58 @@ class GuiChecks(unittest.TestCase):
             fw.apply_theme(True)
             self.assertIn("#1e262f", fw.guide_view.toHtml())
 
-            # Verify autotuner.apply_best_ref_to_draft() fills draft without emitting commands + history_rows()
+            # Verify autotuner.apply_best_ref_to_draft() refuses cross-group overwrite in single-loop mode,
+            # fills exact source group in grouped mode without emitting commands, & show_history_dialog() renders cleanly
             from autotune import StepEvaluation
             sent_draft = []
             w.commands.submit = lambda cmds, quiet=False: (sent_draft.extend(cmds) or True)
-            w.autotuner.last_best_ref = {"group": "SPD", "KP": 3.45, "KI": 11.2, "KD": 0.0, "score": 0.14}
+            w.drafts["ANG"]["KP"] = 2.0
+            w.drafts["SPD"]["KP"] = 4.0
+            w.load_fields()
+            w.autotuner.last_best_ref = {"group": "SPD", "KP": 7.77, "KI": 11.2, "KD": 0.0, "score": 0.14}
             w.autotuner.last_history_group = "SPD"
             w.autotuner.last_history = [
                 (1, {"KP": 2.0, "KI": 5.0, "KD": 0.0}, StepEvaluation(0.45, 2.0, 0.2, 0.8, 0.01, 0.02, sample_count=20), "当前基准"),
-                (2, {"KP": 3.45, "KI": 11.2, "KD": 0.0}, StepEvaluation(0.14, 1.0, 0.12, 0.45, 0.005, 0.01, sample_count=20), "精调最优"),
+                (2, {"KP": 7.77, "KI": 11.2, "KD": 0.0}, StepEvaluation(0.14, 1.0, 0.12, 0.45, 0.005, 0.01, sample_count=20), "精调最优"),
             ]
             w.autotuner.state = w.autotuner.IDLE
             w.autotuner.sync_ui()
             self.assertFalse(w.autotune_draft_btn.isHidden())
             self.assertFalse(w.autotune_history_btn.isHidden())
             self.assertIsNotNone(w.pid_panel.findChild(W.QScrollArea))
+
+            # Single-loop @KP locks group to ANG: must refuse filling SPD ref into ANG and preserve both drafts!
+            w.address.setCurrentIndex(1)
+            self.assertEqual(w.selected(), "ANG")
+            self.assertFalse(w.autotuner.apply_best_ref_to_draft())
+            self.assertAlmostEqual(w.drafts["ANG"]["KP"], 2.0, places=3)
+            self.assertAlmostEqual(w.drafts["SPD"]["KP"], 4.0, places=3)
+            self.assertIn("分组命令", w.ack.text())
+            self.assertIn("SPD", w.ack.text())
+
+            # Grouped mode: switches to SPD and fills SPD.KP=7.77 cleanly without touching ANG
+            w.address.setCurrentIndex(0)
             self.assertTrue(w.autotuner.apply_best_ref_to_draft())
-            self.assertAlmostEqual(w.fields["KP"].value(), 3.45, places=2)
+            self.assertEqual(w.selected(), "SPD")
+            self.assertAlmostEqual(w.drafts["SPD"]["KP"], 7.77, places=2)
+            self.assertAlmostEqual(w.drafts["ANG"]["KP"], 2.0, places=3)
+            self.assertAlmostEqual(w.fields["KP"].value(), 7.77, places=2)
             self.assertAlmostEqual(w.fields["KI"].value(), 11.2, places=1)
             self.assertEqual(sent_draft, [])
+
             hrows = w.autotuner.history_rows()
             self.assertEqual(len(hrows), 2)
             self.assertFalse(hrows[0]["is_best"])
             self.assertTrue(hrows[1]["is_best"])
+
+            # Actually construct & open round-by-round history dialog in both light and dark modes (regression for QtGui NameError)
+            with patch.object(W.QDialog, "exec", return_value=0) as mock_hist_exec:
+                w.dark.setChecked(False)
+                w.autotuner.show_history_dialog()
+                w.dark.setChecked(True)
+                w.autotuner.show_history_dialog()
+                self.assertEqual(mock_hist_exec.call_count, 2)
+                w.dark.setChecked(False)
 
             # Verify imu_page.sync_zero_to_pid(switch_to_pid=True) updates ANG.TGT and switches to tab 0
             w.switch_module(2)

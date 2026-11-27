@@ -1,7 +1,7 @@
 """Qt dialog and real-time closed-loop execution controller for PID Auto-Tune."""
 from time import monotonic
 import numpy as np
-from PySide6 import QtCore as C, QtWidgets as W
+from PySide6 import QtCore as C, QtGui, QtWidgets as W
 
 from autotune import MODE_KEYS, MODES, STYLES, STRATEGIES, AutoTuner
 from engine import KEYS, LIMIT, LOOPS, MAX_CHANNELS
@@ -591,14 +591,21 @@ class AutoTuneController:
             return False
         w = self.ui
         grp = group or ref.get("group") or self.group
-        if grp in LOOPS and w.selected() != grp and w.address.currentIndex() != 1:
+        if grp not in LOOPS:
+            return False
+        if w.selected() != grp:
+            if w.address.currentIndex() == 1:
+                w.feedback(f"该参考参数属于 {grp}，请先将【寻址方式】切回“分组命令”后再填入草稿", True)
+                return False
             w.group.setCurrentIndex(LOOPS.index(grp))
-        active_grp = w.selected()
+        if w.selected() != grp:
+            w.feedback(f"当前无法切换至参数组 {grp}，已取消填入草稿", True)
+            return False
         for k in ("KP", "KI", "KD"):
             if k in ref:
-                w.drafts[active_grp][k] = float(ref[k])
+                w.drafts[grp][k] = float(ref[k])
         w.load_fields()
-        w.feedback(f"已将参考参数填入 {active_grp} 草稿（未下发），核对后请点【发送本组】")
+        w.feedback(f"已将参考参数填入 {grp} 草稿（未下发），核对后请点【发送本组】")
         return True
 
     def history_rows(self):
