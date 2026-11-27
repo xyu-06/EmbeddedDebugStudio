@@ -1519,9 +1519,11 @@ class Window(W.QMainWindow):
         rec_txt = f"{dm['recovery_s']:.2f} s" if dm["recovery_s"] is not None else "未恢复"
         sat_txt = f"{dm['sat_time_s']:.2f} s" if dm["sat_time_s"] is not None else "—"
         pre_txt = f"{dm['pre_pwm']:.0f}" if dm["pre_pwm"] is not None else "—"
+        peak_txt = f"{dm['t_peak']:.2f}s" if dm.get("t_peak") is not None else "无"
+        mode_desc = "游标指定" if (dm.get("t_load") is not None or dm.get("t_unload") is not None) else "自动检测(可放A/B游标指定)"
         lines = [
-            f"最大掉速 {dm['max_drop']:.2f}　卸载冲高 {dm['unload_overshoot']:.2f}",
-            f"恢复时间 {rec_txt}　PWM 饱和 {sat_txt}",
+            f"最大掉速 {dm['max_drop']:.2f}　卸载冲高 {dm['unload_overshoot']:.2f} (峰值@{peak_txt})",
+            f"恢复时间 {rec_txt}　PWM 饱和 {sat_txt} [{mode_desc}]",
             f"当前参数 ({pid_tag}) · 触发前 PWM={pre_txt}",
         ]
         if self.scope.ghost and self.scope.ghost.get("kind") == "capture":

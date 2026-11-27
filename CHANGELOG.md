@@ -19,6 +19,11 @@
 - **5. 自动整定真实限幅/角色冲突防护与长录制流式分段回放**（`autotune.py`、`autotune_ui.py`、`storage.py`、`main.py`）：
   - 自动整定支持填写控制器真实 `输出限幅 ±` 并在总结中展示 `触顶占比 / 有效采样 / 反馈通道 / 时间来源`，手选反馈通道与 `#ROLES:actual` 冲突时提前告警阻断并要求二次核对；
   - `storage.py` 新增流式扫描 `inspect_csv()` 与 `[t_start, t_end]` 时间窗口流式读取 `load_csv()`，导入超过 `20,000` 行的长录制时弹出起止时间选择窗（含一键选取开头前 200 s / 末尾最近 200 s）。
+- **6. 二次审计收敛加固**（`firmware_studio.py`、`telemetry_schema.py`、`engine.py`、`tests/verify_generators.py`）：
+  - SPL 串口初始化补齐 `UART4`（`PC10/PC11`）与 `UART5`（`PC12/PD2`）引脚/时钟/中断，不支持的外设名（如 `USART6`）直接报错拒绝生成；
+  - 收窄 `telemetry_schema.py` 默认单位推断，通用 `target / actual / output` 通道不再被误判成角度 `°` 或 `PWM`；
+  - `disturbance_metrics()` 无卸载冲高时 `t_peak` 返回 `None`（不再误取窗口末时刻），Arduino PID 草图新增 `PID_SENSOR_HOOK_READY 0` 防呆钩子避免未接反馈盲目 `@RUN`；
+  - 新增 `tests/verify_generators.py` 并在 CI 自动编译全部 30 组配置与 SPL 5 路串口模板，源码压缩包统一使用 POSIX `/` 路径规范。
 
 ---
 

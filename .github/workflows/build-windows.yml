@@ -42,6 +42,7 @@ jobs:
             python -m ziglang cc -std=c99 -Wall -Wextra -Werror -Ifirmware_example tests/balance_check.c firmware_example/balance_example.c firmware_example/pid_link.c -o .build/ctests/bal.exe
             ./.build/ctests/bal.exe
           }
+          python tests/verify_generators.py
 
       - name: Run Python GUI & protocol regression suite
         shell: pwsh

@@ -1871,6 +1871,49 @@ class GuiChecks(unittest.TestCase):
 
             w.close()
 
+    def test_v19_audit_fixes_spl_uarts_units_disturbance_peak_and_arduino_hook(self):
+        from firmware_studio import generate_interface_bundle
+        from telemetry_schema import infer_channel_unit, resolve_channel_semantics
+        from engine import disturbance_metrics
+
+        # 1) SPL UART4 & UART5 generate real PC10/11 and PC12/PD2 pins + APB1/APB2 RCC; USART6 raises ValueError
+        u4 = generate_interface_bundle({"interface_type": 0, "platform": 1, "uart_handle": "UART4"})
+        self.assertIn("RCC_APB1Periph_UART4", u4["main_integration_spl.c"])
+        self.assertIn("GPIOC", u4["main_integration_spl.c"])
+        self.assertIn("UART4_IRQn", u4["main_integration_spl.c"])
+        u5 = generate_interface_bundle({"interface_type": 1, "platform": 1, "uart_handle": "UART5"})
+        self.assertIn("RCC_APB1Periph_UART5", u5["main_imu_spl.c"])
+        self.assertIn("GPIO_Pin_12", u5["main_imu_spl.c"])
+        self.assertIn("GPIOD", u5["main_imu_spl.c"])
+        self.assertIn("UART5_IRQn", u5["main_imu_spl.c"])
+        with self.assertRaises(ValueError):
+            generate_interface_bundle({"interface_type": 0, "platform": 1, "uart_handle": "USART6"})
+
+        # 2) Generic PID channels ("target", "actual", "output") stay unitless while pitch_* keeps deg
+        self.assertEqual(infer_channel_unit("target"), "")
+        self.assertEqual(infer_channel_unit("actual"), "")
+        self.assertEqual(infer_channel_unit("output"), "")
+        self.assertEqual(infer_channel_unit("pitch_target"), "°")
+        self.assertEqual(infer_channel_unit("pitch"), "°")
+        self.assertEqual(infer_channel_unit("angle_deg"), "°")
+        smap = resolve_channel_semantics(["target", "actual", "output", "error"])
+        self.assertNotIn("pitch_target", smap)
+        self.assertNotIn("pwm", smap)
+
+        # 3) Overdamped disturbance with zero unload overshoot must report t_peak=None (not tail timestamp)
+        t_over = np.linspace(0.0, 3.0, 151)
+        y_over = np.full_like(t_over, 200.0)
+        y_over[(t_over >= 0.8) & (t_over <= 1.4)] = 175.0
+        dm_over = disturbance_metrics(t_over, 200.0, y_over, t_load=0.8, t_unload=1.4)
+        self.assertEqual(dm_over["unload_overshoot"], 0.0)
+        self.assertIsNone(dm_over["t_peak"])
+
+        # 4) Arduino PID sketch enforces PID_SENSOR_HOOK_READY guard so unmodified 0.0f stub cannot @RUN
+        ino = generate_interface_bundle({"interface_type": 0, "platform": 2})["EmbeddedDebugStudio_PID.ino"]
+        self.assertIn("#define PID_SENSOR_HOOK_READY 0", ino)
+        self.assertIn("readSensorFeedback()", ino)
+        self.assertIn("@ERR:implement readSensorFeedback()", ino)
+
 
 if __name__ == "__main__":
     unittest.main()

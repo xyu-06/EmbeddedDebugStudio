@@ -38,7 +38,6 @@ _ALIASES: dict[str, str] = {
     "target_deg": "pitch_target",
     "tgt_deg": "pitch_target",
     "ang_tgt": "pitch_target",
-    "target": "pitch_target",
     "pitch": "pitch",
     "pitch_deg": "pitch",
     "angle": "pitch",
@@ -51,8 +50,6 @@ _ALIASES: dict[str, str] = {
     "pwm": "pwm",
     "drive_pwm": "pwm",
     "pwm_out": "pwm",
-    "output": "pwm",
-    "out": "pwm",
     "wheel_speed": "wheel_speed",
     "speed": "wheel_speed",
     "speed_filtered": "wheel_speed",
@@ -115,7 +112,7 @@ def infer_channel_unit(name: str) -> str:
         return "RPM"
     if "pwm" in tok:
         return "PWM"
-    if "deg" in tok or "pitch" in tok or "roll" in tok or "yaw" in tok or "ang" in tok:
+    if "deg" in tok or "pitch" in tok or "roll" in tok or "yaw" in tok or "angle" in tok or tok.startswith("ang_") or tok.endswith("_ang"):
         return "°"
     if tok.endswith("_ms"):
         return "ms"

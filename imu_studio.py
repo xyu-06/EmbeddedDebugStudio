@@ -918,6 +918,11 @@ class ImuStudioPage(W.QWidget):
             if kind == "names":
                 self.stream_names = list(payload)
                 self.semantic_map = resolve_channel_semantics(self.stream_names)
+                if "pitch_target" not in self.semantic_map and "pitch" in self.semantic_map:
+                    for idx_n, raw_n in enumerate(self.stream_names):
+                        if str(raw_n or "").strip().lower() == "target":
+                            self.semantic_map["pitch_target"] = idx_n
+                            break
             elif kind == "log" and payload.startswith("#BALANCE:"):
                 tag = payload[9:].strip()
                 if tag.startswith("CALIBRATING"):

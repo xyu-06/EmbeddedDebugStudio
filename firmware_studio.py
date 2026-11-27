@@ -295,6 +295,8 @@ def _safe_uart_handle(raw: str, platform: int) -> str:
     if platform == 0 and cleaned.upper().startswith("USART"):
         return "huart" + cleaned[5:] if len(cleaned) > 5 else default
     if platform == 1 and cleaned.lower().startswith("huart"):
+        if cleaned.lower() in ("huart4", "huart5"):
+            return "UART" + cleaned[5:]
         return "USART" + cleaned[5:] if len(cleaned) > 5 else default
     if platform == 2 and (cleaned.lower().startswith("huart") or cleaned.upper().startswith("USART")):
         return default
@@ -313,34 +315,49 @@ def _channel_expr(role: str, idx: int) -> str:
     return f"0.0f /* TODO: CH{idx + 1} 自定义观测量 */"
 
 
+SPL_SUPPORTED_USARTS = ("USART1", "USART2", "USART3", "UART4", "UART5")
+
+
 def _usart_irq_name(usart_name: str) -> str:
     up = usart_name.upper()
-    if up in ("USART1", "USART2", "USART3", "UART4", "UART5", "USART6"):
+    if up in SPL_SUPPORTED_USARTS:
         return f"{up}_IRQHandler"
-    return "USART2_IRQHandler"
+    raise ValueError(
+        f"STM32F10x 标准库 (SPL) 仅支持 {', '.join(SPL_SUPPORTED_USARTS)}，不支持 {usart_name}"
+    )
 
 
 def _usart_rcc_setup(usart_name: str, baudrate: int) -> str:
     up = usart_name.upper()
     if up == "USART1":
         rcc = "RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1 | RCC_APB2Periph_GPIOA, ENABLE);"
-        gpio_port, tx_pin, rx_pin, irqn = "GPIOA", "GPIO_Pin_9", "GPIO_Pin_10", "USART1_IRQn"
+        tx_port, tx_pin, rx_port, rx_pin, irqn = "GPIOA", "GPIO_Pin_9", "GPIOA", "GPIO_Pin_10", "USART1_IRQn"
+    elif up == "USART2":
+        rcc = "RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);\n    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);"
+        tx_port, tx_pin, rx_port, rx_pin, irqn = "GPIOA", "GPIO_Pin_2", "GPIOA", "GPIO_Pin_3", "USART2_IRQn"
     elif up == "USART3":
         rcc = "RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART3, ENABLE);\n    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);"
-        gpio_port, tx_pin, rx_pin, irqn = "GPIOB", "GPIO_Pin_10", "GPIO_Pin_11", "USART3_IRQn"
+        tx_port, tx_pin, rx_port, rx_pin, irqn = "GPIOB", "GPIO_Pin_10", "GPIOB", "GPIO_Pin_11", "USART3_IRQn"
+    elif up == "UART4":
+        rcc = "RCC_APB1PeriphClockCmd(RCC_APB1Periph_UART4, ENABLE);\n    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);"
+        tx_port, tx_pin, rx_port, rx_pin, irqn = "GPIOC", "GPIO_Pin_10", "GPIOC", "GPIO_Pin_11", "UART4_IRQn"
+    elif up == "UART5":
+        rcc = "RCC_APB1PeriphClockCmd(RCC_APB1Periph_UART5, ENABLE);\n    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC | RCC_APB2Periph_GPIOD, ENABLE);"
+        tx_port, tx_pin, rx_port, rx_pin, irqn = "GPIOC", "GPIO_Pin_12", "GPIOD", "GPIO_Pin_2", "UART5_IRQn"
     else:
-        rcc = "RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);\n    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);"
-        gpio_port, tx_pin, rx_pin, irqn = "GPIOA", "GPIO_Pin_2", "GPIO_Pin_3", "USART2_IRQn"
+        raise ValueError(
+            f"STM32F10x 标准库 (SPL) 仅支持 {', '.join(SPL_SUPPORTED_USARTS)}，不支持 {usart_name}"
+        )
     return (
         f"    {rcc}\n"
         f"    GPIO_InitTypeDef g;\n"
         f"    g.GPIO_Speed = GPIO_Speed_50MHz;\n"
         f"    g.GPIO_Pin = {tx_pin};\n"
         f"    g.GPIO_Mode = GPIO_Mode_AF_PP;\n"
-        f"    GPIO_Init({gpio_port}, &g);\n"
+        f"    GPIO_Init({tx_port}, &g);\n"
         f"    g.GPIO_Pin = {rx_pin};\n"
         f"    g.GPIO_Mode = GPIO_Mode_IN_FLOATING;\n"
-        f"    GPIO_Init({gpio_port}, &g);\n"
+        f"    GPIO_Init({rx_port}, &g);\n"
         f"    USART_InitTypeDef u;\n"
         f"    USART_StructInit(&u);\n"
         f"    u.USART_BaudRate = {baudrate}U;\n"
@@ -1075,6 +1092,8 @@ void App_PidSplDemo(void)
 #include <math.h>
 
 #define PID_SERIAL {uart_handle}
+// 实机接入传感器反馈（编码器转速 / 倾角）后：修改 readSensorFeedback() 并将其改为 1，否则 @RUN 拒绝空反馈运行
+#define PID_SENSOR_HOOK_READY 0
 
 struct PidLoop {{
   float kp, ki, kd, target;
@@ -1098,6 +1117,11 @@ void sendHeader() {{
 void applyMotorPwm(float pwm) {{
   applied_pwm = constrain(pwm, -{_c_float(pwm_limit)}, {_c_float(pwm_limit)});
   // TODO: 在此处将 applied_pwm 输出至 PWM 引脚 / ledcWrite / analogWrite
+}}
+
+float readSensorFeedback() {{
+  // TODO: 读取真实编码器 / 传感器反馈值，并将顶部 PID_SENSOR_HOOK_READY 设为 1
+  return 0.0f;
 }}
 
 void stopMotor(const char *reason = nullptr) {{
@@ -1152,6 +1176,11 @@ void handleCommand(String line) {{
   if (body == "PING") {{ last_ping_ms = millis(); return; }}
   if (body == "STOP") {{ stopMotor(); PID_SERIAL.println(F("@ACK:STOP")); return; }}
   if (body == "RUN") {{
+#if !PID_SENSOR_HOOK_READY
+    stopMotor();
+    PID_SERIAL.println(F("@ERR:implement readSensorFeedback() and set PID_SENSOR_HOOK_READY 1"));
+    return;
+#else
     last_ping_ms = millis();
     if (!pid_running) {{
       for (int i = 0; i < 4; ++i) {{ pid_loops[i].integral = 0.0f; pid_loops[i].initialized = false; }}
@@ -1162,6 +1191,7 @@ void handleCommand(String line) {{
     PID_SERIAL.println(F("#CAP:SET"));
     PID_SERIAL.println(F("@ACK:RUN"));
     return;
+#endif
   }}
 
   int grp = PRIMARY_PID_GROUP;
@@ -1250,12 +1280,12 @@ void loop() {{
   if (now - last_ctrl >= {control_ms}UL) {{
     float dt = (now - last_ctrl) * 0.001f;
     last_ctrl = now;
-    float actual_val = 0.0f; // TODO: 读取编码器 / 传感器反馈
+    float actual_val = readSensorFeedback();
     applyMotorPwm(computePid(pid_loops[PRIMARY_PID_GROUP], actual_val, dt));
   }}
   if (now - last_rep >= {report_ms}UL) {{
     last_rep = now;
-    float actual_val = 0.0f; // TODO: 与上方反馈保持一致
+    float actual_val = readSensorFeedback();
     reportTelemetry(actual_val);
   }}
 }}
@@ -2603,6 +2633,7 @@ class FirmwareStudioPage(W.QWidget):
         self.platform_box.setSizeAdjustPolicy(W.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.uart_edit = W.QLineEdit("huart2")
         self.uart_edit.setMinimumWidth(0)
+        self.uart_edit.setToolTip("HAL：huart1~3；SPL (stm32f10x.h)：USART1~3 / UART4 / UART5；Arduino：Serial / Serial2")
         self.uart_label = W.QLabel("UART 句柄")
         self.baud_box = W.QComboBox()
         self.baud_box.setEditable(True)
@@ -3136,7 +3167,16 @@ class FirmwareStudioPage(W.QWidget):
             badge_txt = f"遥控协议: {cfg['remote_cmd_fmt']}  ·  ±{cfg['remote_pwm_limit']}  ·  失联 {cfg['remote_failsafe_ms']} ms"
         self.proto_badge.setText(badge_txt)
         self.proto_badge.setToolTip(badge_txt)
-        self._bundle = generate_interface_bundle(cfg)
+        try:
+            self._bundle = generate_interface_bundle(cfg)
+        except ValueError as exc:
+            self.proto_badge.setText(f"⚠ 配置错误：{exc}")
+            self._bundle = {
+                "配置错误说明.txt": (
+                    f"当前配置无效：{exc}\n\n"
+                    f"STM32 标准库 SPL (stm32f10x.h) 支持外设：{', '.join(SPL_SUPPORTED_USARTS)}。\n"
+                )
+            }
         self.guide_view.setHtml(build_interface_guide_html(iface, plat))
 
         prev_file = self.file_combo.currentText()

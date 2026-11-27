@@ -408,7 +408,7 @@ def disturbance_metrics(times, target_val, actual, outputs=None, band=0.02, outp
         over_candidates = np.arange(len(t_v))
     peak_idx = int(over_candidates[int(np.argmax(y_v[over_candidates]))])
     unload_overshoot = max(0.0, float(y_v[peak_idx] - tgt))
-    t_peak = float(t_v[peak_idx])
+    t_peak = float(t_v[peak_idx]) if unload_overshoot > 1e-9 else None
 
     ref_time = float(t_unload) if t_unload is not None else (float(t_load) if t_load is not None else t_dip)
     sub = np.flatnonzero(t_v >= ref_time)
