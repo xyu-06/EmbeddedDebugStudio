@@ -2297,6 +2297,49 @@ class GuiChecks(unittest.TestCase):
             self.assertIn("此前已测最优参考", w_drop.autotune_status.text())
             w_drop.close()
 
+            # F) Feedback column disappears BEFORE step is issued (3 frames at 80, then target-only) -> MUST @STOP first and NEVER send TGT=200
+            w_pre = Window(Path(tmp) / "pre_step_missing_speed.ini")
+            w_pre.timer.stop()
+            w_pre.connected = True
+            w_pre.sim = None
+            w_pre.group.setCurrentIndex(1)
+            for k, v in (("KP", 2.0), ("KI", 5.0), ("KD", 0.0), ("TGT", 10.0)):
+                w_pre.fields[k].setValue(v)
+                w_pre.confirmed[f"SPD.{k}"] = v
+            sent_pre = []
+            w_pre.commands.submit = lambda cmds, quiet=False: (sent_pre.extend(cmds) or True)
+            w_pre.commands.busy = lambda: False
+            w_pre.receive(b"#NAMES:target,actual,pwm\n#ROLES:target,actual,output\n100,80,200\n", 5.0)
+            self.assertTrue(
+                w_pre.autotuner.start(0, 1, 0, base=100.0, target=200.0, step_seconds=0.8, max_rounds=4, hold_target=True)
+            )
+            w_pre.autotuner.tick(5.01)  # WAIT_START -> PREPARE
+            w_pre.autotuner.tick(5.02)  # PREPARE -> WAIT_BASE_ACK
+            w_pre.autotuner.tick(5.03)  # WAIT_BASE_ACK -> SETTLE_BASE
+            sent_pre.clear()
+            # 3 valid frames at 80, then 3 target-only frames -> must NOT jump to TGT=200 using stale 3 frames
+            base_t = w_pre.latest
+            for i in range(3):
+                w_pre.sample(base_t + 0.05 + i * 0.04, [100.0, 80.0, 200.0])
+            for i in range(3):
+                w_pre.sample(base_t + 0.17 + i * 0.04, [100.0])
+            w_pre.autotuner.tick(5.30)
+            self.assertEqual(w_pre.autotuner.state, w_pre.autotuner.SETTLE_BASE)
+            self.assertEqual(sent_pre, [])
+            # Continue target-only frames past timeout -> MUST abort with @STOP first, never emit TGT=200
+            for i in range(20):
+                w_pre.sample(base_t + 0.29 + i * 0.04, [100.0])
+            w_pre.autotuner.tick(6.10)
+            self.assertFalse(w_pre.autotuner.active)
+            self.assertEqual(w_pre.autotuner.state, w_pre.autotuner.IDLE)
+            self.assertTrue(sent_pre and sent_pre[0] == "@STOP")
+            self.assertFalse(any("SPD.TGT=200.0000" in c for c in sent_pre))
+            self.assertTrue(any("SPD.KP=2.0000" in c for c in sent_pre))
+            self.assertTrue(any("SPD.TGT=10.0000" in c for c in sent_pre))
+            self.assertIn("基准段", w_pre.autotune_status.text())
+            self.assertIn("反馈通道", w_pre.autotune_status.text())
+            w_pre.close()
+
 
 if __name__ == "__main__":
     unittest.main()

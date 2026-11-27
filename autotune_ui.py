@@ -671,6 +671,27 @@ class AutoTuneController:
         winner_full = {"KP": best["KP"], "KI": best["KI"], "KD": best["KD"], "TGT": final_tgt}
         self._begin_finalize("winner", winner_full, reason, stop_motor=False, already_stopped=True, summary=summary)
 
+    def _check_missing_feedback(self, rows, phase_start, now):
+        """Return (trailing_missing, missing_s, timed_out) for actual_col within rows >= phase_start."""
+        if not len(rows):
+            ref_t = self.last_valid_actual_t if self.last_valid_actual_t is not None else phase_start
+            return 0, max(0.0, self.ui.latest - ref_t), False
+        y_col = rows[:, self.actual_col + 1]
+        fin_idx = np.flatnonzero(np.isfinite(y_col))
+        if len(fin_idx):
+            last_fin_t = float(rows[int(fin_idx[-1]), 0])
+            if self.last_valid_actual_t is None or last_fin_t > self.last_valid_actual_t:
+                self.last_valid_actual_t = last_fin_t
+                self.last_valid_actual_wall = now
+            trailing_missing = len(rows) - 1 - int(fin_idx[-1])
+        else:
+            trailing_missing = len(rows)
+        ref_t = self.last_valid_actual_t if self.last_valid_actual_t is not None else phase_start
+        missing_s = max(0.0, self.ui.latest - ref_t)
+        missing_timeout = min(max(0.50, self.engine.step_seconds * 0.45), 1.50)
+        timed_out = trailing_missing >= 2 and missing_s >= missing_timeout
+        return trailing_missing, missing_s, timed_out
+
     def tick(self, now):
         if self.state == self.IDLE:
             return
@@ -776,17 +797,22 @@ class AutoTuneController:
             settle_cap = min(2.5, max(0.70, self.engine.step_seconds * 0.70))
             max_settle_wait = min(4.0, max(1.4, self.engine.step_seconds * 1.25))
             a = w.buffer.view()
-            fresh_fin = np.array([], dtype=float)
+            fresh_rows = a[a[:, 0] >= self.phase_t0] if len(a) else a
+            trailing_missing, missing_s, fb_timed_out = self._check_missing_feedback(fresh_rows, self.phase_t0, now)
+            if fb_timed_out:
+                self._abort_with_stop(
+                    f"基准段反馈通道 CH{self.actual_col+1} 持续缺失有效数据（已优先停机，未下发阶跃目标）"
+                )
+                return
+
+            fresh_fin = (
+                fresh_rows[np.isfinite(fresh_rows[:, self.actual_col + 1]), self.actual_col + 1]
+                if len(fresh_rows)
+                else np.array([], dtype=float)
+            )
             near_base = flat = False
-            if len(a):
-                fresh_rows = a[a[:, 0] >= self.phase_t0]
-                fresh_y = fresh_rows[:, self.actual_col + 1]
-                fin_idx = np.flatnonzero(np.isfinite(fresh_y))
-                fresh_fin = fresh_y[fin_idx]
-                if len(fin_idx):
-                    self.last_valid_actual_t = float(fresh_rows[int(fin_idx[-1]), 0])
-                    self.last_valid_actual_wall = now
-            if elapsed >= 0.18 and len(fresh_fin) >= 3:
+            feedback_live = (trailing_missing == 0 and missing_s <= 0.25)
+            if feedback_live and elapsed >= 0.18 and len(fresh_fin) >= 3:
                 recent = a[(a[:, 0] >= self.phase_t0) & (a[:, 0] >= w.latest - 0.15), self.actual_col + 1]
                 recent = recent[np.isfinite(recent)]
                 if len(recent) < 3:
@@ -795,10 +821,10 @@ class AutoTuneController:
                 near_base = abs(float(np.mean(recent)) - self.engine.base) <= max(0.06 * amp, 1e-3)
                 flat = float(np.ptp(recent)) <= max(0.03 * amp, 1e-3)
 
-            ready = (near_base and flat) or (elapsed >= settle_cap and flat)
+            ready = feedback_live and ((near_base and flat) or (elapsed >= settle_cap and flat))
             if not ready:
                 if elapsed >= max_settle_wait or now > self.wall_deadline:
-                    if len(fresh_fin) < 3:
+                    if len(fresh_fin) < 3 or trailing_missing >= 2 or missing_s >= 0.30:
                         self._abort_with_stop("基准段未收到有效反馈，已停机并取消整定")
                         return
                     if self.engine.round == 1:
@@ -876,25 +902,12 @@ class AutoTuneController:
 
             # Mid-round safety guard against sustained motor stall or strong reversed feedback
             seg_live = a[a[:, 0] >= self.step_t0] if len(a) else a
-            if len(seg_live):
-                y_col = seg_live[:, self.actual_col + 1]
-                fin_idx = np.flatnonzero(np.isfinite(y_col))
-                if len(fin_idx):
-                    last_fin_t = float(seg_live[int(fin_idx[-1]), 0])
-                    if self.last_valid_actual_t is None or last_fin_t > self.last_valid_actual_t:
-                        self.last_valid_actual_t = last_fin_t
-                        self.last_valid_actual_wall = now
-                    trailing_missing = len(seg_live) - 1 - int(fin_idx[-1])
-                else:
-                    trailing_missing = len(seg_live)
-                ref_t = self.last_valid_actual_t if self.last_valid_actual_t is not None else self.step_t0
-                missing_s = max(0.0, w.latest - ref_t)
-                missing_timeout = min(max(0.50, self.engine.step_seconds * 0.45), 1.50)
-                if trailing_missing >= 4 and missing_s >= missing_timeout:
-                    self._abort_with_stop(
-                        f"反馈通道 CH{self.actual_col+1} 持续缺失有效数据（已优先停机，避免失反馈继续运行）"
-                    )
-                    return
+            _, _, fb_timed_out = self._check_missing_feedback(seg_live, self.step_t0, now)
+            if fb_timed_out:
+                self._abort_with_stop(
+                    f"反馈通道 CH{self.actual_col+1} 持续缺失有效数据（已优先停机，避免失反馈继续运行）"
+                )
+                return
             grace_s = min(max(0.45, self.engine.step_seconds * 0.25), 1.5)
             step_delta = self.engine.target - self.base_y
             if len(seg_live) >= 8 and abs(step_delta) > 1e-3 and elapsed >= grace_s:
