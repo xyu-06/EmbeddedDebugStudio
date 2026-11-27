@@ -2240,6 +2240,63 @@ class GuiChecks(unittest.TestCase):
             self.assertTrue(any("SPD.TGT=150.0000" in c for c in sent_r1))
             w_r1.close()
 
+            # D) Stream keeps sending target-only frames (speed feedback column disappears) -> MUST @STOP & NOT advance
+            w_drop = Window(Path(tmp) / "missing_speed_col.ini")
+            w_drop.timer.stop()
+            w_drop.connected = True
+            w_drop.sim = None
+            w_drop.group.setCurrentIndex(1)
+            for k, v in (("KP", 2.0), ("KI", 5.0), ("KD", 0.0), ("TGT", 10.0)):
+                w_drop.fields[k].setValue(v)
+                w_drop.confirmed[f"SPD.{k}"] = v
+            sent_d = []
+            w_drop.commands.submit = lambda cmds, quiet=False: (sent_d.extend(cmds) or True)
+            w_drop.commands.busy = lambda: False
+            w_drop.receive(b"#NAMES:target,actual,pwm\n#ROLES:target,actual,output\n0,0,0\n", 1.0)
+            self.assertTrue(
+                w_drop.autotuner.start(0, 1, 0, base=0.0, target=200.0, step_seconds=0.8, max_rounds=4, hold_target=True)
+            )
+            w_drop.autotuner.tick(1.01)  # WAIT_START -> PREPARE
+            w_drop.autotuner.tick(1.02)  # PREPARE (R1) -> WAIT_BASE_ACK
+            w_drop.autotuner.tick(1.03)  # WAIT_BASE_ACK -> SETTLE_BASE
+            for i in range(10):
+                w_drop.sample(1.05 + i * 0.04, [0.0, 0.0, 0.0])
+            w_drop.autotuner.tick(1.45)  # SETTLE_BASE -> WAIT_STEP_ACK
+            w_drop.autotuner.tick(1.46)  # WAIT_STEP_ACK -> OBSERVE (R1)
+            for i in range(26):
+                t_s = 1.50 + i * 0.04
+                if i == 10:
+                    w_drop.sample(t_s, [200.0])  # E) single dropped speed frame must be tolerated
+                else:
+                    y_s = 200.0 * (1.0 - np.exp(-max(0.0, t_s - 1.50) / 0.18))
+                    w_drop.sample(t_s, [200.0, float(y_s), 450.0])
+            w_drop.autotuner.tick(2.60)
+            self.assertIsNotNone(w_drop.autotuner.engine.best_params)
+            self.assertEqual(w_drop.autotuner.state, w_drop.autotuner.PREPARE)
+
+            # Start Round 2 normally, then stream ONLY target=200 for 30 frames (actual col becomes NaN)
+            w_drop.autotuner.tick(2.61)  # PREPARE (R2) -> WAIT_BASE_ACK
+            w_drop.autotuner.tick(2.62)  # WAIT_BASE_ACK -> SETTLE_BASE
+            for i in range(10):
+                w_drop.sample(2.65 + i * 0.04, [0.0, 0.0, 0.0])
+            w_drop.autotuner.tick(3.05)  # SETTLE_BASE -> WAIT_STEP_ACK
+            w_drop.autotuner.tick(3.06)  # WAIT_STEP_ACK -> OBSERVE (R2)
+            sent_d.clear()
+            for i in range(30):
+                w_drop.sample(3.10 + i * 0.04, [200.0])
+            w_drop.autotuner.tick(4.40)
+            self.assertFalse(w_drop.autotuner.active)
+            self.assertEqual(w_drop.autotuner.state, w_drop.autotuner.IDLE)
+            self.assertEqual(w_drop.autotuner.engine.round, 2)
+            self.assertEqual(sent_d[0], "@STOP")
+            self.assertTrue(any("SPD.KP=2.0000" in c for c in sent_d))
+            self.assertTrue(any("SPD.TGT=10.0000" in c for c in sent_d))
+            self.assertFalse(any("SPD.KP=" in c and "SPD.KP=2.0000" not in c for c in sent_d))
+            self.assertFalse(any("SPD.TGT=200.0000" in c for c in sent_d))
+            self.assertIn("反馈通道", w_drop.autotune_status.text())
+            self.assertIn("此前已测最优参考", w_drop.autotune_status.text())
+            w_drop.close()
+
 
 if __name__ == "__main__":
     unittest.main()

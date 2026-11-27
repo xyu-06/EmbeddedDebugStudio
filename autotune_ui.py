@@ -32,6 +32,8 @@ class AutoTuneController:
         self.step_t0 = 0.
         self.step_t0_source = ""
         self.step_t0_resolved = False
+        self.last_valid_actual_t = None
+        self.last_valid_actual_wall = None
         self._pending_start = None
         self.finalize_mode = ""
         self.finalize_need_stop = False
@@ -763,6 +765,8 @@ class AutoTuneController:
             if w.commands.busy():
                 return
             self.phase_t0 = w.latest
+            self.last_valid_actual_t = self.phase_t0
+            self.last_valid_actual_wall = now
             self.wall_deadline = now + max(4.5, self.engine.step_seconds * 2.5)
             self.state = self.SETTLE_BASE
             return
@@ -775,8 +779,13 @@ class AutoTuneController:
             fresh_fin = np.array([], dtype=float)
             near_base = flat = False
             if len(a):
-                fresh = a[a[:, 0] >= self.phase_t0, self.actual_col + 1]
-                fresh_fin = fresh[np.isfinite(fresh)]
+                fresh_rows = a[a[:, 0] >= self.phase_t0]
+                fresh_y = fresh_rows[:, self.actual_col + 1]
+                fin_idx = np.flatnonzero(np.isfinite(fresh_y))
+                fresh_fin = fresh_y[fin_idx]
+                if len(fin_idx):
+                    self.last_valid_actual_t = float(fresh_rows[int(fin_idx[-1]), 0])
+                    self.last_valid_actual_wall = now
             if elapsed >= 0.18 and len(fresh_fin) >= 3:
                 recent = a[(a[:, 0] >= self.phase_t0) & (a[:, 0] >= w.latest - 0.15), self.actual_col + 1]
                 recent = recent[np.isfinite(recent)]
@@ -789,11 +798,11 @@ class AutoTuneController:
             ready = (near_base and flat) or (elapsed >= settle_cap and flat)
             if not ready:
                 if elapsed >= max_settle_wait or now > self.wall_deadline:
+                    if len(fresh_fin) < 3:
+                        self._abort_with_stop("基准段未收到有效反馈，已停机并取消整定")
+                        return
                     if self.engine.round == 1:
-                        if len(fresh_fin) < 3:
-                            self._abort_with_stop("基准段未收到有效反馈，已停机并取消整定")
-                        else:
-                            self._abort_with_stop("起始基准未平稳，请待车轮停稳后再启动自动整定")
+                        self._abort_with_stop("起始基准未平稳，请待车轮停稳后再启动自动整定")
                         return
                     self.engine.record_result([], [], aborted_reason="基准段未平稳，本轮不可比较")
                     w.log("整定", f"R{self.engine.round:02d} 跳过：上一轮结束后尚未平稳")
@@ -834,6 +843,8 @@ class AutoTuneController:
                         self.step_t0 = float(sub[int(hits[0]), 0])
                         self.step_t0_resolved = True
                         self.step_t0_source = "目标列跳变起点"
+            self.last_valid_actual_t = self.step_t0
+            self.last_valid_actual_wall = now
             self.wall_deadline = now + max(5.0, self.engine.step_seconds * 3.0)
             self.state = self.OBSERVE
             return
@@ -865,6 +876,25 @@ class AutoTuneController:
 
             # Mid-round safety guard against sustained motor stall or strong reversed feedback
             seg_live = a[a[:, 0] >= self.step_t0] if len(a) else a
+            if len(seg_live):
+                y_col = seg_live[:, self.actual_col + 1]
+                fin_idx = np.flatnonzero(np.isfinite(y_col))
+                if len(fin_idx):
+                    last_fin_t = float(seg_live[int(fin_idx[-1]), 0])
+                    if self.last_valid_actual_t is None or last_fin_t > self.last_valid_actual_t:
+                        self.last_valid_actual_t = last_fin_t
+                        self.last_valid_actual_wall = now
+                    trailing_missing = len(seg_live) - 1 - int(fin_idx[-1])
+                else:
+                    trailing_missing = len(seg_live)
+                ref_t = self.last_valid_actual_t if self.last_valid_actual_t is not None else self.step_t0
+                missing_s = max(0.0, w.latest - ref_t)
+                missing_timeout = min(max(0.50, self.engine.step_seconds * 0.45), 1.50)
+                if trailing_missing >= 4 and missing_s >= missing_timeout:
+                    self._abort_with_stop(
+                        f"反馈通道 CH{self.actual_col+1} 持续缺失有效数据（已优先停机，避免失反馈继续运行）"
+                    )
+                    return
             grace_s = min(max(0.45, self.engine.step_seconds * 0.25), 1.5)
             step_delta = self.engine.target - self.base_y
             if len(seg_live) >= 8 and abs(step_delta) > 1e-3 and elapsed >= grace_s:
@@ -907,6 +937,12 @@ class AutoTuneController:
             actual = seg[:, self.actual_col + 1]
             outputs = seg[:, self.output_col + 1] if self.output_col is not None else None
             finite_y = actual[np.isfinite(actual)]
+            if len(finite_y) < 6:
+                if len(finite_y) == 0:
+                    self._abort_with_stop(f"反馈通道 CH{self.actual_col+1} 无有效数据（已优先停机，避免失反馈继续运行）")
+                else:
+                    self._abort_with_stop(f"反馈通道 CH{self.actual_col+1} 有效采样不足（仅 {len(finite_y)} 帧），已停机中止")
+                return
             step_amp = abs(self.engine.target - self.base_y)
             if len(finite_y) >= 6 and step_amp > 1e-3:
                 check_y = finite_y[1:] if (len(finite_y) >= 8 and abs(float(finite_y[0]) - self.base_y) <= 0.05 * step_amp) else finite_y
@@ -931,6 +967,9 @@ class AutoTuneController:
                 w.mark(f"最优#{rnd} J={ev.score:.2f}")
             if ev.stalled or (ev.reversed_sign and self.engine.finished and self.engine.best_params is None):
                 self.stop(self.engine.finish_reason, apply_best=False)
+                return
+            if not ev.valid and ev.sample_count < 6:
+                self._abort_with_stop(f"反馈通道 CH{self.actual_col+1} 有效采样不足（{ev.sample_count} 帧），已停机中止")
                 return
             if self.engine.finished:
                 if self.engine.best_params is not None and self.engine.best_eval is not None and self.engine.best_eval.valid:
