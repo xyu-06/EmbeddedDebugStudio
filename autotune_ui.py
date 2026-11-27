@@ -468,7 +468,7 @@ class AutoTuneController:
             msg = f"⚠ {self.finalize_reason} · 连接已断开，设备参数未确认（请重连后点【读取】核对）"
         self.state = self.IDLE
         self.sync_ui()
-        self._set_status(msg)
+        self._set_status(msg, self.finalize_summary)
         w.log("系统", "自动整定  " + msg)
         w.feedback(msg, True)
 
@@ -500,14 +500,14 @@ class AutoTuneController:
                 status = f"⚠ 原参数恢复未确认（{msg}；请重连后点【读取】核对）"
             self.state = self.IDLE
             self.sync_ui()
-            self._set_status(status)
+            self._set_status(status, self.finalize_summary)
             w.log("系统", "自动整定  " + status)
             w.feedback(status, True)
             return
         if self.active:
-            self._restore_original(f"命令失败（{msg}）", send_to_device=w.connected, stop_motor=True, already_stopped=False)
+            self._abort_with_stop(f"命令失败（{msg}）")
 
-    def _restore_original(self, reason, send_to_device=True, stop_motor=True, already_stopped=False):
+    def _restore_original(self, reason, send_to_device=True, stop_motor=True, already_stopped=False, summary=""):
         """Always roll back UI and device to saved_before when no verified winner exists."""
         w = self.ui
         if self.saved_before:
@@ -516,14 +516,30 @@ class AutoTuneController:
             w.load_fields()
         msg = reason or "已中止整定"
         if send_to_device and w.connected and self.saved_before:
-            self._begin_finalize("restore", self.saved_before, msg, stop_motor=stop_motor, already_stopped=already_stopped)
+            self._begin_finalize("restore", self.saved_before, msg, stop_motor=stop_motor, already_stopped=already_stopped, summary=summary)
             return
         self.state = self.IDLE
         self.sync_ui()
         note = msg + (" · 未连机或无设备基准，设备参数未确认" if self.saved_before is None or not w.connected else "")
-        self._set_status(note)
+        self._set_status(note, summary)
         w.log("系统", "自动整定  " + note)
         w.feedback(note, True)
+
+    def _abort_with_stop(self, reason):
+        """Abort safely on abnormal runtime faults: always @STOP + restore original params, never drive target."""
+        w = self.ui
+        best_ref = ""
+        if self.engine and self.engine.best_params and self.engine.best_eval and self.engine.best_eval.valid:
+            p = self.engine.best_params
+            ev = self.engine.best_eval
+            best_ref = (
+                f"此前已测最优参考（未自动下发）：KP={p['KP']:.4g}  KI={p['KI']:.4g}  KD={p['KD']:.4g}"
+                f"（J={ev.score:.3f}，超调 {ev.overshoot_pct:.1f}%）"
+            )
+            w.log("整定", f"{reason} · {best_ref}")
+        self._restore_original(
+            reason, send_to_device=w.connected, stop_motor=True, already_stopped=False, summary=best_ref,
+        )
 
     def sync_ui(self):
         w = self.ui
@@ -555,6 +571,12 @@ class AutoTuneController:
     def on_device_stopped(self, reason):
         """Called when device reports #STOP:fall / #STOP:heartbeat or user hits emergency stop."""
         if self.state == self.IDLE:
+            return
+        if self.state == self.READ_BASELINE:
+            self._pending_start = None
+            self.state = self.IDLE
+            self.sync_ui()
+            self._set_status(f"因“{reason}”中止（启动前设备已停机）")
             return
         w = self.ui
         if reason == "急停":
@@ -728,7 +750,7 @@ class AutoTuneController:
                     w.fields[k].setValue(cand[k])
             cmds = self._build_param_cmds(cand["KP"], cand["KI"], cand["KD"], self.engine.base, reset=True)
             if not w.commands.submit(cmds, quiet=True):
-                self.stop("命令队列已满，整定中止", apply_best=True)
+                self._abort_with_stop("命令队列已满，整定中止")
                 return
             self.state = self.WAIT_BASE_ACK
             self._set_status(
@@ -750,39 +772,45 @@ class AutoTuneController:
             settle_cap = min(2.5, max(0.70, self.engine.step_seconds * 0.70))
             max_settle_wait = min(4.0, max(1.4, self.engine.step_seconds * 1.25))
             a = w.buffer.view()
+            fresh_fin = np.array([], dtype=float)
             near_base = flat = False
-            if elapsed >= 0.18 and len(a) >= 6:
-                recent = a[a[:, 0] >= w.latest - 0.15, self.actual_col + 1]
+            if len(a):
+                fresh = a[a[:, 0] >= self.phase_t0, self.actual_col + 1]
+                fresh_fin = fresh[np.isfinite(fresh)]
+            if elapsed >= 0.18 and len(fresh_fin) >= 3:
+                recent = a[(a[:, 0] >= self.phase_t0) & (a[:, 0] >= w.latest - 0.15), self.actual_col + 1]
                 recent = recent[np.isfinite(recent)]
+                if len(recent) < 3:
+                    recent = fresh_fin[-3:]
                 amp = abs(self.engine.target - self.engine.base)
-                if len(recent) >= 3:
-                    near_base = abs(float(np.mean(recent)) - self.engine.base) <= max(0.06 * amp, 1e-3)
-                    flat = float(np.ptp(recent)) <= max(0.03 * amp, 1e-3)
+                near_base = abs(float(np.mean(recent)) - self.engine.base) <= max(0.06 * amp, 1e-3)
+                flat = float(np.ptp(recent)) <= max(0.03 * amp, 1e-3)
 
             ready = (near_base and flat) or (elapsed >= settle_cap and flat)
             if not ready:
                 if elapsed >= max_settle_wait or now > self.wall_deadline:
                     if self.engine.round == 1:
-                        # Round 1 may start even if sample cadence is coarse; warn if still moving
-                        ready = len(a) > 0
-                    else:
-                        self.engine.record_result([], [], aborted_reason="基准段未平稳，本轮不可比较")
-                        w.log("整定", f"R{self.engine.round:02d} 跳过：上一轮结束后尚未平稳")
-                        self.state = self.PREPARE
+                        if len(fresh_fin) < 3:
+                            self._abort_with_stop("基准段未收到有效反馈，已停机并取消整定")
+                        else:
+                            self._abort_with_stop("起始基准未平稳，请待车轮停稳后再启动自动整定")
                         return
-                if not ready:
+                    self.engine.record_result([], [], aborted_reason="基准段未平稳，本轮不可比较")
+                    w.log("整定", f"R{self.engine.round:02d} 跳过：上一轮结束后尚未平稳")
+                    self.state = self.PREPARE
                     return
+                return
 
-            if len(a):
-                tail = a[a[:, 0] >= w.latest - 0.12, self.actual_col + 1]
+            if len(a) and len(fresh_fin):
+                tail = a[(a[:, 0] >= self.phase_t0) & (a[:, 0] >= w.latest - 0.12), self.actual_col + 1]
                 tail = tail[np.isfinite(tail)]
-                self.base_y = float(np.mean(tail)) if len(tail) else float(a[-1, self.actual_col + 1])
+                self.base_y = float(np.mean(tail)) if len(tail) else float(np.mean(fresh_fin[-3:]))
             else:
                 self.base_y = self.engine.base
 
             self.step_pre_t = w.latest
             if not w.commands.submit([self._cmd("RST"), self._cmd("TGT", self.engine.target)], quiet=True):
-                self.stop("下发阶跃目标失败", apply_best=True)
+                self._abort_with_stop("下发阶跃目标失败")
                 return
             self.state = self.WAIT_STEP_ACK
             return
@@ -812,7 +840,7 @@ class AutoTuneController:
 
         if self.state == self.OBSERVE:
             if now > self.wall_deadline:
-                self.stop("阶跃采样中断", apply_best=True)
+                self._abort_with_stop("阶跃采样中断（已优先停机，避免失反馈继续运行）")
                 return
             a = w.buffer.view()
             if not self.step_t0_resolved and self.target_col is not None and len(a):
@@ -872,7 +900,7 @@ class AutoTuneController:
             if len(seg) < 6:
                 if now <= self.wall_deadline - 1.0:
                     return
-                self.stop("采样率过低（单轮少于 6 帧），无法可靠整定", apply_best=True)
+                self._abort_with_stop("采样率过低（单轮少于 6 帧），已停机中止")
                 return
 
             times = seg[:, 0]

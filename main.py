@@ -936,11 +936,11 @@ class Window(W.QMainWindow):
                         "fall":("检测到倒地，设备已自动停机","检测到倒地 · 输出已清零，扶正后再点启动")}.get(
                         reason,("设备已停机  "+reason,"设备已停机 · "+reason))
                 self.send_heartbeat = False
-                self.autotuner.on_device_stopped(text[0])
                 self.stop_generator(text[0],restore=False)
-                self.commands.failed(text[0])
+                self.commands.failed(text[0], notify_autotune=False)
                 self.stop_banner.setText(text[1])
                 self.stop_banner.show()
+                self.autotuner.on_device_stopped(text[0])
             elif kind == "names":
                 if not self.writer:
                     for idx, (w, n) in enumerate(zip(self.name_edits, payload)):

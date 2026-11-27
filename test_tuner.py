@@ -2097,6 +2097,149 @@ class GuiChecks(unittest.TestCase):
             self.assertEqual(w3.autotuner.step_t0_source, "估计起点(ACK)")
             w3.close()
 
+    def test_v19_autotune_feedback_loss_device_stop_and_round1_settle(self):
+        with TemporaryDirectory() as tmp:
+            # A) Feedback loss (OBSERVE wall_deadline timeout) after Round 1 succeeded and hold_target=True
+            # MUST @STOP and restore saved_before (NOT apply winner target=200 without @STOP), while keeping best ref
+            w_to = Window(Path(tmp) / "timeout_stop.ini")
+            w_to.timer.stop()
+            w_to.connected = True
+            w_to.sim = None
+            w_to.group.setCurrentIndex(1)  # SPD
+            for k, v in (("KP", 2.0), ("KI", 5.0), ("KD", 0.0), ("TGT", 10.0)):
+                w_to.fields[k].setValue(v)
+                w_to.confirmed[f"SPD.{k}"] = v
+            sent_to = []
+            w_to.commands.submit = lambda cmds, quiet=False: (sent_to.extend(cmds) or True)
+            w_to.commands.busy = lambda: False
+            w_to.receive(b"#NAMES:target,actual,pwm\n#ROLES:target,actual,output\n0,0,0\n", 1.0)
+            self.assertTrue(
+                w_to.autotuner.start(0, 1, 0, base=0.0, target=200.0, step_seconds=0.8, max_rounds=4, hold_target=True)
+            )
+            w_to.autotuner.tick(1.01)  # WAIT_START -> PREPARE
+            w_to.autotuner.tick(1.02)  # PREPARE (R1) -> WAIT_BASE_ACK
+            w_to.autotuner.tick(1.03)  # WAIT_BASE_ACK -> SETTLE_BASE
+            for i in range(10):
+                w_to.sample(1.05 + i * 0.04, [0.0, 0.0, 0.0])
+            w_to.autotuner.tick(1.45)  # SETTLE_BASE -> WAIT_STEP_ACK
+            w_to.autotuner.tick(1.46)  # WAIT_STEP_ACK -> OBSERVE (R1)
+            for i in range(25):
+                t_s = 1.50 + i * 0.04
+                y_s = 200.0 * (1.0 - np.exp(-max(0.0, t_s - 1.50) / 0.18))
+                w_to.sample(t_s, [200.0, float(y_s), 450.0])
+            w_to.autotuner.tick(2.60)  # finishes R1 cleanly, advances to PREPARE(R2)
+            self.assertIsNotNone(w_to.autotuner.engine.best_params)
+            self.assertEqual(w_to.autotuner.state, w_to.autotuner.PREPARE)
+
+            w_to.autotuner.tick(2.61)  # PREPARE (R2) -> WAIT_BASE_ACK
+            w_to.autotuner.tick(2.62)  # WAIT_BASE_ACK -> SETTLE_BASE
+            for i in range(10):
+                w_to.sample(2.65 + i * 0.04, [0.0, 0.0, 0.0])
+            w_to.autotuner.tick(3.05)  # SETTLE_BASE -> WAIT_STEP_ACK
+            w_to.autotuner.tick(3.06)  # WAIT_STEP_ACK -> OBSERVE (R2)
+            sent_to.clear()
+            w_to.autotuner.tick(w_to.autotuner.wall_deadline + 1.0)  # telemetry dropped!
+            self.assertFalse(w_to.autotuner.active)
+            self.assertEqual(sent_to[0], "@STOP")
+            self.assertTrue(any("SPD.KP=2.0000" in c for c in sent_to))
+            self.assertTrue(any("SPD.TGT=10.0000" in c for c in sent_to))
+            self.assertFalse(any("SPD.TGT=200.0000" in c for c in sent_to))
+            st_to = w_to.autotune_status.text()
+            self.assertIn("阶跃采样中断", st_to)
+            self.assertIn("此前已测最优参考", st_to)
+            w_to.close()
+
+            # B) Device #STOP:fall during active tuning clears stale commands FIRST and keeps restore commands queued
+            w_fall = Window(Path(tmp) / "fall_order.ini")
+            w_fall.timer.stop()
+            w_fall.connected = True
+            w_fall.sim = None
+            w_fall.group.setCurrentIndex(1)
+            for k, v in (("KP", 4.0), ("KI", 20.0), ("KD", 0.0), ("TGT", 50.0)):
+                w_fall.fields[k].setValue(v)
+                w_fall.confirmed[f"SPD.{k}"] = v
+            class FakeAsyncLink:
+                def send(self, data, urgent=False):
+                    return True
+            w_fall.link = FakeAsyncLink()
+            self.assertTrue(w_fall.autotuner.start(0, 1, 0, base=0.0, target=120.0, step_seconds=2.0, max_rounds=4))
+            w_fall.commands.waiting.append(("@SPD.KP=88.0000", "SPD", False, 999))
+            w_fall.receive(b"#STOP:fall\n", 2.0)
+            queued_f = [cmd for cmd, _, _, _ in w_fall.commands.waiting]
+            pending_f = w_fall.commands.pending[0] if w_fall.commands.pending else ""
+            active_f = [pending_f, *queued_f]
+            self.assertNotIn("@SPD.KP=88.0000", active_f)
+            self.assertEqual(w_fall.autotuner.state, w_fall.autotuner.FINALIZING)
+            self.assertTrue(any("4.0000" in c for c in active_f))
+            self.assertFalse(w_fall.stop_banner.isHidden())
+            self.assertIn("倒地", w_fall.stop_banner.text())
+            # Drain all queued restore ACKs and verify clean IDLE completion
+            for _ in range(12):
+                if not w_fall.commands.pending:
+                    w_fall.commands.dispatch()
+                if not w_fall.commands.pending:
+                    break
+                cur_cmd = w_fall.commands.pending[0]
+                w_fall.commands.reply("ACK", cur_cmd.lstrip("@"))
+            self.assertFalse(w_fall.commands.busy())
+            self.assertEqual(w_fall.autotuner.state, w_fall.autotuner.IDLE)
+            self.assertIn("已恢复", w_fall.autotune_status.text())
+            w_fall.link = None
+            w_fall.close()
+
+            # C) Round 1 SETTLE_BASE rejects stale pre-start frames & oscillating motion, accepts flat droop
+            # C1: stale pre-start data only (no fresh frames after phase_t0) -> aborts cleanly
+            w_r1 = Window(Path(tmp) / "r1_settle.ini")
+            w_r1.timer.stop()
+            w_r1.connected = True
+            w_r1.sim = None
+            w_r1.group.setCurrentIndex(1)
+            for k, v in (("KP", 2.0), ("KI", 0.0), ("KD", 0.0), ("TGT", 0.0)):
+                w_r1.fields[k].setValue(v)
+                w_r1.confirmed[f"SPD.{k}"] = v
+            sent_r1 = []
+            w_r1.commands.submit = lambda cmds, quiet=False: (sent_r1.extend(cmds) or True)
+            w_r1.commands.busy = lambda: False
+            w_r1.receive(b"#NAMES:target,actual,pwm\n#ROLES:target,actual,output\n0,0,0\n", 1.0)
+            self.assertTrue(w_r1.autotuner.start(0, 1, 0, base=100.0, target=150.0, step_seconds=0.8, max_rounds=4))
+            w_r1.autotuner.tick(1.01)  # WAIT_START -> PREPARE
+            w_r1.autotuner.tick(1.02)  # PREPARE -> WAIT_BASE_ACK
+            w_r1.autotuner.tick(1.03)  # WAIT_BASE_ACK -> SETTLE_BASE (phase_t0 = 1.0)
+            sent_r1.clear()
+            w_r1.autotuner.tick(w_r1.autotuner.wall_deadline + 0.5)
+            self.assertFalse(w_r1.autotuner.active)
+            self.assertIn("基准段未收到有效反馈", w_r1.autotune_status.text())
+            self.assertIn("@STOP", sent_r1)
+            self.assertFalse(any("SPD.TGT=150.0000" in c for c in sent_r1))
+
+            # C2: fresh samples actively decelerating (not flat) -> rejects start with @STOP
+            w_r1.clear_plot()
+            w_r1.receive(b"#NAMES:target,actual,pwm\n#ROLES:target,actual,output\n100,90,0\n", 2.0)
+            self.assertTrue(w_r1.autotuner.start(0, 1, 0, base=100.0, target=150.0, step_seconds=0.8, max_rounds=4))
+            w_r1.autotuner.tick(2.01); w_r1.autotuner.tick(2.02); w_r1.autotuner.tick(2.03)
+            for i in range(12):
+                w_r1.sample(2.05 + i * 0.10, [100.0, 90.0 - i * 5.0, 0.0])
+            sent_r1.clear()
+            w_r1.autotuner.tick(4.50)
+            self.assertFalse(w_r1.autotuner.active)
+            self.assertIn("起始基准未平稳", w_r1.autotune_status.text())
+            self.assertIn("@STOP", sent_r1)
+            self.assertFalse(any("SPD.TGT=150.0000" in c for c in sent_r1))
+
+            # C3: fresh flat steady P-only droop at y=80 when base=100 -> allowed after settle_cap
+            w_r1.clear_plot()
+            w_r1.receive(b"#NAMES:target,actual,pwm\n#ROLES:target,actual,output\n100,80,200\n", 5.0)
+            self.assertTrue(w_r1.autotuner.start(0, 1, 0, base=100.0, target=150.0, step_seconds=0.8, max_rounds=4))
+            w_r1.autotuner.tick(5.01); w_r1.autotuner.tick(5.02); w_r1.autotuner.tick(5.03)
+            for i in range(16):
+                w_r1.sample(5.05 + i * 0.06, [100.0, 80.0, 200.0])
+            sent_r1.clear()
+            w_r1.autotuner.tick(6.00)
+            self.assertEqual(w_r1.autotuner.state, w_r1.autotuner.WAIT_STEP_ACK)
+            self.assertAlmostEqual(w_r1.autotuner.base_y, 80.0, places=3)
+            self.assertTrue(any("SPD.TGT=150.0000" in c for c in sent_r1))
+            w_r1.close()
+
 
 if __name__ == "__main__":
     unittest.main()

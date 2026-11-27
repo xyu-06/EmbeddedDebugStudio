@@ -94,7 +94,7 @@ class DeviceSession(CommandQueue):
             self.failed("发送队列已满")
 
 
-    def failed(self,msg):
+    def failed(self,msg,notify_autotune=True):
         if getattr(self.ui,"generator",None):
             self.ui.stop_generator("命令失败，发生器已停止",restore=False)
         was_pending = self.pending
@@ -112,7 +112,7 @@ class DeviceSession(CommandQueue):
         if self.ui.retry_command == "@STOP":
             self.ui.stop_banner.setText("急停未获确认 · 请检查设备输出")
         self.clear()
-        if at_engaged:
+        if notify_autotune and at_engaged:
             at.on_command_failed(msg)
         self.ui.feedback(msg,True)
 
