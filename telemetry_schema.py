@@ -6,7 +6,7 @@ CANONICAL_CHANNELS: dict[str, tuple[str, str, str]] = {
     "pitch": ("°", "actual", "实际倾角"),
     "gyro_pitch": ("°/s", "other", "俯仰角速度"),
     "pwm": ("PWM", "output", "电机输出"),
-    "wheel_speed": ("cnt/s", "other", "轮速"),
+    "wheel_speed": ("RPM", "other", "轮速"),
     "roll": ("°", "other", "横滚角"),
     "yaw": ("°", "other", "航向角"),
     "ax_g": ("g", "other", "加速度X"),

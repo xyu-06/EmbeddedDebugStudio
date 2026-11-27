@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 import numpy as np
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 from autotune import AutoTuner, evaluate_step
+from autotune_ui import AutoTuneController
 from diagnostics import RuntimeMonitor, analyze_frame_timing, dominant_fft, format_c_code
 from engine import Lines, MAX_CHANNELS, REF_BASE, Simulator, match_ack, step_metrics
 from generator import TargetGenerator
@@ -1727,7 +1728,7 @@ class GuiChecks(unittest.TestCase):
             self.assertEqual(w.actual_ch.currentData(), 1)
             self.assertIn("°", w.units[1])
             self.assertIn("°/s", w.units[2])
-            self.assertEqual(w.units[4], "cnt/s")
+            self.assertEqual(w.units[4], "RPM")
 
             imu = w.imu_page
             imu.connected = True
@@ -2470,6 +2471,551 @@ class GuiChecks(unittest.TestCase):
             self.assertIn(b"6.0000", dlink.flushed[0])
             self.assertTrue(rlink.flushed)
             self.assertIn(b"J,0,0\nS\n", rlink.flushed[0])
+
+    def test_universal_bluetooth_spp_tokens_heartbeat_and_handoff(self):
+        from bluetooth_link import (
+            BluetoothRfcommLink,
+            format_bt_port_token,
+            normalize_port_identity,
+            parse_bt_port_token,
+        )
+
+        tok = format_bt_port_token("00260102eac0", "HC-05")
+        self.assertEqual(tok, "BT:00:26:01:02:EA:C0 (HC-05)")
+        self.assertEqual(parse_bt_port_token(tok), ("00:26:01:02:EA:C0", "HC-05"))
+        self.assertEqual(parse_bt_port_token("BT:00:26:01:02:EA:C0"), ("00:26:01:02:EA:C0", ""))
+        self.assertIsNone(parse_bt_port_token("COM9"))
+        self.assertEqual(normalize_port_identity(tok), "BT:00:26:01:02:EA:C0")
+        self.assertEqual(normalize_port_identity(" com9 "), "COM9")
+
+        rf = BluetoothRfcommLink("00:26:01:02:EA:C0", name="HC-05")
+        rf.keepalive(True)
+        self.assertEqual(rf.next_write(10.0), BluetoothRfcommLink.HEARTBEAT)
+        self.assertIsNone(rf.next_write(10.1))
+        self.assertEqual(rf.next_write(10.25), BluetoothRfcommLink.HEARTBEAT)
+        rf.ping()
+        self.assertEqual(rf.next_write(10.26), BluetoothRfcommLink.HEARTBEAT)
+        rf.send(b"@ANG.GET\n")
+        self.assertEqual(rf.next_write(10.27), b"@ANG.GET\n")
+        rf.flush_and_close(b"@STOP\n")
+        self.assertFalse(rf.heartbeat)
+
+        class DummyLink:
+            def __init__(self, *args, **kwargs):
+                self.started = False
+                self.closed = type("E", (), {"set": lambda self: None})()
+                self.flushed = []
+
+            def start(self):
+                self.started = True
+
+            def take(self):
+                return [], 0
+
+            def keepalive(self, enabled):
+                pass
+
+            def flush_and_close(self, final_data=b"", timeout=0.25):
+                self.flushed.append(final_data)
+
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                return None
+
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "bt_all.ini")
+            w.timer.stop()
+            w.serial_page.poll_timer.stop()
+            w.imu_page.timer.stop()
+            w.remote_page.timer.stop()
+            handoffs = []
+            w.confirm_handoff = lambda old, new, port: (handoffs.append((old, new, port)), True)[1]
+
+            with patch("main.BluetoothRfcommLink", DummyLink), \
+                 patch("imu_studio.BluetoothRfcommLink", DummyLink), \
+                 patch("serial_studio.BluetoothRfcommLink", DummyLink):
+                w.source.setCurrentIndex(0)
+                w.port.setCurrentText(tok)
+                w.toggle_connection()
+                self.assertIsNotNone(w.link)
+                self.assertEqual(normalize_port_identity(w.active_port()), "BT:00:26:01:02:EA:C0")
+
+                # Opening same BT MAC from IMU page triggers handoff from PID page
+                w.imu_page.source_box.setCurrentIndex(0)
+                w.imu_page.port_box.setCurrentText("BT:00:26:01:02:EA:C0")
+                w.imu_page.toggle_source()
+                self.assertEqual(len(handoffs), 1)
+                self.assertIsNone(w.link)
+                self.assertIsNotNone(w.imu_page.link)
+
+                # Opening same BT MAC from Serial page triggers handoff from IMU page
+                w.serial_page.port_box.setCurrentText(tok)
+                w.serial_page.toggle_port()
+                self.assertEqual(len(handoffs), 2)
+                self.assertIsNone(w.imu_page.link)
+                self.assertIsNotNone(w.serial_page.link)
+                w.serial_page.disconnect_port()
+                w.serial_page.link = None
+            w.close()
+
+    def test_spd_loop_channel_binding_and_feedback_stall_watchdog(self):
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "spd_watchdog.ini")
+            w.timer.stop()
+            w.serial_page.poll_timer.stop()
+            w.imu_page.timer.stop()
+            w.remote_page.timer.stop()
+            w.connected = True
+
+            # 1) Balance-car 5-col stream: ANG uses pitch (CH2/CH1), SPD uses wheel_speed (CH5) with target_col=None
+            w.receive(
+                b"#NAMES:pitch_target,pitch,gyro_pitch,pwm,wheel_speed\n"
+                b"#ROLES:target,actual,other,output,other\n"
+                b"0.15,0.20,1.0,15.0,12.5\n",
+                1.0,
+            )
+            self.assertEqual(w.units[4], "RPM")
+
+            w.group.setCurrentIndex(1)  # SPD
+            act_spd, out_spd = w.autotuner.detect_channels(group="SPD")
+            self.assertEqual(act_spd, 4)
+            self.assertEqual(out_spd, 3)
+            w.autotuner.actual_col = act_spd
+            self.assertIsNone(w.autotuner._find_target_col(group="SPD"))
+            conflict, _ = w.autotuner.has_role_conflict(group="SPD")
+            self.assertFalse(conflict)
+            self.assertEqual(w.autotuner.missing_speed_feedback_error("SPD"), "")
+
+            # Switching back to ANG still detects pitch (CH2) & pitch_target (CH1)
+            w.group.setCurrentIndex(0)  # ANG
+            act_ang, _ = w.autotuner.detect_channels(group="ANG")
+            self.assertEqual(act_ang, 1)
+            w.autotuner.actual_col = act_ang
+            self.assertEqual(w.autotuner._find_target_col(group="ANG"), 0)
+
+            # 2) Angle-only stream (no wheel_speed) blocks SPD autotune start cleanly
+            w.group.setCurrentIndex(1)  # SPD
+            w.channel_preferences[1] = None
+            w.receive(
+                b"#NAMES:pitch_target,pitch,gyro_pitch,pwm\n"
+                b"#ROLES:target,actual,other,output\n"
+                b"0.15,0.20,1.0,15.0\n",
+                2.0,
+            )
+            self.assertTrue(w.autotuner.missing_speed_feedback_error("SPD"))
+            self.assertFalse(w.autotuner.start(0, 1, 1, 0.0, 30.0))
+
+            # 3) Complete feedback stall during OBSERVE stops heartbeat & queues @STOP within ~1s (before 6s wall_deadline)
+            sent_packets = []
+            keepalive_calls = []
+
+            class FakeLink:
+                def send(self, data, urgent=False):
+                    sent_packets.append((bytes(data), urgent))
+                    return True
+
+                def keepalive(self, enabled):
+                    keepalive_calls.append(bool(enabled))
+
+            w.link = FakeLink()
+            w.send_heartbeat = True
+            w.confirmed.update({"SPD.KP": 0.045, "SPD.KI": 0.005, "SPD.KD": 0.0, "SPD.TGT": 0.0})
+            w.autotuner.group = "SPD"
+            w.autotuner.actual_col = 4
+            w.autotuner.output_col = 3
+            w.autotuner.target_col = None
+            w.autotuner.saved_before = {"KP": 0.045, "KI": 0.005, "KD": 0.0, "TGT": 0.0}
+            w.autotuner.engine = AutoTuner(0, 1, 1, w.autotuner.saved_before, w.rules["SPD"], 0.0, 30.0, 2.0, 6)
+            w.autotuner.current_cand = w.autotuner.engine.next_candidate()[1]
+            w.autotuner.current_tag = "基线"
+            w.autotuner.base_y = 0.0
+            w.autotuner.step_t0 = 10.0
+            w.autotuner.step_t0_resolved = True
+            w.autotuner.last_valid_actual_t = 10.0
+            w.autotuner.last_valid_actual_wall = 100.0
+            w.autotuner.wall_deadline = 106.0
+            w.autotuner.state = AutoTuneController.OBSERVE
+
+            # At 101.05s (1.05s stall, well before 106.0s wall_deadline), tick() must abort and kill heartbeat + queue @STOP
+            w.autotuner.tick(101.05)
+            w.commands.dispatch()
+            self.assertEqual(w.autotuner.state, AutoTuneController.FINALIZING)
+            self.assertFalse(w.send_heartbeat)
+            self.assertIn(False, keepalive_calls)
+            self.assertTrue(sent_packets and sent_packets[0][0] == b"@STOP\n")
+            w.link = None
+            w.close()
+
+    def test_autotune_probe_cap_scoring_gates_climbing_and_spd_brake_reverify(self):
+        from autotune import evaluate_step_and_brake, identify_from_p_step, is_step_still_climbing
+        from configuration import DEFAULT_RULES
+
+        rules = dict(DEFAULT_RULES)
+
+        # 1) Small SPD initial gains (KP=0.045, KI=0.005): probe, boost & SIMC steps MUST stay capped
+        tuner_spd = AutoTuner(
+            0, 1, 0, {"KP": 0.045, "KI": 0.005, "KD": 0.0},
+            rules, base=0.0, target=30.0, step_seconds=2.0, max_rounds=8, max_ratio=2.0,
+        )
+        _, p1, tag1 = tuner_spd.next_candidate()
+        self.assertEqual(tag1, "初始基准")
+        self.assertAlmostEqual(p1["KP"], 0.045, places=4)
+        t_g = np.linspace(0.0, 2.0, 41)
+        tuner_spd.record_result(t_g, 30.0 * (1.0 - np.exp(-t_g / 0.35)), base_y=0.0)
+
+        _, p2, tag2 = tuner_spd.next_candidate()
+        self.assertEqual(tag2, "阶跃辨识")
+        self.assertAlmostEqual(p2["KP"], round(0.045 * 0.65, 4), places=4)
+        self.assertLessEqual(p2["KP"], 0.045 * 2.0)
+        tuner_spd.record_result(t_g, 20.0 * (1.0 - np.exp(-t_g / 0.30)), base_y=0.0)
+
+        _, p3, tag3 = tuner_spd.next_candidate()
+        self.assertLessEqual(p3["KP"], 0.045 * 2.0 + 1e-6)
+        self.assertLessEqual(p3["KI"], 0.005 * 2.0 + 1e-6)
+
+        # 2) Unified baseline/duration scoring: Curve A (-60 -> 30, tau=0.25) has 7.5x cumulative error of B (0 -> 30, tau=0.10)
+        ev_a = evaluate_step(
+            t_g, -60.0 + 90.0 * (1.0 - np.exp(-t_g / 0.25)),
+            base_y=-60.0, goal_y=30.0, cmd_base=0.0, ref_duration=2.0,
+        )
+        ev_b = evaluate_step(
+            t_g, 30.0 * (1.0 - np.exp(-t_g / 0.10)),
+            base_y=0.0, goal_y=30.0, cmd_base=0.0, ref_duration=2.0,
+        )
+        self.assertGreater(ev_a.score, ev_b.score)
+        ev_short = evaluate_step(
+            t_g[:13], 30.0 * (1.0 - np.exp(-t_g[:13] / 0.25)),
+            base_y=0.0, goal_y=30.0, cmd_base=0.0, ref_duration=2.0,
+        )
+        self.assertFalse(ev_short.valid)
+        self.assertFalse(ev_short.passed_gates)
+
+        # 3) Sustained 69% PWM saturation: fails gate, loses to gate-passing curve, and blocks identify/boost
+        u_sat = np.full_like(t_g, 990.0)
+        u_sat[int(len(t_g) * 0.69):] = 120.0
+        ev_sat = evaluate_step(
+            t_g, 30.0 * (1.0 - np.exp(-t_g / 0.20)),
+            base_y=0.0, goal_y=30.0, outputs=u_sat, output_limit=1000.0, cmd_base=0.0, ref_duration=2.0,
+        )
+        self.assertTrue(ev_sat.saturated)
+        self.assertFalse(ev_sat.passed_gates)
+        self.assertEqual(
+            identify_from_p_step(
+                t_g, 24.0 * (1.0 - np.exp(-t_g / 0.25)), 0.0, 30.0, 0.045,
+                outputs=u_sat, output_limit=1000.0,
+            ),
+            [],
+        )
+
+        # Saturated candidate even with tiny tracking error cannot beat a clean gate-passing candidate
+        tuner_gate = AutoTuner(
+            0, 1, 1, {"KP": 0.045, "KI": 0.005, "KD": 0.0},
+            rules, base=0.0, target=30.0, step_seconds=2.0, max_rounds=6, output_limit=1000.0,
+        )
+        tuner_gate.next_candidate()
+        tuner_gate.record_result(t_g, 30.0 * (1.0 - np.exp(-t_g / 0.35)), base_y=0.0, outputs=np.full_like(t_g, 180.0))
+        tuner_gate.next_candidate()
+        ev_r2 = tuner_gate.record_result(t_g, 30.0 * (1.0 - np.exp(-t_g / 0.12)), base_y=0.0, outputs=u_sat)
+        self.assertFalse(ev_r2.passed_gates)
+        self.assertAlmostEqual(tuner_gate.best_params["KP"], 0.045, places=4)
+
+        # 4) Still-climbing curve (0.4s vs 3.0s on same tau_cl=0.8s plant) & poor-fit curve guard
+        t_04 = np.linspace(0.0, 0.4, 21)
+        y_04 = 20.0 * (1.0 - np.exp(-t_04 / 0.8))
+        self.assertTrue(is_step_still_climbing(t_04, y_04, 0.0))
+        self.assertEqual(identify_from_p_step(t_04, y_04, 0.0, 30.0, 0.045), [])
+
+        t_30 = np.linspace(0.0, 3.0, 61)
+        y_30 = 20.0 * (1.0 - np.exp(-t_30 / 0.8))
+        self.assertFalse(is_step_still_climbing(t_30, y_30, 0.0))
+        self.assertTrue(identify_from_p_step(t_30, y_30, 0.0, 30.0, 0.045))
+
+        y_bad_fit = 20.0 * (1.0 - np.exp(-t_30 / 0.4)) + 10.0 * np.sin(8.0 * t_30) * np.exp(-0.1 * t_30)
+        self.assertEqual(identify_from_p_step(t_30, y_bad_fit, 0.0, 30.0, 0.045, mode=0), [])
+
+        # 5) Bidirectional evaluate_step_and_brake + AutoTuner reverify_winner (confirm vs revert)
+        t_b = np.linspace(0.0, 3.0, 61)
+        ev_good_brk = evaluate_step_and_brake(
+            t_g, 30.0 * (1.0 - np.exp(-t_g / 0.30)),
+            t_b, 30.0 * np.exp(-t_b / 0.45) - 2.0 * np.exp(-t_b / 0.8) * np.sin(2.5 * t_b),
+            0.0, 30.0, start_outputs=np.full_like(t_g, 150.0), brake_outputs=np.full_like(t_b, 140.0),
+            start_pitch=np.full_like(t_g, 1.5), brake_pitch=np.full_like(t_b, -2.0),
+            output_limit=1000.0, ref_duration=2.0, brake_duration=3.0,
+        )
+        ev_bad_pitch = evaluate_step_and_brake(
+            t_g, 30.0 * (1.0 - np.exp(-t_g / 0.25)),
+            t_b, 30.0 * np.exp(-t_b / 0.40),
+            0.0, 30.0, start_outputs=np.full_like(t_g, 150.0), brake_outputs=np.full_like(t_b, 140.0),
+            start_pitch=np.full_like(t_g, 14.5), brake_pitch=np.full_like(t_b, -3.0),
+            output_limit=1000.0, ref_duration=2.0, brake_duration=3.0,
+        )
+        self.assertTrue(ev_good_brk.passed_gates)
+        self.assertFalse(ev_bad_pitch.passed_gates)
+        self.assertIn("倾角超限", ev_bad_pitch.note)
+
+        def run_reverify_case(score_mode):
+            tu = AutoTuner(
+                0, 1, 1, {"KP": 0.045, "KI": 0.005, "KD": 0.0},
+                rules, base=0.0, target=30.0, step_seconds=2.0, max_rounds=4,
+                output_limit=1000.0, eval_brake=True, brake_seconds=3.0, reverify_winner=True,
+            )
+            tags_seen = []
+            while True:
+                nxt = tu.next_candidate()
+                if nxt is None:
+                    break
+                _, cand, tag = nxt
+                tags_seen.append(tag)
+                is_base = abs(cand["KP"] - 0.045) < 1e-4 and abs(cand["KI"] - 0.005) < 1e-4
+                if score_mode == "clear_win":
+                    tau = 0.65 if is_base else 0.25
+                else:
+                    # Marginally better only once (noise dominates on retest)
+                    if tag == "当前基准":
+                        tau = 0.42
+                    elif tag == "复测原参":
+                        tau = 0.36
+                    elif tag == "复测候选":
+                        tau = 0.41
+                    else:
+                        tau = 0.38 if cand["KP"] > 0.045 else 0.70
+                tu.record_result(
+                    t_g, 30.0 * (1.0 - np.exp(-t_g / tau)),
+                    base_y=0.0, outputs=np.full_like(t_g, 150.0),
+                    brake_times=t_b, brake_actual=30.0 * np.exp(-t_b / (tau * 1.4)),
+                    brake_outputs=np.full_like(t_b, 140.0),
+                    start_pitch=np.full_like(t_g, 1.5), brake_pitch=np.full_like(t_b, -1.5),
+                )
+            return tu, tags_seen
+
+        tu_win, tags_win = run_reverify_case("clear_win")
+        self.assertIn("复测候选", tags_win)
+        self.assertIn("复测原参", tags_win)
+        self.assertTrue(tu_win.winner_verified)
+        self.assertGreater(tu_win.best_params["KP"], 0.045)
+
+        tu_keep, tags_keep = run_reverify_case("noise_revert")
+        self.assertIn("复测候选", tags_keep)
+        self.assertIn("复测原参", tags_keep)
+        self.assertTrue(tu_keep.kept_baseline)
+        self.assertAlmostEqual(tu_keep.best_params["KP"], 0.045, places=4)
+        self.assertAlmostEqual(tu_keep.best_params["KI"], 0.005, places=4)
+
+        # 6) AutoTuneController GUI 5-col SPD start+brake workflow & SETTLE_BASE starting-offset guard
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "bal_spd_brake.ini")
+            w.timer.stop()
+            w.serial_page.poll_timer.stop()
+            w.imu_page.timer.stop()
+            w.remote_page.timer.stop()
+            w.connected = True
+            w.sim = None
+            w.group.setCurrentIndex(1)  # SPD
+            for k, v in (("KP", 0.045), ("KI", 0.005), ("KD", 0.0), ("TGT", 0.0)):
+                w.fields[k].setValue(v)
+                w.confirmed[f"SPD.{k}"] = v
+            sent_gui = []
+            w.commands.submit = lambda cmds, quiet=False: (sent_gui.extend(cmds) or True)
+            w.commands.busy = lambda: False
+
+            w.receive(
+                b"#NAMES:pitch_target,pitch,gyro_pitch,pwm,wheel_speed\n"
+                b"#ROLES:target,actual,other,output,other\n"
+                b"0.15,0.20,0.5,25.0,0.0\n",
+                1.0,
+            )
+            self.assertTrue(
+                w.autotuner.start(
+                    0, 1, 1, base=0.0, target=30.0, step_seconds=2.0,
+                    max_rounds=3, hold_target=False, output_limit=950.0,
+                    eval_brake=True, reverify_winner=False,
+                )
+            )
+            self.assertEqual(w.autotuner.pitch_col, 1)
+            w.autotuner.tick(1.01)  # WAIT_START + PREPARE (R1) -> WAIT_BASE_ACK
+            w.autotuner.tick(1.02)  # WAIT_BASE_ACK -> SETTLE_BASE
+
+            # Flat but non-zero speed 12 RPM at base=0 (> 15% of 30) past settle_cap=1.4s must NOT advance!
+            sent_gui.clear()
+            for i in range(11):
+                t_i = 1.10 + i * 0.10
+                w.sample(t_i, [0.15, 0.2, 0.2, 40.0, 12.0])
+                w.autotuner.tick(t_i)
+            self.assertEqual(w.autotuner.state, AutoTuneController.SETTLE_BASE)
+            self.assertFalse(any("SPD.TGT=30.0000" in c for c in sent_gui))
+
+            # Now settle cleanly near 0 RPM for > 0.18s (clears recent 0.15s window before max_settle_wait=2.50s)
+            for i in range(6):
+                t_i = 2.16 + i * 0.05
+                w.sample(t_i, [0.15, 0.2, 0.1, 20.0, 0.2])
+            w.autotuner.tick(2.42)
+            self.assertEqual(w.autotuner.state, AutoTuneController.WAIT_STEP_ACK)
+            w.autotuner.tick(2.43)  # -> OBSERVE
+
+            # Feed 2.05s start curve with moderate pitch (<= 3 deg)
+            for i in range(42):
+                dt_s = i * 0.05
+                t_i = 2.48 + dt_s
+                rpm = 30.0 * (1.0 - math.exp(-dt_s / 0.35))
+                w.sample(t_i, [1.2, 1.5, 2.0, 140.0, rpm])
+                if i == 20:
+                    w.autotuner.tick(t_i)
+            sent_gui.clear()
+            w.autotuner.tick(4.54)
+            self.assertEqual(w.autotuner.state, AutoTuneController.WAIT_BRAKE_ACK)
+            self.assertEqual(sent_gui, ["@SPD.TGT=0.0000"])  # NEVER @SPD.RST before braking!
+
+            w.autotuner.tick(5.27)  # -> OBSERVE_BRAKE
+            brk_start = w.autotuner.brake_t0
+            for i in range(58):
+                dt_s = (i + 1) * 0.05
+                t_i = brk_start + dt_s
+                rpm = 29.0 * math.exp(-dt_s / 0.55)
+                w.sample(t_i, [-1.0, -1.2, -2.0, 130.0, rpm])
+                if i in (20, 40):
+                    w.autotuner.tick(t_i)
+            w.autotuner.tick(brk_start + 2.95)
+            self.assertEqual(w.autotuner.state, AutoTuneController.PREPARE)
+            self.assertIsNotNone(w.autotuner.engine.best_eval.brake_settle_s)
+            self.assertTrue(w.autotuner.engine.best_eval.passed_gates)
+            w.close()
+
+    def test_autotune_writeback_gate_start_tol_reverify_inconclusive_and_settle_stall(self):
+        from autotune import evaluate_step_and_brake
+        from configuration import DEFAULT_RULES
+
+        rules = dict(DEFAULT_RULES)
+        t_s = np.linspace(0.0, 2.8, 57)
+        t_b = np.linspace(0.0, 3.0, 61)
+
+        # 1) All 3 candidates exceed 12 deg pitch gate -> has_qualified_winner() is False,
+        #    AutoTuneController MUST @STOP & restore original params instead of writing back!
+        with TemporaryDirectory() as tmp:
+            w = Window(Path(tmp) / "all_fail_gates.ini")
+            w.timer.stop(); w.serial_page.poll_timer.stop(); w.imu_page.timer.stop(); w.remote_page.timer.stop()
+            w.connected = True; w.sim = None
+            w.group.setCurrentIndex(1)  # SPD
+            for k, v in (("KP", 0.05), ("KI", 0.018), ("KD", 0.0), ("TGT", 0.0)):
+                w.fields[k].setValue(v); w.confirmed[f"SPD.{k}"] = v
+            sent_gate = []
+            w.commands.submit = lambda cmds, quiet=False: (sent_gate.extend(cmds) or True)
+            w.commands.busy = lambda: False
+
+            w.autotuner.group = "SPD"
+            w.autotuner.actual_col = 4
+            w.autotuner.output_col = 3
+            w.autotuner.pitch_col = 1
+            w.autotuner.saved_before = {"KP": 0.05, "KI": 0.018, "KD": 0.0, "TGT": 0.0}
+            w.autotuner.engine = AutoTuner(
+                0, 1, 1, w.autotuner.saved_before, rules, 0.0, 30.0,
+                step_seconds=2.0, max_rounds=3, output_limit=950.0, eval_brake=True,
+            )
+            for _ in range(3):
+                _, cand, tag = w.autotuner.engine.next_candidate()
+                w.autotuner.current_cand, w.autotuner.current_tag = cand, tag
+                ev = w.autotuner.engine.record_result(
+                    t_s, 30.0 * (1.0 - np.exp(-t_s / 0.35)), base_y=0.0, outputs=np.full_like(t_s, 140.0),
+                    brake_times=t_b, brake_actual=30.0 * np.exp(-t_b / 0.55), brake_outputs=np.full_like(t_b, 120.0),
+                    start_pitch=np.full_like(t_s, 14.0), brake_pitch=np.full_like(t_b, -1.0),
+                )
+                self.assertTrue(ev.valid)
+                self.assertFalse(ev.passed_gates)
+            self.assertFalse(w.autotuner.engine.has_qualified_winner())
+            sent_gate.clear()
+            w.autotuner.state = AutoTuneController.PREPARE
+            w.autotuner.tick(10.0)
+            self.assertIn("@STOP", sent_gate)
+            self.assertTrue(any("SPD.KP=0.0500" in c for c in sent_gate))
+            self.assertIn("无候选通过安全验收门槛", w.autotune_status.text())
+            self.assertIsNotNone(w.autotuner.last_best_ref)
+            w.close()
+
+        # 2) Start-phase acceptance requires reaching near target (±5 RPM), rejecting 8.1 RPM steady droop!
+        ev_weak = evaluate_step_and_brake(
+            t_s, 8.1 * (1.0 - np.exp(-t_s / 0.35)),
+            t_b, 8.1 * np.exp(-t_b / 0.35),
+            0.0, 30.0, start_outputs=np.full_like(t_s, 120.0), brake_outputs=np.full_like(t_b, 90.0),
+            start_pitch=np.full_like(t_s, 1.5), brake_pitch=np.full_like(t_b, -1.0),
+            output_limit=950.0, ref_duration=2.8, brake_duration=3.0, settle_band=5.0,
+        )
+        ev_strong = evaluate_step_and_brake(
+            t_s, 27.5 * (1.0 - np.exp(-t_s / 0.35)),
+            t_b, 27.5 * np.exp(-t_b / 0.50),
+            0.0, 30.0, start_outputs=np.full_like(t_s, 140.0), brake_outputs=np.full_like(t_b, 110.0),
+            start_pitch=np.full_like(t_s, 1.8), brake_pitch=np.full_like(t_b, -1.5),
+            output_limit=950.0, ref_duration=2.8, brake_duration=3.0, settle_band=5.0,
+        )
+        self.assertFalse(ev_weak.passed_gates)
+        self.assertIn("尾差过大", ev_weak.note)
+        self.assertTrue(ev_strong.passed_gates)
+
+        # 3) Baseline passes Round 1, fails retest -> auto-retries baseline once; if still fails, marks inconclusive & blocks auto-writeback
+        tu_inc = AutoTuner(
+            0, 1, 1, {"KP": 0.05, "KI": 0.018, "KD": 0.0},
+            rules, base=0.0, target=30.0, step_seconds=2.8, max_rounds=4,
+            output_limit=950.0, eval_brake=True, brake_seconds=3.0, reverify_winner=True,
+        )
+        tags_inc = []
+        while True:
+            nxt = tu_inc.next_candidate()
+            if nxt is None:
+                break
+            _, cand, tag = nxt
+            tags_inc.append(tag)
+            if tag in ("复测原参", "补测原参"):
+                sp, bp = np.full_like(t_s, 14.0), np.full_like(t_b, -2.0)  # baseline retests fail pitch gate
+                tau = 0.50
+            elif tag == "当前基准":
+                sp, bp = np.full_like(t_s, 2.0), np.full_like(t_b, -1.5)
+                tau = 0.50
+            else:
+                sp, bp = np.full_like(t_s, 1.5), np.full_like(t_b, -1.2)
+                tau = 0.25 if cand["KP"] > 0.05 else 0.65
+            tu_inc.record_result(
+                t_s, 30.0 * (1.0 - np.exp(-t_s / tau)),
+                base_y=0.0, outputs=np.full_like(t_s, 150.0),
+                brake_times=t_b, brake_actual=30.0 * np.exp(-t_b / (tau * 1.3)),
+                brake_outputs=np.full_like(t_b, 130.0),
+                start_pitch=sp, brake_pitch=bp,
+            )
+        self.assertIn("复测原参", tags_inc)
+        self.assertIn("补测原参", tags_inc)
+        self.assertTrue(tu_inc.reverify_inconclusive)
+        self.assertFalse(tu_inc.winner_verified)
+        self.assertFalse(tu_inc.has_qualified_winner())
+        self.assertAlmostEqual(tu_inc.best_params["KP"], 0.05, places=4)
+        self.assertIn("对照不足", tu_inc.finish_reason)
+
+        # 4) SETTLE_BASE empty-frame stall watchdog shares unified ~1s timeout (does NOT wait 5.5s!)
+        with TemporaryDirectory() as tmp:
+            w_st = Window(Path(tmp) / "settle_empty_stall.ini")
+            w_st.timer.stop(); w_st.serial_page.poll_timer.stop(); w_st.imu_page.timer.stop(); w_st.remote_page.timer.stop()
+            w_st.connected = True; w_st.sim = None
+            w_st.group.setCurrentIndex(1)
+            for k, v in (("KP", 0.05), ("KI", 0.018), ("KD", 0.0), ("TGT", 0.0)):
+                w_st.fields[k].setValue(v); w_st.confirmed[f"SPD.{k}"] = v
+            sent_st = []
+            w_st.commands.submit = lambda cmds, quiet=False: (sent_st.extend(cmds) or True)
+            w_st.commands.busy = lambda: False
+            w_st.autotuner.group = "SPD"
+            w_st.autotuner.actual_col = 4
+            w_st.autotuner.saved_before = {"KP": 0.05, "KI": 0.018, "KD": 0.0, "TGT": 0.0}
+            w_st.autotuner.engine = AutoTuner(0, 1, 1, w_st.autotuner.saved_before, rules, 0.0, 30.0, 2.8, 4)
+            w_st.autotuner.current_cand = w_st.autotuner.engine.next_candidate()[1]
+            w_st.autotuner.current_tag = "当前基准"
+            w_st.autotuner.phase_t0 = 10.0
+            w_st.autotuner.last_valid_actual_t = 10.0
+            w_st.autotuner.last_valid_actual_wall = 100.0
+            w_st.autotuner.wall_deadline = 107.0
+            w_st.autotuner.state = AutoTuneController.SETTLE_BASE
+            # At 101.30s (1.30s stall with 0 rows >= phase_t0, well before 107s wall_deadline) -> @STOP immediately!
+            w_st.autotuner.tick(101.30)
+            self.assertFalse(w_st.autotuner.active)
+            self.assertIn("@STOP", sent_st)
+            self.assertIn("基准段未收到有效反馈", w_st.autotune_status.text())
+            w_st.close()
 
 
 if __name__ == "__main__":

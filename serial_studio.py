@@ -14,6 +14,13 @@ import serial
 from serial.tools import list_ports
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 
+from bluetooth_link import (
+    BluetoothRfcommLink,
+    discover_bluetooth_devices,
+    format_bt_port_token,
+    parse_bt_port_token,
+)
+from bluetooth_ui import BluetoothPickerDialog
 from transport import SerialLink
 
 
@@ -270,9 +277,11 @@ class SerialAssistantPage(W.QWidget):
         self.port_box = W.QComboBox()
         self.port_box.setEditable(True)
         self.refresh_btn = self._btn("刷新", self.refresh_ports)
+        self.bt_btn = self._btn("🔵 蓝牙", self.pick_bluetooth_device)
+        self.bt_btn.setToolTip("搜索/配对并选择经典蓝牙 SPP 设备（如 HC-05）")
         pr = W.QHBoxLayout(); pr.setContentsMargins(0, 0, 0, 0); pr.setSpacing(4)
-        pr.addWidget(self.port_box, 1); pr.addWidget(self.refresh_btn)
-        pf.addRow("端口", pr)
+        pr.addWidget(self.port_box, 1); pr.addWidget(self.refresh_btn); pr.addWidget(self.bt_btn)
+        pf.addRow("端口/蓝牙", pr)
         self.baud_box = W.QComboBox()
         self.baud_box.setEditable(True)
         self.baud_box.addItems(["4800", "9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600", "1000000", "2000000"])
@@ -481,8 +490,30 @@ class SerialAssistantPage(W.QWidget):
                 self.port_box.setItemData(idx, f"{p.device} · {p.description}", C.Qt.ItemDataRole.ToolTipRole)
         except OSError as exc:
             self._append_sys(f"枚举串口失败：{exc}")
+        try:
+            for dev in discover_bluetooth_devices(inquiry=False):
+                if dev.authenticated:
+                    token = format_bt_port_token(dev.address, dev.name)
+                    self.port_box.addItem(token)
+                    idx = self.port_box.count() - 1
+                    self.port_box.setItemData(idx, f"蓝牙 SPP 直连 · {dev.name} ({dev.address})", C.Qt.ItemDataRole.ToolTipRole)
+        except Exception:
+            pass
         if prev:
             self.port_box.setCurrentText(prev)
+
+    def pick_bluetooth_device(self):
+        dlg = BluetoothPickerDialog(self)
+        if dlg.exec() == W.QDialog.DialogCode.Accepted and dlg.selected_port_text:
+            if self.port_box.findText(dlg.selected_port_text) < 0:
+                self.port_box.addItem(dlg.selected_port_text)
+            self.port_box.setCurrentText(dlg.selected_port_text)
+
+    def _create_link(self, opts):
+        bt = parse_bt_port_token(opts.get("url", ""))
+        if bt is not None:
+            return BluetoothRfcommLink(bt[0], channel=1, name=bt[1] or bt[0])
+        return SerialLink(opts)
 
     def toggle_port(self):
         if self.connected or self.link or self.reconnect_at is not None:
@@ -490,36 +521,40 @@ class SerialAssistantPage(W.QWidget):
             return
         name = self.port_box.currentText().strip()
         if not name:
-            self._append_sys("请先选择或输入串口名称（如 COM5）")
+            self._append_sys("请先选择或输入串口名称（如 COM5），或点击【🔵 蓝牙】")
             return
         # Check cross-module port conflict via host workbench!
         if self.host is not None and hasattr(self.host, "request_port_access"):
             if not self.host.request_port_access(self, name):
                 return
-        try:
-            baud = int(self.baud_box.currentText().strip())
-            if not 50 <= baud <= 12_000_000:
-                raise ValueError("波特率超出有效范围")
-            parity_code = ("N", "E", "O", "M", "S")[self.parity_box.currentIndex()]
-            opts = dict(
-                url=name,
-                baudrate=baud,
-                bytesize=int(self.bits_box.currentText()),
-                parity=parity_code,
-                stopbits=float(self.stops_box.currentText()),
-                rtscts=self.flow_box.currentIndex() == 1,
-                xonxoff=self.flow_box.currentIndex() == 2,
-            )
-        except ValueError as exc:
-            self._append_sys(f"参数无效：{exc}")
-            return
+        bt = parse_bt_port_token(name)
+        if bt is not None:
+            opts = dict(url=name)
+        else:
+            try:
+                baud = int(self.baud_box.currentText().strip())
+                if not 50 <= baud <= 12_000_000:
+                    raise ValueError("波特率超出有效范围")
+                parity_code = ("N", "E", "O", "M", "S")[self.parity_box.currentIndex()]
+                opts = dict(
+                    url=name,
+                    baudrate=baud,
+                    bytesize=int(self.bits_box.currentText()),
+                    parity=parity_code,
+                    stopbits=float(self.stops_box.currentText()),
+                    rtscts=self.flow_box.currentIndex() == 1,
+                    xonxoff=self.flow_box.currentIndex() == 2,
+                )
+            except ValueError as exc:
+                self._append_sys(f"参数无效：{exc}")
+                return
 
         self.reconnect_opts = opts
         self.reconnect_at = None
         self.closing = False
         self.rx_tail = None
-        self.link = SerialLink(opts)
-        if self.dtr_chk.isChecked() or self.rts_chk.isChecked():
+        self.link = self._create_link(opts)
+        if bt is None and (self.dtr_chk.isChecked() or self.rts_chk.isChecked()):
             self.link.set_modem_lines(self.dtr_chk.isChecked(), self.rts_chk.isChecked())
         self.link.start()
         self._update_conn_ui()
@@ -542,7 +577,7 @@ class SerialAssistantPage(W.QWidget):
     def _update_conn_ui(self):
         waiting = self.reconnect_at is not None
         busy = self.connected or self.link is not None or waiting
-        for w in (self.port_box, self.refresh_btn, self.baud_box, self.bits_box, self.parity_box, self.stops_box, self.flow_box):
+        for w in (self.port_box, self.refresh_btn, self.bt_btn, self.baud_box, self.bits_box, self.parity_box, self.stops_box, self.flow_box):
             w.setEnabled(not busy)
         self.conn_btn.setEnabled(not self.closing)
         self.conn_btn.setText("关闭串口" if self.connected else "取消重连" if waiting else "断开" if busy else "打开串口")
@@ -551,7 +586,10 @@ class SerialAssistantPage(W.QWidget):
         self.conn_btn.style().polish(self.conn_btn)
         if self.connected:
             port_txt = self.reconnect_opts["url"] if self.reconnect_opts else self.port_box.currentText()
-            self.conn_badge.setText(f"● 已连接 {port_txt} ({self.baud_box.currentText()})")
+            if isinstance(self.link, BluetoothRfcommLink):
+                self.conn_badge.setText(f"● 蓝牙已连 {port_txt}")
+            else:
+                self.conn_badge.setText(f"● 已连接 {port_txt} ({self.baud_box.currentText()})")
             self.conn_badge.setStyleSheet("color:#188467;font-weight:600;padding-left:6px;")
         elif waiting:
             self.conn_badge.setText("● 等待自动重连…")
@@ -862,7 +900,7 @@ class SerialAssistantPage(W.QWidget):
                     break
         elif self.reconnect_at is not None and now >= self.reconnect_at:
             self.reconnect_at = None
-            self.link = SerialLink(self.reconnect_opts)
+            self.link = self._create_link(self.reconnect_opts)
             self.link.start()
             self._update_conn_ui()
 

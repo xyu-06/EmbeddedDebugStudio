@@ -1,17 +1,19 @@
 """Qt dialog and real-time closed-loop execution controller for PID Auto-Tune."""
+import re
 from time import monotonic
 import numpy as np
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 
-from autotune import MODE_KEYS, MODES, STYLES, STRATEGIES, AutoTuner
+from autotune import MODE_KEYS, MODES, STYLES, STRATEGIES, AutoTuner, is_step_still_climbing
 from engine import KEYS, LIMIT, LOOPS, MAX_CHANNELS
 from layout_ui import combo, number, check
+from telemetry_schema import resolve_channel_semantics
 
 
 class AutoTuneController:
     """Drives AutoTuner over live serial or simulated telemetry inside Window.tick()."""
 
-    IDLE, READ_BASELINE, WAIT_START, PREPARE, WAIT_BASE_ACK, SETTLE_BASE, WAIT_STEP_ACK, OBSERVE, FINALIZING = range(9)
+    IDLE, READ_BASELINE, WAIT_START, PREPARE, WAIT_BASE_ACK, SETTLE_BASE, WAIT_STEP_ACK, OBSERVE, WAIT_BRAKE_ACK, OBSERVE_BRAKE, FINALIZING = range(11)
 
     def __init__(self, window):
         self.ui = window
@@ -21,6 +23,12 @@ class AutoTuneController:
         self.actual_col = 1
         self.output_col = None
         self.target_col = None
+        self.pitch_col = None
+        self.pitch_ref = 0.0
+        self.eval_brake = False
+        self.reverify_winner = False
+        self._start_seg = None
+        self._climbing_extended = False
         self.hold_target = True
         self.saved_before = None
         self.current_cand = None
@@ -56,18 +64,95 @@ class AutoTuneController:
             "rounds": 10,
             "hold": True,
             "output_limit": 0.0,
+            "eval_brake": False,
+            "reverify_winner": False,
         }
 
-    def has_role_conflict(self):
-        """Detect mismatch between manually selected actual channel and device #ROLES:actual."""
+    def _find_pitch_col(self):
+        count, _names, _roles, smap = self._channel_meta()
+        col = smap.get("pitch")
+        if col is not None and col < count and col != self.actual_col and col != self.output_col:
+            return col
+        return None
+
+    def _channel_meta(self):
         w = self.ui
-        roles = list(getattr(w, "channel_roles", []))[:w.count]
-        declared_actual = next((i for i, r in enumerate(roles) if r == "actual"), None)
+        count = max(0, min(int(w.count), MAX_CHANNELS))
+        raw_names = [re.sub(r"\s*\[[^\]]*\]$", "", str(n or "")).strip() for n in w.names()[:count]]
+        roles = list(getattr(w, "channel_roles", []))[:count]
+        return count, raw_names, roles, resolve_channel_semantics(raw_names)
+
+    @staticmethod
+    def _has_target_token(text):
+        low = str(text or "").lower()
+        return ("目标" in low) or bool(re.search(r"(?:^|[_\W])(target|setpoint|sp|tgt|ref)(?:$|[_\W])", low))
+
+    @staticmethod
+    def _has_angle_token(text):
+        low = str(text or "").lower()
+        return any(t in low for t in ("pitch", "angle", "tilt", "倾角", "roll", "yaw"))
+
+    def _find_speed_actual_col(self):
+        count, names, _roles, smap = self._channel_meta()
+        for key in ("actual_rpm", "wheel_speed"):
+            if key in smap and smap[key] < count:
+                return smap[key]
+        speed_tags = ("wheel_speed", "actual_rpm", "wheel_rpm", "rpm", "speed", "vel", "轮速", "转速")
+        for idx, raw in enumerate(names):
+            low = raw.lower()
+            if any(t in low for t in speed_tags) and not self._has_target_token(low):
+                return idx
+        return None
+
+    def _find_speed_target_col(self):
+        count, names, _roles, smap = self._channel_meta()
+        if "target_rpm" in smap and smap["target_rpm"] < count:
+            return smap["target_rpm"]
+        speed_tags = ("wheel_speed", "rpm", "speed", "vel", "轮速", "转速")
+        for idx, raw in enumerate(names):
+            low = raw.lower()
+            if any(t in low for t in speed_tags) and self._has_target_token(low):
+                return idx
+        return None
+
+    def missing_speed_feedback_error(self, group=None):
+        """Return an error string if SPD autotune is requested on angle-only telemetry lacking wheel speed."""
+        w = self.ui
+        grp = group or w.selected()
+        if grp != "SPD" or w.sim or w.count <= 0:
+            return ""
+        spd_col = self._find_speed_actual_col()
+        if spd_col is not None:
+            return ""
+        count, names, _roles, smap = self._channel_meta()
+        pref_actual = w.channel_preferences[1] if hasattr(w, "channel_preferences") else None
+        is_angle_stream = ("pitch" in smap) or any(
+            ("pitch" in n.lower() or "angle" in n.lower() or "倾角" in n) for n in names
+        )
+        if is_angle_stream and (pref_actual is None or pref_actual == smap.get("pitch") or pref_actual >= count):
+            return "当前通道仅包含姿态/倾角数据，缺少轮速 (RPM) 反馈通道，请先开启轮速上报后再整定 SPD"
+        return ""
+
+    def has_role_conflict(self, group=None):
+        """Detect mismatch between manually selected actual channel and the active loop's expected feedback."""
+        w = self.ui
+        grp = group or w.selected()
+        count, names, roles, _smap = self._channel_meta()
         selected_actual = w.actual_ch.currentData()
-        if declared_actual is None or selected_actual is None or declared_actual >= w.count:
+        if grp == "SPD":
+            spd_col = self._find_speed_actual_col()
+            if spd_col is None or selected_actual is None or selected_actual >= count or selected_actual == spd_col:
+                return False, ""
+            sel_name = names[selected_actual] if selected_actual < len(names) else f"CH{selected_actual+1}"
+            spd_name = names[spd_col] if spd_col < len(names) else f"CH{spd_col+1}"
+            return True, (
+                f"⚠ 当前整定 SPD（速度环），但反馈通道选了 CH{selected_actual+1}({sel_name})，"
+                f"建议改为轮速通道 CH{spd_col+1}({spd_name})。"
+            )
+        declared_actual = next((i for i, r in enumerate(roles) if r == "actual"), None)
+        if declared_actual is None or selected_actual is None or declared_actual >= count:
             return False, ""
         if selected_actual != declared_actual:
-            names = w.names()
             sel_name = names[selected_actual] if selected_actual < len(names) else f"CH{selected_actual+1}"
             dec_name = names[declared_actual] if declared_actual < len(names) else f"CH{declared_actual+1}"
             return True, (
@@ -80,19 +165,33 @@ class AutoTuneController:
     def active(self):
         return self.state not in (self.IDLE, self.FINALIZING)
 
-    def _find_target_col(self):
+    def _find_target_col(self, group=None):
         w = self.ui
-        target_tags = ("target", "目标", "setpoint", "sp", "tgt", "ref")
-        roles = list(getattr(w, "channel_roles", []))[:w.count]
-        names = [n.lower() for n in w.names()[:w.count]]
+        grp = group or self.group or w.selected()
+        count, names, roles, _smap = self._channel_meta()
+        if grp == "SPD":
+            col = self._find_speed_target_col()
+            if col is not None and col < count and col != self.actual_col:
+                return col
+            col = next(
+                (i for i, r in enumerate(roles) if i != self.actual_col and r == "target" and not self._has_angle_token(names[i])),
+                None,
+            )
+            if col is None:
+                col = next(
+                    (i for i, n in enumerate(names) if i != self.actual_col and self._has_target_token(n) and not self._has_angle_token(n)),
+                    None,
+                )
+            return col if (col is not None and col < count and col != self.actual_col) else None
         col = next((i for i, r in enumerate(roles) if i != self.actual_col and r == "target"), None)
         if col is None:
-            col = next((i for i, n in enumerate(names) if i != self.actual_col and any(t in n for t in target_tags)), None)
-        return col if (col is not None and col < w.count and col != self.actual_col) else None
+            col = next((i for i, n in enumerate(names) if i != self.actual_col and self._has_target_token(n)), None)
+        return col if (col is not None and col < count and col != self.actual_col) else None
 
-    def detect_channels(self, sync_ui=True):
+    def detect_channels(self, sync_ui=True, group=None):
         """Return (actual_channel_index, optional_output_channel_index)."""
         w = self.ui
+        grp = group or w.selected()
         target_tags = ("target", "目标", "setpoint", "sp", "tgt", "ref")
         actual_tags = ("actual", "实际", "feedback", "fb", "meas")
         output_tags = ("pwm", "输出", "output", "out", "duty", "占空")
@@ -103,6 +202,13 @@ class AutoTuneController:
         actual = w.actual_ch.currentData()
         if pref_actual is not None and 0 <= pref_actual < w.count:
             actual = pref_actual
+        elif grp == "SPD" and not w.sim:
+            spd_col = self._find_speed_actual_col()
+            if spd_col is not None:
+                actual = spd_col
+            else:
+                role_actual = next((i for i, r in enumerate(roles) if r == "actual"), None)
+                actual = role_actual if role_actual is not None else (actual if (actual is not None and actual < max(1, w.count)) else 0)
         else:
             role_actual = next((i for i, r in enumerate(roles) if r == "actual"), None)
             if role_actual is not None:
@@ -143,7 +249,11 @@ class AutoTuneController:
             return
 
         group = w.selected()
-        actual_ch, output_ch = self.detect_channels()
+        missing_spd_msg = self.missing_speed_feedback_error(group)
+        if missing_spd_msg:
+            w.feedback(missing_spd_msg, True)
+            return
+        actual_ch, output_ch = self.detect_channels(group=group)
         ch_names = w.names()
         actual_label = ch_names[actual_ch] if actual_ch < len(ch_names) else f"CH{actual_ch+1}"
         out_label = ch_names[output_ch] if output_ch is not None and output_ch < len(ch_names) else "未指定"
@@ -163,15 +273,18 @@ class AutoTuneController:
         outer.addLayout(form)
 
         cur_tgt = w.fields["TGT"].value()
-        default_tgt = cur_tgt if abs(cur_tgt) > 1e-3 else self.cfg["target"]
+        has_nonzero_init = abs(w.fields["KP"].value()) > 1e-4 or abs(w.fields["KI"].value()) > 1e-4
+        self.actual_col, self.output_col = self.detect_channels(group=group)
+        is_balance_spd = (group == "SPD") and (not w.sim) and (self._find_pitch_col() is not None)
+        default_tgt = cur_tgt if abs(cur_tgt) > 1e-3 else (30.0 if is_balance_spd else self.cfg["target"])
         target_spin = number(default_tgt, -LIMIT, LIMIT, 5.0, 3)
-        base_spin = number(self.cfg["base"], -LIMIT, LIMIT, 5.0, 3)
+        base_spin = number(0.0 if is_balance_spd else self.cfg["base"], -LIMIT, LIMIT, 5.0, 3)
         if abs(default_tgt - base_spin.value()) < 1e-3:
             base_spin.setValue(0.0 if abs(default_tgt) > 1e-3 else -10.0)
 
         is_ang = group == "ANG"
-        default_mode = 2 if (is_ang or (w.sim and w.sim.pendulum)) else 1 if w.sim and w.sim.model == 1 else self.cfg["mode"]
-        default_strategy = 1 if (is_ang or (w.sim and w.sim.pendulum)) else self.cfg["strategy"]
+        default_mode = 2 if (is_ang or (w.sim and w.sim.pendulum)) else 0 if is_balance_spd else 1 if w.sim and w.sim.model == 1 else self.cfg["mode"]
+        default_strategy = 1 if (is_ang or (w.sim and w.sim.pendulum) or ((not w.sim) and has_nonzero_init)) else self.cfg["strategy"]
         mode_box = combo(list(MODES), default_mode)
         style_box = combo(list(STYLES), self.cfg["style"])
         strat_box = combo(list(STRATEGIES), default_strategy)
@@ -179,20 +292,25 @@ class AutoTuneController:
             strat_box.setCurrentIndex(1)
             strat_box.setEnabled(False)
             strat_box.setToolTip("直立环 (ANG) 属于开环不稳定对象，为防止倒地飞车已强制锁定为局部微调")
-        step_spin = number(self.cfg["step_s"], 0.5, 30.0, 0.5, 2)
+        default_step_s = 2.8 if is_balance_spd else self.cfg["step_s"]
+        step_spin = number(default_step_s, 0.5, 30.0, 0.5, 2)
         rounds_spin = W.QSpinBox()
         rounds_spin.setRange(3, 25)
         rounds_spin.setValue(int(self.cfg["rounds"]))
         limit_val = float(self.cfg.get("output_limit", 0.0))
         if limit_val <= 0 and hasattr(w, "capture_pwm_limit"):
             limit_val = float(w.capture_pwm_limit.value())
+        if limit_val <= 0 and is_balance_spd:
+            limit_val = 950.0
         limit_spin = number(limit_val, 0.0, LIMIT, 50.0, 1)
         limit_spin.setSpecialValueText("自动估计")
-        limit_spin.setToolTip("填写控制器真实输出上限（如平衡车 ±1000），用于准确统计触顶饱和占比；0 为自动估计")
-        hold_chk = check("整定完成后保持在目标值运行", self.cfg["hold"])
+        limit_spin.setToolTip("填写控制器真实输出上限（如平衡车 ±950），用于准确统计触顶饱和占比；0 为自动估计")
+        hold_chk = check("整定完成后保持在目标值运行", False if is_balance_spd else self.cfg["hold"])
+        brake_chk = check("联合评估起步 + 刹停 (0 → 目标 → 0，平衡车控速推荐)", is_balance_spd or self.cfg.get("eval_brake", False))
+        reverify_chk = check("优胜组与原参数复测确认后再写回", is_balance_spd or self.cfg.get("reverify_winner", False))
         safety_chk = check("我已确认：车轮已架空离地或已加装机械限位，且知晓随时可按 Esc 急停", False)
 
-        form.addRow("目标值（如控速 100）", target_spin)
+        form.addRow("目标值（如控速 30）", target_spin)
         form.addRow("起始基准值", base_spin)
         form.addRow("控制器类型", mode_box)
         form.addRow("响应偏好", style_box)
@@ -200,6 +318,8 @@ class AutoTuneController:
         form.addRow("单轮观察时长 s", step_spin)
         form.addRow("最大寻优轮数", rounds_spin)
         form.addRow("输出限幅 ±", limit_spin)
+        form.addRow(brake_chk)
+        form.addRow(reverify_chk)
         form.addRow(hold_chk)
         form.addRow(safety_chk)
 
@@ -223,7 +343,8 @@ class AutoTuneController:
         _update_mode_hint()
         mode_box.currentIndexChanged.connect(lambda _: _update_mode_hint())
 
-        conflict, conflict_msg = self.has_role_conflict()
+        self.detect_channels(group=group)
+        conflict, conflict_msg = self.has_role_conflict(group)
         conflict_chk = None
         if conflict:
             c_lbl = W.QLabel(conflict_msg)
@@ -274,6 +395,8 @@ class AutoTuneController:
             rounds=rounds_spin.value(),
             hold=hold_chk.isChecked(),
             output_limit=limit_spin.value(),
+            eval_brake=brake_chk.isChecked(),
+            reverify_winner=reverify_chk.isChecked(),
         )
         self.start(
             mode=self.cfg["mode"],
@@ -286,9 +409,15 @@ class AutoTuneController:
             hold_target=self.cfg["hold"],
             output_limit=self.cfg["output_limit"],
             confirm_role=bool(conflict_chk and conflict_chk.isChecked()),
+            eval_brake=self.cfg["eval_brake"],
+            reverify_winner=self.cfg["reverify_winner"],
         )
 
-    def start(self, mode, style, strategy, base, target, step_seconds=2.0, max_rounds=10, hold_target=True, output_limit=None, confirm_role=False):
+    def start(
+        self, mode, style, strategy, base, target, step_seconds=2.0,
+        max_rounds=10, hold_target=True, output_limit=None, confirm_role=False,
+        eval_brake=False, reverify_winner=False,
+    ):
         w = self.ui
         if not w.connected:
             w.feedback("请先连接串口或打开仿真", True)
@@ -297,12 +426,17 @@ class AutoTuneController:
         if group == "ANG" and strategy == 0:
             w.feedback("直立环 (ANG) 属于开环不稳定对象，仅允许使用【从当前参数局部微调】策略", True)
             return False
+        missing_spd_msg = self.missing_speed_feedback_error(group)
+        if missing_spd_msg:
+            w.feedback(missing_spd_msg, True)
+            return False
         tgt_lo, tgt_hi, _ = w.rules[group]["TGT"]
         if not (tgt_lo <= base <= tgt_hi and tgt_lo <= target <= tgt_hi):
             w.feedback(f"起始基准与目标值必须在 {group}.TGT 允许范围 {tgt_lo:g} 至 {tgt_hi:g} 内", True)
             return False
 
-        conflict, conflict_msg = self.has_role_conflict()
+        self.detect_channels(group=group)
+        conflict, conflict_msg = self.has_role_conflict(group)
         if conflict and not confirm_role:
             w.feedback(conflict_msg, True)
             return False
@@ -326,6 +460,7 @@ class AutoTuneController:
                 "mode": mode, "style": style, "strategy": strategy,
                 "base": base, "target": target, "step_seconds": step_seconds,
                 "max_rounds": max_rounds, "output_limit": output_limit,
+                "eval_brake": bool(eval_brake), "reverify_winner": bool(reverify_winner),
             }
             self.engine = None
             self.saved_before = None
@@ -347,15 +482,21 @@ class AutoTuneController:
         }
         return self._launch_with_baseline(
             initial, mode, style, strategy, base, target, step_seconds, max_rounds, output_limit,
+            eval_brake=eval_brake, reverify_winner=reverify_winner,
         )
 
-    def _launch_with_baseline(self, baseline, mode, style, strategy, base, target, step_seconds, max_rounds, output_limit):
+    def _launch_with_baseline(
+        self, baseline, mode, style, strategy, base, target,
+        step_seconds, max_rounds, output_limit,
+        eval_brake=False, reverify_winner=False,
+    ):
         w = self.ui
         group = self.group
         try:
             self.engine = AutoTuner(
                 mode, style, strategy, baseline, w.rules[group], base, target,
                 step_seconds, max_rounds, output_limit=output_limit,
+                eval_brake=eval_brake, reverify_winner=reverify_winner,
             )
         except ValueError as exc:
             self.state = self.IDLE
@@ -369,8 +510,14 @@ class AutoTuneController:
         if w.scope.frozen:
             w.toggle_freeze()
 
-        self.actual_col, self.output_col = self.detect_channels()
-        self.target_col = self._find_target_col()
+        self.actual_col, self.output_col = self.detect_channels(group=group)
+        self.target_col = self._find_target_col(group=group)
+        self.pitch_col = self._find_pitch_col() if group == "SPD" else None
+        self.pitch_ref = float(w.confirmed.get("ANG.TGT", w.drafts.get("ANG", {}).get("TGT", 0.0)))
+        self.eval_brake = bool(eval_brake)
+        self.reverify_winner = bool(reverify_winner)
+        self._start_seg = None
+        self._climbing_extended = False
         self.saved_before = {k: float(baseline[k]) for k in KEYS}
         self.last_best_ref = None
         self.last_history = []
@@ -429,6 +576,11 @@ class AutoTuneController:
             w.feedback(msg, True)
             return
 
+        if self.finalize_need_stop:
+            w.send_heartbeat = False
+            if getattr(w, "link", None) is not None and hasattr(w.link, "keepalive"):
+                w.link.keepalive(False)
+            w.commands.clear()
         cmds = (["@STOP"] if self.finalize_need_stop else []) + self._build_param_cmds(
             params_dict["KP"], params_dict["KI"], params_dict["KD"], params_dict["TGT"], reset=True,
         )
@@ -613,14 +765,33 @@ class AutoTuneController:
         hist = list(self.engine.history) if (self.engine and self.engine.history) else list(self.last_history)
         if not hist:
             return []
+        strict_gates = bool(
+            self.engine and (
+                self.engine.eval_brake
+                or self.engine.output_limit is not None
+                or any(getattr(ev, "max_pitch_dev", None) is not None for _r, _p, ev, _t in hist)
+            )
+        )
         best_idx = None
-        best_score = float("inf")
+        best_key = (True, float("inf"))
         for idx, (_rnd, _p, ev, _tag) in enumerate(hist):
-            if ev.valid and ev.score < best_score:
-                best_score = ev.score
-                best_idx = idx
+            if ev.valid:
+                passed = getattr(ev, "passed_gates", True)
+                if strict_gates and not passed:
+                    continue
+                key = (not passed, float(ev.score))
+                if key < best_key:
+                    best_key = key
+                    best_idx = idx
         rows = []
         for idx, (rnd, p, ev, tag) in enumerate(hist):
+            note = str(ev.note or "")
+            if not note:
+                if ev.valid and ev.brake_settle_s is not None:
+                    rev_txt = f"{ev.brake_rev_peak:+.1f}" if ev.brake_rev_peak is not None else "--"
+                    note = f"刹停 {ev.brake_settle_s:.2f}s / 反冲 {rev_txt}"
+                else:
+                    note = "有效" if ev.valid else "无效"
             rows.append({
                 "round": int(rnd),
                 "tag": str(tag),
@@ -631,7 +802,7 @@ class AutoTuneController:
                 "overshoot_pct": float(ev.overshoot_pct),
                 "settle_s": ev.settle_s,
                 "sat_pct": float(ev.sat_ratio * 100.0),
-                "note": str(ev.note or ("有效" if ev.valid else "无效")),
+                "note": note,
                 "valid": bool(ev.valid),
                 "is_best": idx == best_idx,
             })
@@ -715,6 +886,36 @@ class AutoTuneController:
         ev = self.engine.best_eval
         return f"当前最优：KP={p['KP']:.4g}  KI={p['KI']:.4g}  KD={p['KD']:.4g}（J={ev.score:.3f}，超调 {ev.overshoot_pct:.1f}%）"
 
+    def _preserve_unqualified_ref(self):
+        if not self.engine:
+            return ""
+        cand_p = self.engine.candidate_ref
+        if cand_p is not None and self.engine._pre_reverify_best is not None:
+            ref_ev = self.engine._pre_reverify_best[1]
+        else:
+            cand_p = self.engine.best_params
+            ref_ev = self.engine.best_eval
+        if cand_p is None or ref_ev is None or not ref_ev.valid:
+            return ""
+        self.last_best_ref = {
+            "group": self.group,
+            "KP": float(cand_p["KP"]),
+            "KI": float(cand_p["KI"]),
+            "KD": float(cand_p["KD"]),
+            "score": float(ref_ev.score),
+        }
+        return (
+            f"未自动写回参考：KP={cand_p['KP']:.4g}  KI={cand_p['KI']:.4g}  KD={cand_p['KD']:.4g}"
+            f"（J={ref_ev.score:.3f}，超调 {ref_ev.overshoot_pct:.1f}%）"
+        )
+
+    def _reject_reason_for_no_winner(self, fallback):
+        if self.engine and (self.engine.reverify_inconclusive or self.engine.kept_baseline):
+            return self.engine.finish_reason or fallback
+        if self.engine and self.engine.best_eval is not None and self.engine.best_eval.valid and not self.engine.best_eval.passed_gates:
+            return f"无候选通过安全验收门槛（{self.engine.best_eval.note or '未达标'}），已停机并恢复原参数"
+        return fallback
+
     def on_device_stopped(self, reason):
         """Called when device reports #STOP:fall / #STOP:heartbeat or user hits emergency stop."""
         if self.state == self.IDLE:
@@ -729,9 +930,9 @@ class AutoTuneController:
         if reason == "急停":
             self._restore_original("已响应急停", send_to_device=w.connected, stop_motor=False, already_stopped=True)
             return
-        if self.state in (self.OBSERVE, self.SETTLE_BASE, self.WAIT_STEP_ACK, self.WAIT_BASE_ACK) and self.current_cand and self.engine:
+        if self.state in (self.OBSERVE, self.WAIT_BRAKE_ACK, self.OBSERVE_BRAKE, self.SETTLE_BASE, self.WAIT_STEP_ACK, self.WAIT_BASE_ACK) and self.current_cand and self.engine:
             self.engine.record_result([], [], aborted_reason=reason)
-        if self.engine and self.engine.best_params and self.engine.best_eval and self.engine.best_eval.valid:
+        if self.engine and self.engine.has_qualified_winner():
             p = self.engine.best_params
             base_tgt = self.engine.base
             if self.saved_before:
@@ -756,7 +957,11 @@ class AutoTuneController:
                 stop_motor=False, already_stopped=True, summary=self._best_brief(),
             )
         else:
-            self._restore_original(f"因“{reason}”中止（无可用最优组）", send_to_device=w.connected, stop_motor=False, already_stopped=True)
+            ref_txt = self._preserve_unqualified_ref()
+            self._restore_original(
+                self._reject_reason_for_no_winner(f"因“{reason}”中止（无合格最优组）"),
+                send_to_device=w.connected, stop_motor=False, already_stopped=True, summary=ref_txt,
+            )
 
     def stop(self, message="", apply_best=True):
         w = self.ui
@@ -770,18 +975,13 @@ class AutoTuneController:
             return
         if self.state == self.FINALIZING:
             return
-        has_best = (
-            apply_best
-            and self.engine is not None
-            and self.engine.best_params is not None
-            and self.engine.best_eval is not None
-            and self.engine.best_eval.valid
-            and w.connected
-        )
+        has_best = bool(apply_best and self.engine is not None and self.engine.has_qualified_winner() and w.connected)
         if has_best:
             self._apply_winner(message or "已停止并应用最优参数")
             return
-        self._restore_original(message or "自动整定已停止", send_to_device=w.connected, stop_motor=True, already_stopped=False)
+        ref_txt = self._preserve_unqualified_ref() if apply_best else ""
+        msg = self._reject_reason_for_no_winner(message or "自动整定已停止") if apply_best else (message or "自动整定已停止")
+        self._restore_original(msg, send_to_device=w.connected, stop_motor=True, already_stopped=False, summary=ref_txt)
 
     def _apply_winner(self, reason):
         w = self.ui
@@ -822,9 +1022,13 @@ class AutoTuneController:
 
     def _check_missing_feedback(self, rows, phase_start, now):
         """Return (trailing_missing, missing_s, timed_out) for actual_col within rows >= phase_start."""
+        stall_timeout = min(max(0.80, self.engine.step_seconds * 0.45), 1.50)
+        wall_stale_s = max(0.0, now - self.last_valid_actual_wall) if self.last_valid_actual_wall is not None else 0.0
         if not len(rows):
             ref_t = self.last_valid_actual_t if self.last_valid_actual_t is not None else phase_start
-            return 0, max(0.0, self.ui.latest - ref_t), False
+            missing_s = max(0.0, self.ui.latest - ref_t)
+            empty_timed_out = (self.state in (self.SETTLE_BASE, self.OBSERVE, self.OBSERVE_BRAKE)) and (wall_stale_s >= stall_timeout)
+            return 0, max(missing_s, wall_stale_s), empty_timed_out
         y_col = rows[:, self.actual_col + 1]
         fin_idx = np.flatnonzero(np.isfinite(y_col))
         if len(fin_idx):
@@ -832,14 +1036,15 @@ class AutoTuneController:
             if self.last_valid_actual_t is None or last_fin_t > self.last_valid_actual_t:
                 self.last_valid_actual_t = last_fin_t
                 self.last_valid_actual_wall = now
+                wall_stale_s = 0.0
             trailing_missing = len(rows) - 1 - int(fin_idx[-1])
         else:
             trailing_missing = len(rows)
         ref_t = self.last_valid_actual_t if self.last_valid_actual_t is not None else phase_start
         missing_s = max(0.0, self.ui.latest - ref_t)
         missing_timeout = min(max(0.50, self.engine.step_seconds * 0.45), 1.50)
-        timed_out = trailing_missing >= 2 and missing_s >= missing_timeout
-        return trailing_missing, missing_s, timed_out
+        timed_out = (trailing_missing >= 2 and missing_s >= missing_timeout) or (wall_stale_s >= stall_timeout)
+        return trailing_missing, max(missing_s, wall_stale_s), timed_out
 
     def tick(self, now):
         if self.state == self.IDLE:
@@ -877,6 +1082,7 @@ class AutoTuneController:
             self._launch_with_baseline(
                 baseline, ps["mode"], ps["style"], ps["strategy"],
                 ps["base"], ps["target"], ps["step_seconds"], ps["max_rounds"], ps["output_limit"],
+                eval_brake=ps.get("eval_brake", False), reverify_winner=ps.get("reverify_winner", False),
             )
             return
 
@@ -895,8 +1101,9 @@ class AutoTuneController:
                 if not has_tgt:
                     w.follow[0] = self.group
                     w.set_reference(0, "整定目标", self.engine.target)
-            self.actual_col, self.output_col = self.detect_channels()
-            self.target_col = self._find_target_col()
+            self.actual_col, self.output_col = self.detect_channels(group=self.group)
+            self.target_col = self._find_target_col(group=self.group)
+            self.pitch_col = self._find_pitch_col() if self.group == "SPD" else None
             ch_names = w.names()
             actual_desc = ch_names[self.actual_col] if self.actual_col < len(ch_names) else f"CH{self.actual_col+1}"
             out_desc = f"CH{self.output_col+1}({ch_names[self.output_col]})" if self.output_col is not None and self.output_col < len(ch_names) else "无"
@@ -907,16 +1114,19 @@ class AutoTuneController:
         if self.state == self.PREPARE:
             nxt = self.engine.next_candidate()
             if nxt is None:
-                if self.engine.best_params is not None and self.engine.best_eval is not None and self.engine.best_eval.valid:
+                if self.engine.has_qualified_winner():
                     self._apply_winner(self.engine.finish_reason or "整定完成")
                 else:
+                    ref_txt = self._preserve_unqualified_ref()
                     self._restore_original(
-                        self.engine.finish_reason or "未获得有效整定结果",
-                        send_to_device=w.connected, stop_motor=True, already_stopped=False,
+                        self._reject_reason_for_no_winner(self.engine.finish_reason or "未获得有效整定结果"),
+                        send_to_device=w.connected, stop_motor=True, already_stopped=False, summary=ref_txt,
                     )
                 return
             rnd, cand, tag = nxt
             self.current_cand, self.current_tag = cand, tag
+            self._start_seg = None
+            self._climbing_extended = False
             for k in ("KP", "KI", "KD"):
                 with C.QSignalBlocker(w.fields[k]):
                     w.fields[k].setValue(cand[k])
@@ -947,18 +1157,20 @@ class AutoTuneController:
             max_settle_wait = min(4.0, max(1.4, self.engine.step_seconds * 1.25))
             a = w.buffer.view()
             fresh_rows = a[a[:, 0] >= self.phase_t0] if len(a) else a
-            trailing_missing, missing_s, fb_timed_out = self._check_missing_feedback(fresh_rows, self.phase_t0, now)
-            if fb_timed_out:
-                self._abort_with_stop(
-                    f"基准段反馈通道 CH{self.actual_col+1} 持续缺失有效数据（已优先停机，未下发阶跃目标）"
-                )
-                return
-
             fresh_fin = (
                 fresh_rows[np.isfinite(fresh_rows[:, self.actual_col + 1]), self.actual_col + 1]
                 if len(fresh_rows)
                 else np.array([], dtype=float)
             )
+            trailing_missing, missing_s, fb_timed_out = self._check_missing_feedback(fresh_rows, self.phase_t0, now)
+            if fb_timed_out:
+                if len(fresh_fin) < 3:
+                    self._abort_with_stop("基准段未收到有效反馈，已停机并取消整定")
+                else:
+                    self._abort_with_stop(
+                        f"基准段反馈通道 CH{self.actual_col+1} 持续缺失有效数据（已优先停机，未下发阶跃目标）"
+                    )
+                return
             near_base = flat = False
             feedback_live = (trailing_missing == 0 and missing_s <= 0.25)
             if feedback_live and elapsed >= 0.18 and len(fresh_fin) >= 3:
@@ -967,10 +1179,16 @@ class AutoTuneController:
                 if len(recent) < 3:
                     recent = fresh_fin[-3:]
                 amp = abs(self.engine.target - self.engine.base)
-                near_base = abs(float(np.mean(recent)) - self.engine.base) <= max(0.06 * amp, 1e-3)
+                mean_y = float(np.mean(recent))
+                near_base = abs(mean_y - self.engine.base) <= max(0.06 * amp, 1e-3)
+                near_base_strict = abs(mean_y - self.engine.base) <= max(0.15 * amp, 1e-3)
                 flat = float(np.ptp(recent)) <= max(0.03 * amp, 1e-3)
 
-            ready = feedback_live and ((near_base and flat) or (elapsed >= settle_cap and flat))
+            require_near_base = (abs(self.engine.base) <= 1e-6) or (abs(self.current_cand.get("KI", 0.0)) > 1e-6)
+            ready = feedback_live and (
+                (near_base and flat)
+                or (elapsed >= settle_cap and flat and (near_base_strict or not require_near_base))
+            )
             if not ready:
                 if elapsed >= max_settle_wait or now > self.wall_deadline:
                     if len(fresh_fin) < 3 or trailing_missing >= 2 or missing_s >= 0.30:
@@ -1098,6 +1316,7 @@ class AutoTuneController:
             times = seg[:, 0]
             actual = seg[:, self.actual_col + 1]
             outputs = seg[:, self.output_col + 1] if self.output_col is not None else None
+            pitch_arr = seg[:, self.pitch_col + 1] if self.pitch_col is not None else None
             finite_y = actual[np.isfinite(actual)]
             if len(finite_y) < 6:
                 if len(finite_y) == 0:
@@ -1105,6 +1324,17 @@ class AutoTuneController:
                 else:
                     self._abort_with_stop(f"反馈通道 CH{self.actual_col+1} 有效采样不足（仅 {len(finite_y)} 帧），已停机中止")
                 return
+            if (
+                self.current_tag in ("阶跃辨识", "放大辨识")
+                and elapsed < self.engine.step_seconds * 2.5
+                and is_step_still_climbing(times, actual, self.base_y)
+            ):
+                if not self._climbing_extended:
+                    self._climbing_extended = True
+                    self.wall_deadline = max(self.wall_deadline, now + self.engine.step_seconds * 1.6)
+                    w.log("整定", "探针曲线仍在爬升，自动延长采样以待稳态")
+                return
+
             step_amp = abs(self.engine.target - self.base_y)
             if len(finite_y) >= 6 and step_amp > 1e-3:
                 check_y = finite_y[1:] if (len(finite_y) >= 8 and abs(float(finite_y[0]) - self.base_y) <= 0.05 * step_amp) else finite_y
@@ -1114,33 +1344,119 @@ class AutoTuneController:
                         apply_best=False,
                     )
                     return
-            prev_best = self.engine.best_eval.score if (self.engine.best_eval and self.engine.best_eval.valid) else float("inf")
-            ev = self.engine.record_result(times, actual, base_y=self.base_y, outputs=outputs)
-            self.last_history = list(self.engine.history)
-            self.last_history_group = self.group
 
-            cand = self.current_cand
-            settle_txt = f"{ev.settle_s:.2f} s" if ev.settle_s is not None else "未稳"
-            note_txt = f" [{ev.note}]" if ev.note else ""
-            w.log(
-                "整定",
-                f"R{rnd:02d} {self.current_tag} ({self.step_t0_source})  KP={cand['KP']:.4g} KI={cand['KI']:.4g} KD={cand['KD']:.4g} → "
-                f"J={ev.score:.3f}  超调 {ev.overshoot_pct:.1f}%  调节 {settle_txt}{note_txt}",
+            if self.eval_brake:
+                self._start_seg = (times.copy(), actual.copy(), outputs.copy() if outputs is not None else None, pitch_arr.copy() if pitch_arr is not None else None)
+                if not w.commands.submit([self._cmd("TGT", self.engine.base)], quiet=True):
+                    self._abort_with_stop("下发刹停目标失败")
+                    return
+                self.state = self.WAIT_BRAKE_ACK
+                self._set_status(
+                    f"第 {rnd}/{self.engine.max_rounds} 轮 · {self.current_tag} · 刹停归零至 {self.engine.base:g}",
+                    self._best_brief(),
+                )
+                return
+
+            prev_best = self.engine.best_eval.score if (self.engine.best_eval and self.engine.best_eval.valid) else float("inf")
+            prev_gates = getattr(self.engine.best_eval, "passed_gates", False) if self.engine.best_eval else False
+            ev = self.engine.record_result(
+                times, actual, base_y=self.base_y, outputs=outputs,
+                start_pitch=pitch_arr, pitch_ref=self.pitch_ref,
             )
-            if ev.valid and ev.score < prev_best:
-                w.mark(f"最优#{rnd} J={ev.score:.2f}")
-            if ev.stalled or (ev.reversed_sign and self.engine.finished and self.engine.best_params is None):
-                self.stop(self.engine.finish_reason, apply_best=False)
+            self._handle_recorded_eval(ev, prev_best, prev_gates)
+            return
+
+        if self.state == self.WAIT_BRAKE_ACK:
+            if w.commands.busy():
                 return
-            if not ev.valid and ev.sample_count < 6:
-                self._abort_with_stop(f"反馈通道 CH{self.actual_col+1} 有效采样不足（{ev.sample_count} 帧），已停机中止")
+            self.brake_t0 = w.latest
+            self.last_valid_actual_t = self.brake_t0
+            self.last_valid_actual_wall = now
+            self.wall_deadline = now + max(5.0, self.engine.brake_seconds * 2.5)
+            self.state = self.OBSERVE_BRAKE
+            return
+
+        if self.state == self.OBSERVE_BRAKE:
+            if now > self.wall_deadline:
+                self._abort_with_stop("刹停采样中断（已优先停机，避免失反馈继续运行）")
                 return
-            if self.engine.finished:
-                if self.engine.best_params is not None and self.engine.best_eval is not None and self.engine.best_eval.valid:
-                    self._apply_winner(self.engine.finish_reason)
-                else:
-                    self.stop(self.engine.finish_reason, apply_best=False)
+            a = w.buffer.view()
+            seg_brk = a[a[:, 0] >= self.brake_t0] if len(a) else a
+            _, _, fb_timed_out = self._check_missing_feedback(seg_brk, self.brake_t0, now)
+            if fb_timed_out:
+                self._abort_with_stop(
+                    f"刹停段反馈通道 CH{self.actual_col+1} 持续缺失有效数据（已优先停机）"
+                )
                 return
-            if ev.saturated and rnd <= 2:
-                w.log("整定", "提示：输出通道接近满幅饱和，若始终达不到目标请适当降低目标值或检查输出限幅")
-            self.state = self.PREPARE
+            elapsed_brk = max(0., w.latest - self.brake_t0)
+            rnd = self.engine.round
+            self._set_status(
+                f"第 {rnd}/{self.engine.max_rounds} 轮 · {self.current_tag} · 刹停评估 {min(elapsed_brk, self.engine.brake_seconds):.1f}/{self.engine.brake_seconds:.1f} s",
+                self._best_brief(),
+            )
+            if elapsed_brk < self.engine.brake_seconds:
+                return
+            if len(seg_brk) < 6:
+                if now <= self.wall_deadline - 1.0:
+                    return
+                self._abort_with_stop("刹停段采样率过低（少于 6 帧），已停机中止")
+                return
+            brk_t = seg_brk[:, 0]
+            brk_y = seg_brk[:, self.actual_col + 1]
+            brk_u = seg_brk[:, self.output_col + 1] if self.output_col is not None else None
+            brk_p = seg_brk[:, self.pitch_col + 1] if self.pitch_col is not None else None
+            start_t, start_y, start_u, start_p = self._start_seg
+            prev_best = self.engine.best_eval.score if (self.engine.best_eval and self.engine.best_eval.valid) else float("inf")
+            prev_gates = getattr(self.engine.best_eval, "passed_gates", False) if self.engine.best_eval else False
+            ev = self.engine.record_result(
+                start_t, start_y, base_y=self.base_y, outputs=start_u,
+                brake_times=brk_t, brake_actual=brk_y, brake_outputs=brk_u,
+                start_pitch=start_p, brake_pitch=brk_p, pitch_ref=self.pitch_ref,
+            )
+            self._handle_recorded_eval(ev, prev_best, prev_gates)
+
+    def _handle_recorded_eval(self, ev, prev_best, prev_gates):
+        w = self.ui
+        rnd = self.engine.round
+        cand = self.current_cand
+        self.last_history = list(self.engine.history)
+        self.last_history_group = self.group
+
+        if self.eval_brake and ev.brake_settle_s is not None:
+            settle_txt = f"{ev.brake_settle_s:.2f} s"
+        elif self.eval_brake:
+            settle_txt = "未刹稳"
+        else:
+            settle_txt = f"{ev.settle_s:.2f} s" if ev.settle_s is not None else "未稳"
+        extra_brk = f"  反冲 {ev.brake_rev_peak:+.1f}" if (self.eval_brake and ev.brake_rev_peak is not None) else ""
+        note_txt = f" [{ev.note}]" if ev.note else ""
+        w.log(
+            "整定",
+            f"R{rnd:02d} {self.current_tag} ({self.step_t0_source})  KP={cand['KP']:.4g} KI={cand['KI']:.4g} KD={cand['KD']:.4g} → "
+            f"J={ev.score:.3f}  超调 {ev.overshoot_pct:.1f}%  调节 {settle_txt}{extra_brk}{note_txt}",
+        )
+        improved_rank = ev.valid and (
+            (ev.passed_gates and not prev_gates)
+            or (ev.passed_gates == prev_gates and ev.score < prev_best)
+        )
+        if improved_rank:
+            w.mark(f"最优#{rnd} J={ev.score:.2f}")
+        if ev.stalled or (ev.reversed_sign and self.engine.finished and self.engine.best_params is None):
+            self.stop(self.engine.finish_reason, apply_best=False)
+            return
+        if not ev.valid and ev.sample_count < 6:
+            self._abort_with_stop(f"反馈通道 CH{self.actual_col+1} 有效采样不足（{ev.sample_count} 帧），已停机中止")
+            return
+        if self.engine.finished:
+            if self.engine.has_qualified_winner():
+                self._apply_winner(self.engine.finish_reason)
+            else:
+                ref_txt = self._preserve_unqualified_ref()
+                self._restore_original(
+                    self._reject_reason_for_no_winner(self.engine.finish_reason),
+                    send_to_device=w.connected, stop_motor=True, already_stopped=False, summary=ref_txt,
+                )
+            return
+        if ev.saturated and rnd <= 2:
+            w.log("整定", "提示：输出通道接近满幅饱和，若始终达不到目标请适当降低目标值或检查输出限幅")
+        self.state = self.PREPARE

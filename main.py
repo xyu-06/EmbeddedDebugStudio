@@ -28,6 +28,14 @@ from scope import COLORS, REF_COLORS
 from serial_studio import SerialAssistantPage
 from storage import History, PARAM_COLS, csv_header, csv_row, inspect_csv, load_csv
 from telemetry_schema import infer_channel_unit
+from bluetooth_link import (
+    BluetoothRfcommLink,
+    discover_bluetooth_devices,
+    format_bt_port_token,
+    normalize_port_identity,
+    parse_bt_port_token,
+)
+from bluetooth_ui import BluetoothPickerDialog
 from transport import SerialLink
 from version import APP_NAME, APP_TITLE_ZH, APP_VERSION
 
@@ -228,7 +236,7 @@ class Window(W.QMainWindow):
                     self.source_ui()
 
     def request_port_access(self, requester, port_name: str) -> bool:
-        wanted = port_name.strip().upper()
+        wanted = normalize_port_identity(port_name)
         if not wanted:
             return True
         req_title = getattr(requester, "module_title", "当前模块")
@@ -236,7 +244,9 @@ class Window(W.QMainWindow):
             if mod is requester:
                 continue
             held = mod.active_port()
-            if held and held.strip().upper() == wanted:
+            if not held and hasattr(mod, "active_bt_token"):
+                held = mod.active_bt_token()
+            if held and normalize_port_identity(held) == wanted:
                 if self.confirm_handoff is not None:
                     ok = bool(self.confirm_handoff(title, req_title, port_name))
                 else:
@@ -587,28 +597,54 @@ class Window(W.QMainWindow):
                 self.port.setItemData(self.port.count()-1,p.description,C.Qt.ItemDataRole.ToolTipRole)
         except OSError as exc:
             self.log("系统",str(exc))
+        try:
+            for dev in discover_bluetooth_devices(inquiry=False):
+                if dev.authenticated:
+                    token = format_bt_port_token(dev.address, dev.name)
+                    self.port.addItem(token)
+                    self.port.setItemData(self.port.count()-1, f"蓝牙 SPP 直连 · {dev.name} ({dev.address})", C.Qt.ItemDataRole.ToolTipRole)
+        except Exception:
+            pass
         if old:
             self.port.setCurrentText(old)
+
+    def pick_bluetooth_device(self):
+        dlg = BluetoothPickerDialog(self)
+        if dlg.exec() == W.QDialog.DialogCode.Accepted and dlg.selected_port_text:
+            self.source.setCurrentIndex(0)
+            if self.port.findText(dlg.selected_port_text) < 0:
+                self.port.addItem(dlg.selected_port_text)
+            self.port.setCurrentText(dlg.selected_port_text)
+            self.feedback(f"已选定无线连接：{dlg.selected_port_text}（点击【连接串口】建立链接）")
+
+    def _create_link(self, opts):
+        bt = parse_bt_port_token(opts.get("url", ""))
+        if bt is not None:
+            mac, name = bt
+            return BluetoothRfcommLink(mac, channel=1, name=name or mac)
+        return SerialLink(opts)
 
     def source_ui(self):
         sim = self.source.currentIndex() == 1
         waiting = self.reconnect_at is not None
         busy = self.connected or self.link is not None or waiting
+        is_bt = isinstance(self.link, BluetoothRfcommLink) or parse_bt_port_token(self.port.currentText()) is not None
         self.source.setEnabled(not busy)
         self.model.setEnabled(not busy)
         self.serial_form.setRowVisible(self.model,sim)
         self.serial_form.setRowVisible(self.baud,not sim)
         self.serial_form.setRowVisible(1,not sim)
         self.serial_form.setRowVisible(self.auto_reconnect,not sim)
-        for w in (self.port,self.refresh_btn,self.baud,self.bits,self.parity,self.stops,self.flow,self.time_mode,self.rate):
+        for w in (self.port,self.refresh_btn,self.bt_pick_btn,self.baud,self.bits,self.parity,self.stops,self.flow,self.time_mode,self.rate):
             w.setEnabled(not busy and not sim)
         self.connect_btn.setEnabled(not self.closing)
         self.connect_btn.setText("关闭仿真" if self.sim else "取消重连" if waiting or (self.reconnecting and not self.connected)
-                                 else "断开" if busy else "打开仿真" if sim else "连接串口")
+                                 else "断开" if busy else "打开仿真" if sim else "连接设备" if is_bt else "连接串口")
         self.stop_btn.setEnabled(self.connected)
         self.gen_btn.setEnabled((self.connected or self.generator is not None) and not self.autotuner.active)
         self.autotune_btn.setEnabled(self.connected or self.autotuner.active)
-        self.badge.setText("仿真练习" if self.sim else "串口已连接" if self.connected else "正在关闭…" if self.closing
+        conn_label = "蓝牙已连接" if isinstance(self.link, BluetoothRfcommLink) else "串口已连接"
+        self.badge.setText("仿真练习" if self.sim else conn_label if self.connected else "正在关闭…" if self.closing
                            else "等待重连…" if waiting or self.reconnecting else "正在连接…" if busy else "未连接")
         if hasattr(self,"nudge_btn"):
             pendulum = sim and self.model.currentIndex() == 3
@@ -682,7 +718,7 @@ class Window(W.QMainWindow):
                 return
             self.fresh_session()
             self.reconnect_opts = opts
-            self.link = SerialLink(opts)
+            self.link = self._create_link(opts)
             self.link.start()
         self.source_ui()
 
@@ -702,7 +738,7 @@ class Window(W.QMainWindow):
         self.parser = Lines()
         self.parser.skipping = True
         self.rx_log_tail = None
-        self.link = SerialLink(self.reconnect_opts)
+        self.link = self._create_link(self.reconnect_opts)
         self.link.start()
         self.source_ui()
 

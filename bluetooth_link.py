@@ -37,6 +37,34 @@ def parse_bt_address(address: str) -> int:
     return int(cleaned, 16)
 
 
+def format_bt_port_token(address: str, name: str = "") -> str:
+    """Format a Bluetooth RFCOMM endpoint token usable in port dropdowns."""
+    mac = format_bt_address(parse_bt_address(address))
+    clean_name = str(name or "").replace("\r", "").replace("\n", "").strip()
+    return f"BT:{mac} ({clean_name})" if clean_name else f"BT:{mac}"
+
+
+def parse_bt_port_token(text: str) -> tuple[str, str] | None:
+    """Parse 'BT:AA:BB:CC:DD:EE:FF [(Device Name)]' into (normalized_mac, name) or None."""
+    raw = str(text or "").strip()
+    m = re.match(r"^BT:([0-9A-Fa-f:]{17}|[0-9A-Fa-f]{12})(?:\s*\((.*)\))?$", raw, flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        mac = format_bt_address(parse_bt_address(m.group(1)))
+    except ValueError:
+        return None
+    return mac, (m.group(2) or "").strip()
+
+
+def normalize_port_identity(text: str) -> str:
+    """Normalize either 'COMx' or 'BT:<MAC> (...)' for cross-module conflict matching."""
+    parsed = parse_bt_port_token(text)
+    if parsed:
+        return f"BT:{parsed[0]}"
+    return str(text or "").strip().upper()
+
+
 def extract_bt_mac_from_hwid(hwid: str) -> str | None:
     """Extract normalized AA:BB:CC:DD:EE:FF from Windows BTHENUM HWID, ignoring incoming 000000000000."""
     text = str(hwid or "")
@@ -245,19 +273,32 @@ def open_windows_bluetooth_settings() -> None:
 class BluetoothRfcommLink(Thread):
     """Background Classic Bluetooth SPP (RFCOMM) link matching SerialLink's queue/event interface."""
 
+    PING_PERIOD = 0.2
+    UI_GRACE = 1.0
+    HEARTBEAT = b"@PING\n"
+
     def __init__(self, address: str, channel: int = 1, name: str = "", timeout: float = 5.0):
         super().__init__(daemon=True)
-        self.address = address
+        self.address = format_bt_address(parse_bt_address(address))
         self.channel = int(channel)
-        self.device_name = name or address
+        self.device_name = name or self.address
         self.timeout = float(timeout)
         self.closed = Event()
         self.writes: deque[bytes] = deque()
+        self.ping_due = False
+        self.heartbeat = False
+        self.alive_at = 0.0
+        self.next_ping = 0.0
+        self.pings = 0
         self._final_tx: bytes | None = None
         self._final_done = Event()
         self.events: deque = deque(maxlen=1500)
         self.dropped = 0
         self.lock = Lock()
+
+    def set_modem_lines(self, dtr=None, rts=None):
+        """No-op compatibility stub for SerialLink interface."""
+        return None
 
     def event(self, kind: str, data):
         with self.lock:
@@ -269,11 +310,35 @@ class BluetoothRfcommLink(Thread):
         with self.lock:
             if urgent:
                 self.writes.clear()
+                self.ping_due = False
             if len(self.writes) >= 64:
                 return False
             if data:
                 self.writes.append(bytes(data))
             return True
+
+    def ping(self):
+        with self.lock:
+            self.ping_due = True
+
+    def keepalive(self, enabled: bool):
+        with self.lock:
+            if enabled and not self.heartbeat:
+                self.next_ping = 0.0
+            self.heartbeat = bool(enabled)
+            self.alive_at = monotonic()
+
+    def next_write(self, now: float):
+        with self.lock:
+            if self.ping_due:
+                self.ping_due = False
+                return self.HEARTBEAT
+            if self.writes:
+                return self.writes.popleft()
+            if self.heartbeat and now >= self.next_ping and now - self.alive_at <= self.UI_GRACE:
+                self.next_ping = now + self.PING_PERIOD
+                return self.HEARTBEAT
+        return None
 
     def take(self):
         with self.lock:
@@ -286,6 +351,8 @@ class BluetoothRfcommLink(Thread):
     def flush_and_close(self, final_data: bytes = b"", timeout: float = 0.25):
         with self.lock:
             self.writes.clear()
+            self.ping_due = False
+            self.heartbeat = False
             if final_data:
                 self._final_tx = bytes(final_data)
         self.closed.set()
@@ -308,12 +375,15 @@ class BluetoothRfcommLink(Thread):
             self.event("open", f"蓝牙 {label}")
             while not self.closed.is_set():
                 while not self.closed.is_set():
-                    with self.lock:
-                        chunk = self.writes.popleft() if self.writes else None
+                    chunk = self.next_write(monotonic())
                     if not chunk:
                         break
+                    is_hb = chunk is self.HEARTBEAT
                     sock.sendall(chunk)
-                    self.event("tx", chunk)
+                    if is_hb:
+                        self.pings += 1
+                    else:
+                        self.event("tx", chunk)
                 if self.closed.is_set():
                     break
                 try:

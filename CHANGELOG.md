@@ -1,6 +1,24 @@
 # 嵌入式综合调试助手（EmbeddedDebugStudio）更新记录
 
-## v1.9（2026-11-26）
+## v1.9（2026-11-28）
+
+### 9. 全模块蓝牙 SPP 直连、SPD 起步/刹停联合整定与安全写回闭环（本次最新更新）
+- **1. 全工作台经典蓝牙 SPP 直连与冲突交接**（`bluetooth_link.py`、`bluetooth_ui.py`、`main.py`、`imu_studio.py`、`serial_studio.py`、`remote_studio.py`）：
+  - PID 调参、串口调试、3D IMU 与小车遥控四大工作台全面接入蓝牙扫描配对、虚拟 COM 自动映射与 `AF_BLUETOOTH / RFCOMM` 无线直连；切页占用同一 MAC 地址时先冲刷 `@STOP` / `J,0,0\nS\n` 并安全移交。
+- **2. 速度外环 `SPD` 通道绑定与 `wheel_speed` 单位对齐**（`telemetry_schema.py`、`autotune_ui.py`）：
+  - 修正 5 列平衡车遥测中 `wheel_speed` 单位为 `RPM`；切至 `SPD` 自动整定即自动锁定轮速通道与转速目标列（不再误读俯仰角），缺轮速时启动前阻断提示；5 列平衡车流默认启用 `PI 整定 + 从当前参数局部微调 + 起步刹停联合评估 + 复测确认（2.8 s 起步窗，±950 限幅）`。
+- **3. 探针限幅、统一归一化评分、模型拟合与持续饱和拦截**（`autotune.py`）：
+  - 移除纯 P 探针 `0.5` 硬下限，确保非零初值下探针、放大探针与渐进 SIMC 候选均受统一倍率限制；
+  - `evaluate_step()` 改用统一命令阶跃幅度 `goal_y - cmd_base` 与标准观测窗 `ref_duration` 归一化（拒绝截断数据、裁剪超长尾段）；
+  - `identify_from_p_step()` 拒收持续饱和、仍在明显爬升（运行期 `OBSERVE` 最长自动延采至 2.5 倍窗长）或闭环 NRMSE 过大的低拟合曲线。
+- **4. 硬门槛验收、起步达标、优胜复测与三阶段 1 s 断流保护**（`autotune.py`、`autotune_ui.py`、`test_tuner.py`）：
+  - 平衡车 `0 → 目标 → 0` 联合评分强制校验 **起步尾段进入目标 ±5 RPM**、**最大倾角偏差 ≤ 12°**、**无持续饱和** 与 **刹停收敛至 ±5 RPM 保持 200 ms**；若全部候选未通过验收门槛，严禁写回任何候选，立即 `@STOP` 停机并恢复原参数（仅保留参考草稿供手动核对）；
+  - 复测机制（`复测候选` + `复测原参`）：若原参数首轮合格但复测异常则自动 `补测原参` 1 次；仍异常时判定 **“候选通过，对照不足”** 并暂缓写回；
+  - `_check_missing_feedback()` 将 `SETTLE_BASE` 空帧等待纳入与 `OBSERVE / OBSERVE_BRAKE` 共用的 ~1 s（0.8~1.5 s）断流看门狗，且 `OBSERVE_BRAKE` 刹停阶段严格只发 `@SPD.TGT=<base>`（不发 `@RST`）。
+
+---
+
+## v1.9（2026-11-26 初期版）
 
 ### 统一通道语义、MCU 时间基准、蓝牙急停加固与负载扰动对比
 - **1. 平衡车示例与 IMU 通道统一语义**（`telemetry_schema.py`、`firmware_example/balance_example.c`、`imu_studio.py`、`firmware_studio.py`、`main.py`）：

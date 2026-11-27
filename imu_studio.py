@@ -18,6 +18,13 @@ import pyqtgraph as pg
 from serial.tools import list_ports
 from PySide6 import QtCore as C, QtGui, QtWidgets as W
 
+from bluetooth_link import (
+    BluetoothRfcommLink,
+    discover_bluetooth_devices,
+    format_bt_port_token,
+    parse_bt_port_token,
+)
+from bluetooth_ui import BluetoothPickerDialog
 from engine import Lines
 from telemetry_schema import resolve_channel_semantics
 from transport import SerialLink
@@ -459,9 +466,11 @@ class ImuStudioPage(W.QWidget):
         f1.addRow("数据源", self.source_box)
         self.port_box = W.QComboBox(); self.port_box.setEditable(True)
         self.ref_btn = self._btn("刷新", self.refresh_ports)
+        self.bt_btn = self._btn("🔵 蓝牙", self.pick_bluetooth_device)
+        self.bt_btn.setToolTip("搜索/配对并选择经典蓝牙 SPP 设备（如 HC-05）")
         pr = W.QHBoxLayout(); pr.setContentsMargins(0, 0, 0, 0)
-        pr.addWidget(self.port_box, 1); pr.addWidget(self.ref_btn)
-        f1.addRow("串口", pr)
+        pr.addWidget(self.port_box, 1); pr.addWidget(self.ref_btn); pr.addWidget(self.bt_btn)
+        f1.addRow("串口/蓝牙", pr)
         self.baud_box = W.QComboBox(); self.baud_box.setEditable(True)
         self.baud_box.addItems(["9600", "38400", "57600", "115200", "230400", "460800", "921600"])
         self.baud_box.setCurrentText("115200")
@@ -571,17 +580,31 @@ class ImuStudioPage(W.QWidget):
                 self.port_box.addItem(p.device)
         except OSError:
             pass
+        try:
+            for dev in discover_bluetooth_devices(inquiry=False):
+                if dev.authenticated:
+                    self.port_box.addItem(format_bt_port_token(dev.address, dev.name))
+        except Exception:
+            pass
         if old:
             self.port_box.setCurrentText(old)
+
+    def pick_bluetooth_device(self):
+        dlg = BluetoothPickerDialog(self)
+        if dlg.exec() == W.QDialog.DialogCode.Accepted and dlg.selected_port_text:
+            self.source_box.setCurrentIndex(0)
+            if self.port_box.findText(dlg.selected_port_text) < 0:
+                self.port_box.addItem(dlg.selected_port_text)
+            self.port_box.setCurrentText(dlg.selected_port_text)
 
     def _sync_ui(self):
         sim = self.source_box.currentIndex() == 1
         busy = self.connected or self.link is not None
         self.source_box.setEnabled(not busy)
-        for w in (self.port_box, self.ref_btn, self.baud_box, self.proto_box):
+        for w in (self.port_box, self.ref_btn, self.bt_btn, self.baud_box, self.proto_box):
             w.setEnabled(not busy and not sim)
         self.sim_mode.setEnabled(sim)
-        self.conn_btn.setText("关闭仿真" if self.sim_active else "断开连接" if busy else "启动姿态仿真" if sim else "连接 IMU 串口")
+        self.conn_btn.setText("关闭仿真" if self.sim_active else "断开连接" if busy else "启动姿态仿真" if sim else "连接 IMU 串口/蓝牙")
         self.conn_btn.setObjectName("danger" if busy else "primary")
         self.conn_btn.style().unpolish(self.conn_btn)
         self.conn_btn.style().polish(self.conn_btn)
@@ -589,7 +612,8 @@ class ImuStudioPage(W.QWidget):
             self.state_badge.setText("● 姿态仿真运行中")
             self.state_badge.setStyleSheet("color:#188467;font-weight:600;padding-left:8px;")
         elif self.connected:
-            self.state_badge.setText(f"● 已连接 {self.port_box.currentText()}")
+            prefix = "蓝牙已连" if isinstance(self.link, BluetoothRfcommLink) else "已连接"
+            self.state_badge.setText(f"● {prefix} {self.port_box.currentText()}")
             self.state_badge.setStyleSheet("color:#188467;font-weight:600;padding-left:8px;")
         else:
             self.state_badge.setText("● 未连接")
@@ -631,15 +655,21 @@ class ImuStudioPage(W.QWidget):
         if self.host is not None and hasattr(self.host, "request_port_access"):
             if not self.host.request_port_access(self, name):
                 return
-        try:
-            baud = int(self.baud_box.currentText().strip())
-            opts = dict(url=name, baudrate=baud, bytesize=8, parity="N", stopbits=1.0)
-        except ValueError:
-            return
+        bt = parse_bt_port_token(name)
+        if bt is not None:
+            opts = dict(url=name)
+            link = BluetoothRfcommLink(bt[0], channel=1, name=bt[1] or bt[0])
+        else:
+            try:
+                baud = int(self.baud_box.currentText().strip())
+                opts = dict(url=name, baudrate=baud, bytesize=8, parity="N", stopbits=1.0)
+            except ValueError:
+                return
+            link = SerialLink(opts)
         self.banner.hide()
         self.parser = Lines()
         self.reconnect_opts = opts
-        self.link = SerialLink(opts)
+        self.link = link
         self.link.start()
         self._sync_ui()
 

@@ -344,6 +344,11 @@ class RemoteBtPage(W.QWidget):
             return self.reconnect_opts.get("url")
         return None
 
+    def active_bt_token(self):
+        if (self.connected or self.link is not None) and getattr(self, "active_bt_mac", None):
+            return f"BT:{self.active_bt_mac}"
+        return None
+
     def release_port(self):
         if self.connected or self.link:
             self.disconnect_port()
@@ -353,6 +358,7 @@ class RemoteBtPage(W.QWidget):
                     self.link = None
                     self.closing = False
                     self.active_bt_label = None
+                    self.active_bt_mac = None
                     self._sync_conn_ui()
 
     def apply_theme(self, dark: bool):
@@ -882,8 +888,12 @@ class RemoteBtPage(W.QWidget):
             self.bt_status_lbl.setText(f"{dev.name} 尚未配对，正在先发起配对…")
             self.pair_selected_bluetooth()
             return
+        if self.host is not None and hasattr(self.host, "request_port_access"):
+            if not self.host.request_port_access(self, f"BT:{dev.address}"):
+                return
         self.reconnect_opts = None
         self.active_bt_label = f"{dev.name} ({dev.address})"
+        self.active_bt_mac = dev.address
         self.closing = False
         self.rx_tail = ""
         self.link = BluetoothRfcommLink(dev.address, channel=1, name=dev.name)
@@ -955,6 +965,7 @@ class RemoteBtPage(W.QWidget):
                 self.link.closed.set()
         self.connected = False
         self.active_bt_label = None
+        self.active_bt_mac = None
         self._sync_conn_ui()
         kind_label = "蓝牙连接" if was_bt else "串口连接"
         self._log("系统", f"已安全停车并关闭{kind_label}" if had_conn else f"已关闭{kind_label}")

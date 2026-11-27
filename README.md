@@ -13,7 +13,7 @@
 
 - **Windows 免安装单文件**：下载 `PIDTuner.exe`（或 `EmbeddedDebugStudio-v1.9-win64.exe`）双击即用，无需安装 Python 环境。
 - **在线阅读完整图文操作手册**：[点击在线查看完整图文使用手册 (docs/MANUAL.md)](docs/MANUAL.md)（Releases 中亦提供打包好的 `.pdf` 与 `.docx` 离线文档）
-- **历史版本归档**：`v1.1` → `v1.9` 各历史版本的安装包、源码快照与配套操作手册均完整归档于 [Releases 页面](https://github.com/xyu-06/EmbeddedDebugStudio/releases)。
+- **仅保留最新版本**：GitHub Releases 与本地 `release/` 统一仅保留最新稳定发布包 `v1.9`（含最新蓝牙 SPP + 平衡车速度环整定加固）。
 
 ---
 
@@ -24,7 +24,8 @@
 ### 1. 📈 PID 闭环调参与智能自动整定（`Ctrl+1`）
 - **高刷多通道示波器**：支持 **1～8 通道实时曲线** + 4 条固定/跟随参考线、通道缩放系数与工程单位换算、独立双 Y 轴分流（如左轴转速 `RPM`、右轴 `PWM`）、单次边沿触发抓拍、A/B 双游标测量与历史 CSV 离线导入回放。
 - **三色状态安全调参与原子组写入**：支持 `ANG / SPD / YAW / AUX` 四环独立参数、原子下发 `@<GRP>.SET=kp,ki,kd,tgt`（`#CAP:SET` 探测，防新旧参数短暂混用）、连续滑块微调 + 5 档步长、上下限保护、大幅跳变二次确认与一键撤销。
-- **⚡ 智能 PID 自动整定（Auto-Tune）**：无需修改单片机固件，自动辨识 + Hooke–Jeeves 多轮寻优；支持 **直立环 `ANG` 强制局部微调（单轮 `≤±35%`）、车轮架空安全勾选确认、失败/超时/断线自动写回原参数**，并内置带 `25 ms` 滞后、传感器噪声及 `👋 推一下` 扰动按钮的倒立摆仿真。
+- **全工作台经典蓝牙 SPP 无线直连**：`【📈 PID 调参】`、`【🔌 串口调试】`、`【🧭 IMU 姿态】` 与 `【🎮 遥控与 HC-05】` 统一支持搜索配对与直接通过 `RFCOMM (SPP)` 通道连接，并在跨模块切换同一蓝牙 MAC 时自动冲洗安全停机指令后平滑交接。
+- **⚡ 智能 PID 自动整定（Auto-Tune）**：支持基于 `wheel_speed (RPM)` 的速度环 `SPD` 自动识别、探针/候选统一限幅、统一基准/窗长评分、平衡车 `0 → 目标 → 0` 起步+刹停联合评估（强制起步达标与 `±12°` 倾角/持续饱和硬门槛，不合格绝不写回，且支持优胜组与原参数复测及对照不足暂缓写回）和三阶段约 1 s 断流看门狗；同时支持 `ANG` 局部微调、车轮架空确认、失败/断线自动回滚与带 `25 ms` 滞后的倒立摆仿真。
 - **📌 Ghost 同起点残影对比 + 🩺 FFT 信号体检 + 📋 C 代码导出**：锁定旧参数阶跃底图同起点叠加对比；一键分析零偏、底噪 `σ` 与 FFT 主振荡频率；一键生成 STM32 `#define` 参数宏代码。
 
 ![PID 调参工作台全景](docs/images/fig01_overview.png)
@@ -83,7 +84,7 @@ self.register_module("📷 摄像头调试", CameraDebugPage(self))
 | `diagnostics.py` / `scope.py` / `engine.py` | FFT 信号体检、C 代码导出、高刷示波器（含 Ghost 底图）、协议解析与仿真器 |
 | `firmware_example/` | STM32 C99 零 `printf_float` 依赖协议栈 `pid_link.c/.h`、HAL 队列与平衡车三环串级模板 |
 | `telemetry_schema.py` & `storage.py` | 统一通道语义单位映射、流式长录制分段扫描与 CSV 回放引擎 |
-| `tests/` & `test_tuner.py` | STM32 C99 协议/平衡车闭环测试与 39 项 Python 自动化回归测试 |
+| `tests/` & `test_tuner.py` | STM32 C99 协议/平衡车闭环测试与 47 项 Python 自动化回归测试 |
 | `.github/workflows/build-windows.yml` | GitHub Actions 自动运行 C + Python 全套测试并构建单文件 `PIDTuner.exe` |
 
 ---
